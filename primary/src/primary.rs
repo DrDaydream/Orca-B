@@ -5,7 +5,10 @@ use crate::error::DagError;
 use crate::garbage_collector::GarbageCollector;
 use crate::header_waiter::HeaderWaiter;
 use crate::helper::Helper;
-use crate::messages::{Certificate, ConsensusMessage, GradeVote, GradedCertificate, Header, Vote};
+use crate::messages::{
+    Certificate, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GradeVote,
+    GradedCertificate, Header, Vote,
+};
 use crate::payload_receiver::PayloadReceiver;
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
@@ -22,6 +25,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::time::{sleep, Duration};
 
 /// The default channel capacity for each channel of the primary.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -36,6 +40,8 @@ pub enum PrimaryMessage {
     Certificate(Certificate),
     GradeVote(GradeVote),
     GradedCertificate(GradedCertificate),
+    Consensus(ConsensusNetworkMessage),
+    LeaderRequest(Round, PublicKey, /* requestor */ PublicKey),
     CertificatesRequest(Vec<Digest>, /* requestor */ PublicKey),
 }
 
@@ -66,7 +72,7 @@ impl Primary {
         parameters: Parameters,
         store: Store,
         tx_consensus: Sender<ConsensusMessage>,
-        rx_consensus: Receiver<Certificate>,
+        mut rx_consensus: Receiver<ConsensusCommand>,
     ) {
         let (tx_others_digests, rx_others_digests) = channel(CHANNEL_CAPACITY);
         let (tx_our_digests, rx_our_digests) = channel(CHANNEL_CAPACITY);
@@ -78,6 +84,50 @@ impl Primary {
         let (tx_certificates_loopback, rx_certificates_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
+        let (tx_consensus_commands, rx_consensus_commands) = channel(CHANNEL_CAPACITY);
+        let (tx_cleanup, rx_cleanup) = channel(CHANNEL_CAPACITY);
+
+        tokio::spawn(async move {
+            while let Some(command) = rx_consensus.recv().await {
+                match command {
+                    ConsensusCommand::Cleanup(certificate) => tx_cleanup
+                        .send(certificate)
+                        .await
+                        .expect("Failed to send cleanup"),
+                    ConsensusCommand::AbaBroadcast(mut messages) => {
+                        // Coalesce bursts from independent ABA instances. The
+                        // Core signs the resulting batch once.
+                        let deadline = sleep(Duration::from_millis(1));
+                        tokio::pin!(deadline);
+                        loop {
+                            tokio::select! {
+                                () = &mut deadline => break,
+                                next = rx_consensus.recv() => match next {
+                                    Some(ConsensusCommand::AbaBroadcast(mut more)) => {
+                                        messages.append(&mut more);
+                                    }
+                                    Some(ConsensusCommand::Cleanup(certificate)) => {
+                                        tx_cleanup.send(certificate).await.expect("Failed to send cleanup");
+                                    }
+                                    Some(command) => {
+                                        tx_consensus_commands.send(command).await.expect("Failed to send consensus command");
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
+                        tx_consensus_commands
+                            .send(ConsensusCommand::AbaBroadcast(messages))
+                            .await
+                            .expect("Failed to send ABA batch");
+                    }
+                    command => tx_consensus_commands
+                        .send(command)
+                        .await
+                        .expect("Failed to send consensus command"),
+                }
+            }
+        });
 
         // Write the parameters to the logs.
         parameters.log();
@@ -155,10 +205,11 @@ impl Primary {
             /* rx_proposer */ rx_headers,
             tx_consensus,
             /* tx_proposer */ tx_parents,
+            rx_consensus_commands,
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
-        GarbageCollector::spawn(&name, &committee, consensus_round.clone(), rx_consensus);
+        GarbageCollector::spawn(&name, &committee, consensus_round.clone(), rx_cleanup);
 
         // Receives batch digests from other workers. They are only used to validate headers.
         PayloadReceiver::spawn(store.clone(), /* rx_workers */ rx_others_digests);

@@ -64,6 +64,7 @@ async fn process_header() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        /* rx_consensus */ channel(1).1,
     );
 
     // Send a header to the core.
@@ -131,6 +132,7 @@ async fn process_header_missing_parent() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        /* rx_consensus */ channel(1).1,
     );
 
     // Send a header to the core.
@@ -191,6 +193,7 @@ async fn process_header_missing_payload() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        /* rx_consensus */ channel(1).1,
     );
 
     // Send a header to the core.
@@ -253,6 +256,7 @@ async fn process_votes() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        /* rx_consensus */ channel(1).1,
     );
 
     // Make the certificate we expect to receive.
@@ -325,6 +329,7 @@ async fn process_certificates() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        /* rx_consensus */ channel(1).1,
     );
 
     // Send enough certificates to the core.
@@ -350,6 +355,9 @@ async fn process_certificates() {
         match received {
             ConsensusMessage::GradeOne(certificate) => assert_eq!(certificate, x),
             ConsensusMessage::GradeTwo(_) => panic!("unexpected grade-2 delivery"),
+            ConsensusMessage::Aba(_, _) | ConsensusMessage::AbaBatch(_, _) => {
+                panic!("unexpected ABA delivery")
+            }
         }
     }
 

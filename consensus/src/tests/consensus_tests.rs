@@ -17,6 +17,26 @@ async fn deliver(tx: &Sender<ConsensusMessage>, certificate: Certificate) {
         .unwrap();
 }
 
+fn spawn_aba_network(
+    mut rx: tokio::sync::mpsc::Receiver<ConsensusCommand>,
+    tx: Sender<ConsensusMessage>,
+    authorities: Vec<PublicKey>,
+) {
+    tokio::spawn(async move {
+        while let Some(command) = rx.recv().await {
+            if let ConsensusCommand::AbaBroadcast(batch) = command {
+                for bytes in batch {
+                    for authority in &authorities {
+                        tx.send(ConsensusMessage::Aba(*authority, bytes.clone()))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        }
+    });
+}
+
 // Fixture
 fn keys() -> Vec<(PublicKey, SecretKey)> {
     let mut rng = StdRng::from_seed([0; 32]);
@@ -124,12 +144,12 @@ fn grade_two_waits_for_strong_and_weak_edges() {
     let block_digest = block.digest();
 
     state.insert_grade_one(block);
-    state.grade_two.insert(block_digest.clone());
+    state.mark_grade_two(block_digest.clone());
     assert!(state.promote_ready().is_empty());
     assert!(state.vdag.get(&3).unwrap().contains_key(&authority));
 
     state.insert_grade_one(dependency);
-    state.grade_two.insert(dependency_digest);
+    state.mark_grade_two(dependency_digest);
     let promoted = state.promote_ready();
     assert_eq!(promoted.len(), 2);
     assert!(state.dag_digests.contains(&block_digest));
@@ -140,6 +160,7 @@ fn grade_two_waits_for_strong_and_weak_edges() {
 fn finds_paths_over_strong_and_weak_edges() {
     let committee = mock_committee();
     let consensus = Consensus {
+        name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
@@ -196,6 +217,7 @@ fn finds_paths_over_strong_and_weak_edges() {
 fn designates_one_leader_every_round() {
     let committee = mock_committee();
     let consensus = Consensus {
+        name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
@@ -218,6 +240,7 @@ fn designates_one_leader_every_round() {
 fn commit_rule_counts_observed_and_dag_strong_support_separately() {
     let committee = mock_committee();
     let consensus = Consensus {
+        name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
@@ -243,14 +266,14 @@ fn commit_rule_counts_observed_and_dag_strong_support_separately() {
     // Three out of four authorities are observed in Dag union VDag, while no
     // supporter has entered the formal Dag yet.
     assert_eq!(
-        consensus.strong_support_stake(2, &leader_digest, &state),
+        consensus.strong_support_stake(2, &leader_digest, &mut state),
         (3, 0)
     );
 
     state.promote_to_dag(support[0].clone());
     state.promote_to_dag(support[1].clone());
     assert_eq!(
-        consensus.strong_support_stake(2, &leader_digest, &state),
+        consensus.strong_support_stake(2, &leader_digest, &mut state),
         (3, 2)
     );
 }
@@ -259,6 +282,7 @@ fn commit_rule_counts_observed_and_dag_strong_support_separately() {
 fn commit_rule_two_counts_strong_and_two_hop_virtual_paths() {
     let committee = mock_committee();
     let consensus = Consensus {
+        name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
@@ -286,7 +310,7 @@ fn commit_rule_two_counts_strong_and_two_hop_virtual_paths() {
     }
 
     assert_eq!(
-        consensus.rule_two_support_stake(3, &leader_digest, &state),
+        consensus.rule_two_support_stake(3, &leader_digest, &mut state),
         (0, 0, 3)
     );
 }
@@ -295,6 +319,7 @@ fn commit_rule_two_counts_strong_and_two_hop_virtual_paths() {
 fn commit_rule_three_counts_exact_three_edge_virtual_paths() {
     let committee = mock_committee();
     let consensus = Consensus {
+        name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
@@ -338,6 +363,7 @@ async fn commit_rule_two_condition_three_forces_leader_grade_two() {
     let (tx_primary, _rx_primary) = channel(100);
     let (tx_output, _rx_output) = channel(100);
     let mut consensus = Consensus {
+        name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
@@ -361,10 +387,16 @@ async fn commit_rule_two_condition_three_forces_leader_grade_two() {
     }
 
     assert!(!state.grade_two.contains(&leader_digest));
-    consensus.evaluate_commit_rule_two(3, &mut state).await;
+    consensus.evaluate_commit_rule_two(3, &mut state, true).await;
     assert!(state.grade_two.contains(&leader_digest));
     assert!(state.dag_digests.contains(&leader_digest));
+    assert!(state.aba_inputs.contains(&1));
+    assert!(state.direct_commit_ready.contains(&1));
     assert!(state.committed_leaders.contains(&1));
+    consensus
+        .apply_aba_decision(1, BinaryValue::Zero, &mut state)
+        .await;
+    assert!(!state.skipped_leaders.contains(&1));
 }
 
 #[tokio::test]
@@ -373,6 +405,7 @@ async fn leader_commits_wait_for_the_previous_leader() {
     let (tx_primary, _rx_primary) = channel(100);
     let (tx_output, _rx_output) = channel(100);
     let mut consensus = Consensus {
+        name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
@@ -414,17 +447,18 @@ async fn commit_one() {
     certificates.push_back(certificate);
 
     // Spawn the consensus engine and sink the primary channel.
-    let (tx_waiter, rx_waiter) = channel(1);
-    let (tx_primary, mut rx_primary) = channel(1);
-    let (tx_output, mut rx_output) = channel(1);
+    let (tx_waiter, rx_waiter) = channel(100);
+    let (tx_primary, rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
     Consensus::spawn(
+        keys[0],
         mock_committee(),
         /* gc_depth */ 50,
         rx_waiter,
         tx_primary,
         tx_output,
     );
-    tokio::spawn(async move { while rx_primary.recv().await.is_some() {} });
+    spawn_aba_network(rx_primary, tx_waiter.clone(), keys.clone());
 
     // Feed all certificates to the consensus. Only the last certificate should trigger
     // commits, so the task should not block.
@@ -461,17 +495,18 @@ async fn dead_node() {
     let (mut certificates, _) = make_certificates(1, 9, &genesis, &keys);
 
     // Spawn the consensus engine and sink the primary channel.
-    let (tx_waiter, rx_waiter) = channel(1);
-    let (tx_primary, mut rx_primary) = channel(1);
-    let (tx_output, mut rx_output) = channel(1);
+    let (tx_waiter, rx_waiter) = channel(100);
+    let (tx_primary, rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
     Consensus::spawn(
+        keys[0],
         mock_committee(),
         /* gc_depth */ 50,
         rx_waiter,
         tx_primary,
         tx_output,
     );
-    tokio::spawn(async move { while rx_primary.recv().await.is_some() {} });
+    spawn_aba_network(rx_primary, tx_waiter.clone(), keys.clone());
 
     // Feed all certificates to the consensus.
     tokio::spawn(async move {
@@ -549,17 +584,18 @@ async fn not_enough_support() {
     certificates.push_back(certificate);
 
     // Spawn the consensus engine and sink the primary channel.
-    let (tx_waiter, rx_waiter) = channel(1);
-    let (tx_primary, mut rx_primary) = channel(1);
-    let (tx_output, mut rx_output) = channel(1);
+    let (tx_waiter, rx_waiter) = channel(100);
+    let (tx_primary, rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
     Consensus::spawn(
+        keys[0],
         mock_committee(),
         /* gc_depth */ 50,
         rx_waiter,
         tx_primary,
         tx_output,
     );
-    tokio::spawn(async move { while rx_primary.recv().await.is_some() {} });
+    spawn_aba_network(rx_primary, tx_waiter.clone(), keys.clone());
 
     // Feed all certificates to the consensus. Only the last certificate should trigger
     // commits, so the task should not block.
@@ -613,17 +649,18 @@ async fn missing_leader() {
     certificates.push_back(certificate);
 
     // Spawn the consensus engine and sink the primary channel.
-    let (tx_waiter, rx_waiter) = channel(1);
-    let (tx_primary, mut rx_primary) = channel(1);
-    let (tx_output, mut rx_output) = channel(1);
+    let (tx_waiter, rx_waiter) = channel(100);
+    let (tx_primary, rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
     Consensus::spawn(
+        keys[0],
         mock_committee(),
         /* gc_depth */ 50,
         rx_waiter,
         tx_primary,
         tx_output,
     );
-    tokio::spawn(async move { while rx_primary.recv().await.is_some() {} });
+    spawn_aba_network(rx_primary, tx_waiter.clone(), keys.clone());
 
     // Feed all certificates to the consensus. We should only commit upon receiving the last
     // certificate, so calls below should not block the task.

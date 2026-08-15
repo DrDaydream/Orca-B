@@ -1,7 +1,10 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::aggregators::{CertificatesAggregator, GradeVotesAggregator, VotesAggregator};
 use crate::error::{DagError, DagResult};
-use crate::messages::{Certificate, ConsensusMessage, GradeVote, GradedCertificate, Header, Vote};
+use crate::messages::{
+    Certificate, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GradeVote,
+    GradedCertificate, Header, Vote,
+};
 use crate::primary::{PrimaryMessage, Round};
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
@@ -50,6 +53,7 @@ pub struct Core {
     tx_consensus: Sender<ConsensusMessage>,
     /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
     tx_proposer: Sender<ProposerMessage>,
+    rx_consensus: Receiver<ConsensusCommand>,
 
     /// The last garbage collected round.
     gc_round: Round,
@@ -71,6 +75,7 @@ pub struct Core {
     grade_voted: HashSet<Digest>,
     /// Certificates carrying a verified grade-2 proof.
     grade_two: HashSet<Digest>,
+    graded_certificates: HashMap<Digest, GradedCertificate>,
     /// Grade-2 blocks not yet referenced by a weak edge.
     weak_edge_candidates: HashMap<Digest, Round>,
     /// A network sender to send the batches to the other workers.
@@ -95,6 +100,7 @@ impl Core {
         rx_proposer: Receiver<Header>,
         tx_consensus: Sender<ConsensusMessage>,
         tx_proposer: Sender<ProposerMessage>,
+        rx_consensus: Receiver<ConsensusCommand>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -111,6 +117,7 @@ impl Core {
                 rx_proposer,
                 tx_consensus,
                 tx_proposer,
+                rx_consensus,
                 gc_round: 0,
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
@@ -121,6 +128,7 @@ impl Core {
                 grade_aggregators: HashMap::new(),
                 grade_voted: HashSet::new(),
                 grade_two: HashSet::new(),
+                graded_certificates: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
@@ -128,6 +136,80 @@ impl Core {
             .run()
             .await;
         });
+    }
+
+    async fn process_consensus_command(&mut self, command: ConsensusCommand) -> DagResult<()> {
+        match command {
+            ConsensusCommand::Cleanup(_) => unreachable!(),
+            ConsensusCommand::AbaBroadcast(messages) => {
+                let payload = bincode::serialize(&messages).expect("Failed to serialize ABA batch");
+                let message =
+                    ConsensusNetworkMessage::new(payload, self.name, &mut self.signature_service)
+                        .await;
+                let addresses = self
+                    .committee
+                    .others_primaries(&self.name)
+                    .iter()
+                    .map(|(_, x)| x.primary_to_primary)
+                    .collect();
+                let bytes = bincode::serialize(&PrimaryMessage::Consensus(message))
+                    .expect("Failed to serialize ABA message");
+                let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
+                self.cancel_handlers
+                    .entry(self.current_header.round)
+                    .or_default()
+                    .extend(handlers);
+            }
+            ConsensusCommand::LeaderRequest(round, leader) => {
+                let addresses = self
+                    .committee
+                    .others_primaries(&self.name)
+                    .iter()
+                    .map(|(_, x)| x.primary_to_primary)
+                    .collect();
+                let request = PrimaryMessage::LeaderRequest(round, leader, self.name);
+                let bytes =
+                    bincode::serialize(&request).expect("Failed to serialize leader request");
+                let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
+                self.cancel_handlers
+                    .entry(round)
+                    .or_default()
+                    .extend(handlers);
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_leader_request(
+        &mut self,
+        round: Round,
+        leader: PublicKey,
+        requestor: PublicKey,
+    ) -> DagResult<()> {
+        let certificate = self
+            .grbc_certificates
+            .values()
+            .find(|c| c.round() == round && c.origin() == leader)
+            .cloned();
+        if let Some(certificate) = certificate {
+            let digest = certificate.digest();
+            let response = self
+                .graded_certificates
+                .get(&digest)
+                .cloned()
+                .map(PrimaryMessage::GradedCertificate)
+                .unwrap_or_else(|| PrimaryMessage::Certificate(certificate));
+            if let Ok(address) = self.committee.primary(&requestor) {
+                let bytes =
+                    bincode::serialize(&response).expect("Failed to serialize leader response");
+                let handler = self
+                    .network
+                    .send(address.primary_to_primary, Bytes::from(bytes))
+                    .await;
+                self.cancel_handlers.entry(round).or_default().push(handler);
+            }
+        }
+        Ok(())
     }
 
     async fn process_own_header(&mut self, header: Header) -> DagResult<()> {
@@ -405,6 +487,8 @@ impl Core {
 
     async fn process_graded_certificate(&mut self, proof: GradedCertificate) -> DagResult<()> {
         let digest = proof.certificate.digest();
+        self.graded_certificates
+            .insert(digest.clone(), proof.clone());
         if self.grade_two.insert(digest.clone()) {
             debug!("GRBC grade 2 delivered for {:?}", proof.certificate);
             self.tx_consensus
@@ -515,48 +599,65 @@ impl Core {
         proof.verify(&self.committee)
     }
 
+    async fn process_primary_message(&mut self, message: PrimaryMessage) -> DagResult<()> {
+        match message {
+            PrimaryMessage::Header(header) => {
+                self.sanitize_header(&header)?;
+                self.process_header(&header).await
+            }
+            PrimaryMessage::Vote(vote) => {
+                self.sanitize_vote(&vote)?;
+                self.process_vote(vote).await
+            }
+            PrimaryMessage::Certificate(certificate) => {
+                self.sanitize_certificate(&certificate)?;
+                self.process_certificate(certificate).await
+            }
+            PrimaryMessage::GradeVote(vote) => {
+                self.sanitize_grade_vote(&vote)?;
+                self.process_grade_vote(vote).await
+            }
+            PrimaryMessage::GradedCertificate(proof) => {
+                self.sanitize_graded_certificate(&proof)?;
+                self.process_graded_certificate(proof).await
+            }
+            PrimaryMessage::Consensus(message) => {
+                message.verify(&self.committee)?;
+                let batch = bincode::deserialize::<Vec<Vec<u8>>>(&message.payload)
+                    .map_err(DagError::SerializationError)?;
+                self.tx_consensus
+                    .send(ConsensusMessage::AbaBatch(message.author, batch))
+                    .await
+                    .expect("Failed to deliver ABA batch");
+                Ok(())
+            }
+            PrimaryMessage::LeaderRequest(round, leader, requestor) => {
+                self.process_leader_request(round, leader, requestor).await
+            }
+            _ => panic!("Unexpected core message"),
+        }
+    }
+
     // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
         loop {
             let result = tokio::select! {
                 // We receive here messages from other primaries.
                 Some(message) = self.rx_primaries.recv() => {
-                    match message {
-                        PrimaryMessage::Header(header) => {
-                            match self.sanitize_header(&header) {
-                                Ok(()) => self.process_header(&header).await,
-                                error => error
-                            }
-
-                        },
-                        PrimaryMessage::Vote(vote) => {
-                            match self.sanitize_vote(&vote) {
-                                Ok(()) => self.process_vote(vote).await,
-                                error => error
-                            }
-                        },
-                        PrimaryMessage::Certificate(certificate) => {
-                            match self.sanitize_certificate(&certificate) {
-                                Ok(()) =>  self.process_certificate(certificate).await,
-                                error => error
-                            }
-                        },
-                        PrimaryMessage::GradeVote(vote) => {
-                            match self.sanitize_grade_vote(&vote) {
-                                Ok(()) => self.process_grade_vote(vote).await,
-                                error => error
-                            }
-                        },
-                        PrimaryMessage::GradedCertificate(proof) => {
-                            match self.sanitize_graded_certificate(&proof) {
-                                Ok(()) => {
-                                    self.process_graded_certificate(proof).await
-                                },
-                                error => error
-                            }
-                        },
-                        _ => panic!("Unexpected core message")
+                    let mut result = self.process_primary_message(message).await;
+                    // Drain a bounded burst while the channel is already hot.
+                    // This amortizes scheduler/select overhead without starving
+                    // proposer, waiter, or consensus-command channels.
+                    for _ in 1..32 {
+                        if result.is_err() {
+                            break;
+                        }
+                        match self.rx_primaries.try_recv() {
+                            Ok(message) => result = self.process_primary_message(message).await,
+                            Err(_) => break,
+                        }
                     }
+                    result
                 },
 
                 // We receive here loopback headers from the `HeaderWaiter`. Those are headers for which we interrupted
@@ -570,6 +671,7 @@ impl Core {
 
                 // We also receive here our new headers created by the `Proposer`.
                 Some(header) = self.rx_proposer.recv() => self.process_own_header(header).await,
+                Some(command) = self.rx_consensus.recv() => self.process_consensus_command(command).await,
             };
             match result {
                 Ok(()) => (),
@@ -593,6 +695,7 @@ impl Core {
                 self.grade_aggregators.retain(|k, _| live.contains(k));
                 self.grade_voted.retain(|k| live.contains(k));
                 self.grade_two.retain(|k| live.contains(k));
+                self.graded_certificates.retain(|k, _| live.contains(k));
                 self.weak_edge_candidates
                     .retain(|_, round| *round >= gc_round);
                 self.cancel_handlers.retain(|k, _| k >= &gc_round);

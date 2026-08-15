@@ -95,6 +95,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     match matches.subcommand() {
         // Spawn the primary and consensus core.
         ("primary", _) => {
+            let name = keypair.name;
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
             Primary::spawn(
@@ -106,6 +107,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 /* rx_consensus */ rx_feedback,
             );
             Consensus::spawn(
+                name,
                 committee,
                 parameters.gc_depth,
                 /* rx_primary */ rx_new_certificates,

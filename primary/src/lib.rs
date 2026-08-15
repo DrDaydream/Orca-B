@@ -18,6 +18,7 @@ mod synchronizer;
 mod common;
 
 pub use crate::messages::{
-    Certificate, ConsensusMessage, Grade, GradeVote, GradedCertificate, Header,
+    Certificate, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, Grade, GradeVote,
+    GradedCertificate, Header,
 };
 pub use crate::primary::{Primary, PrimaryWorkerMessage, Round, WorkerPrimaryMessage};
