@@ -35,8 +35,6 @@ pub type Round = u64;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
-    /// One network frame carrying GRBC traffic and pending ABA traffic.
-    Bundle(Vec<PrimaryMessage>),
     Header(Header),
     Vote(Vote),
     VoteBatch(Vec<Vote>),

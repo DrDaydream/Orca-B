@@ -76,8 +76,6 @@ pub struct Core {
     grade_aggregators: HashMap<Digest, GradeVotesAggregator>,
     pending_grade_votes: HashMap<Digest, Vec<GradeVote>>,
     ready_outbox: Vec<GradeVote>,
-    aba_network_outbox: Vec<ConsensusNetworkMessage>,
-    aba_flush_at: Option<tokio::time::Instant>,
     ready_support: HashMap<Digest, (Round, PublicKey, HashSet<PublicKey>, Stake)>,
     /// Certificates for which this primary already emitted a grade vote.
     grade_voted: HashSet<Digest>,
@@ -140,8 +138,6 @@ impl Core {
                 grade_aggregators: HashMap::new(),
                 pending_grade_votes: HashMap::new(),
                 ready_outbox: Vec::new(),
-                aba_network_outbox: Vec::new(),
-                aba_flush_at: None,
                 ready_support: HashMap::new(),
                 grade_voted: HashSet::new(),
                 grade_two: HashSet::new(),
@@ -182,10 +178,19 @@ impl Core {
                 let message =
                     ConsensusNetworkMessage::new(payload, self.name, &mut self.signature_service)
                         .await;
-                self.aba_network_outbox.push(message);
-                self.aba_flush_at.get_or_insert_with(|| {
-                    tokio::time::Instant::now() + std::time::Duration::from_millis(1)
-                });
+                let addresses = self
+                    .committee
+                    .others_primaries(&self.name)
+                    .iter()
+                    .map(|(_, x)| x.primary_to_primary)
+                    .collect();
+                let bytes = bincode::serialize(&PrimaryMessage::Consensus(message))
+                    .expect("Failed to serialize ABA message");
+                let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
+                self.cancel_handlers
+                    .entry(self.current_header.round)
+                    .or_default()
+                    .extend(handlers);
             }
             ConsensusCommand::LeaderRequest(round, leader) => {
                 let addresses = self
@@ -556,18 +561,6 @@ impl Core {
     }
 
     async fn broadcast_grbc_batch(&mut self, message: PrimaryMessage, round: Round) {
-        let message = if self.aba_network_outbox.is_empty() {
-            message
-        } else {
-            self.aba_flush_at = None;
-            let mut messages = vec![message];
-            messages.extend(
-                std::mem::take(&mut self.aba_network_outbox)
-                    .into_iter()
-                    .map(PrimaryMessage::Consensus),
-            );
-            PrimaryMessage::Bundle(messages)
-        };
         let addresses = self
             .committee
             .others_primaries(&self.name)
@@ -580,20 +573,6 @@ impl Core {
             .entry(round)
             .or_default()
             .extend(handlers);
-    }
-
-    async fn flush_aba_network_outbox(&mut self) {
-        if self.aba_network_outbox.is_empty() {
-            self.aba_flush_at = None;
-            return;
-        }
-        self.aba_flush_at = None;
-        let messages: Vec<_> = std::mem::take(&mut self.aba_network_outbox)
-            .into_iter()
-            .map(PrimaryMessage::Consensus)
-            .collect();
-        self.broadcast_grbc_batch(PrimaryMessage::Bundle(messages), self.current_header.round)
-            .await;
     }
 
     async fn process_graded_certificate(&mut self, proof: GradedCertificate) -> DagResult<()> {
@@ -737,15 +716,8 @@ impl Core {
         proof.verify(&self.committee)
     }
 
-    #[async_recursion]
     async fn process_primary_message(&mut self, message: PrimaryMessage) -> DagResult<()> {
         match message {
-            PrimaryMessage::Bundle(messages) => {
-                for message in messages {
-                    self.process_primary_message(message).await?;
-                }
-                Ok(())
-            }
             PrimaryMessage::Header(header) => {
                 self.sanitize_header(&header)?;
                 self.process_header(&header).await
@@ -838,14 +810,6 @@ impl Core {
                 .expect("READY verifier pool stopped");
         };
         loop {
-            let aba_deadline = self.aba_flush_at;
-            let aba_timer = async move {
-                match aba_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            tokio::pin!(aba_timer);
             let result = tokio::select! {
                 // We receive here messages from other primaries.
                 Some(message) = self.rx_primaries.recv() => {
@@ -900,10 +864,6 @@ impl Core {
                 Some((vote, verification)) = rx_verified_ready.recv() => match verification {
                     Ok(()) => self.process_grade_vote(vote).await,
                     Err(error) => Err(error),
-                },
-                () = &mut aba_timer => {
-                    self.flush_aba_network_outbox().await;
-                    Ok(())
                 },
             };
             match result {

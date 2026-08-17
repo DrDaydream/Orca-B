@@ -21,7 +21,7 @@
 
 | 端口 | 用途 |
 |---:|---|
-| 3000 | Primary ↔ Primary（GRBC + ABA Bundle） |
+| 3000 | Primary ↔ Primary（GRBC + ABA） |
 | 3001 | Worker → Primary |
 | 3002 | Primary → Worker |
 | 3003 | Client → Worker |
@@ -59,7 +59,7 @@ cargo build --release --features benchmark
 python3 -m pip install --user --break-system-packages -r benchmark/requirements.txt
 ```
 
-**所有机器必须运行完全相同的 Git commit。** Orca-B 新增了 `PrimaryMessage::Bundle`，新旧二进制混用会导致网络消息反序列化失败。检查：
+**所有机器必须运行完全相同的 Git commit。** 新旧二进制混用可能导致网络消息反序列化失败。检查：
 
 ```bash
 while read -r ip; do ssh "$ip" 'git -C ~/Orca-B rev-parse HEAD'; done < deploy/hosts-10.txt
