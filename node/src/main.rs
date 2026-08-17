@@ -106,7 +106,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 /* tx_consensus */ tx_new_certificates,
                 /* rx_consensus */ rx_feedback,
             );
-            Consensus::spawn(
+            Consensus::spawn_batch(
                 name,
                 committee,
                 parameters.gc_depth,
@@ -136,8 +136,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 }
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
-async fn analyze(mut rx_output: Receiver<Certificate>) {
-    while let Some(_certificate) = rx_output.recv().await {
+async fn analyze(mut rx_output: Receiver<Vec<Certificate>>) {
+    while let Some(_certificates) = rx_output.recv().await {
         // NOTE: Here goes the application logic.
     }
 }

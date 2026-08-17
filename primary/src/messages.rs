@@ -266,10 +266,27 @@ impl GradeVote {
         author: &PublicKey,
         signature_service: &mut SignatureService,
     ) -> Self {
+        Self::new_for(
+            certificate.digest(),
+            certificate.round(),
+            certificate.origin(),
+            author,
+            signature_service,
+        )
+        .await
+    }
+
+    pub async fn new_for(
+        id: Digest,
+        round: Round,
+        origin: PublicKey,
+        author: &PublicKey,
+        signature_service: &mut SignatureService,
+    ) -> Self {
         let vote = Self {
-            id: certificate.digest(),
-            round: certificate.round(),
-            origin: certificate.origin(),
+            id,
+            round,
+            origin,
             author: *author,
             signature: Signature::default(),
         };
@@ -317,6 +334,10 @@ pub struct GradedCertificate {
 /// Delivery events emitted by the primary to the consensus layer.
 #[derive(Clone, Debug)]
 pub enum ConsensusMessage {
+    /// The proposer can enter this round after a strong-parent quorum formed.
+    RoundAdvanced(Round),
+    /// A valid author-signed block observed before any quorum certificate or grade.
+    Observed(Header),
     GradeOne(Certificate),
     GradeTwo(Certificate),
     Aba(PublicKey, Vec<u8>),
@@ -326,6 +347,7 @@ pub enum ConsensusMessage {
 #[derive(Debug)]
 pub enum ConsensusCommand {
     Cleanup(Certificate),
+    CleanupBatch(Vec<Certificate>),
     AbaBroadcast(Vec<Vec<u8>>),
     LeaderRequest(Round, PublicKey),
 }

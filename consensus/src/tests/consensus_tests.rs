@@ -9,10 +9,14 @@ use std::collections::{BTreeSet, VecDeque};
 use tokio::sync::mpsc::{channel, Sender};
 
 async fn deliver(tx: &Sender<ConsensusMessage>, certificate: Certificate) {
+    let entered_round = certificate.round() + 1;
     tx.send(ConsensusMessage::GradeOne(certificate.clone()))
         .await
         .unwrap();
     tx.send(ConsensusMessage::GradeTwo(certificate))
+        .await
+        .unwrap();
+    tx.send(ConsensusMessage::RoundAdvanced(entered_round))
         .await
         .unwrap();
 }
@@ -165,7 +169,7 @@ fn finds_paths_over_strong_and_weak_edges() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_output: channel(1).0,
+        tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
     let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
@@ -222,7 +226,7 @@ fn designates_one_leader_every_round() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_output: channel(1).0,
+        tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut expected: Vec<_> = committee.authorities.keys().cloned().collect();
@@ -245,7 +249,7 @@ fn commit_rule_counts_observed_and_dag_strong_support_separately() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_output: channel(1).0,
+        tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -287,7 +291,7 @@ fn commit_rule_two_counts_strong_and_two_hop_virtual_paths() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(10).0,
-        tx_output: channel(10).0,
+        tx_output: OutputSender::Individual(channel(10).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -316,6 +320,72 @@ fn commit_rule_two_counts_strong_and_two_hop_virtual_paths() {
 }
 
 #[test]
+fn virtual_path_checks_the_reference_without_loading_its_target() {
+    let committee = mock_committee();
+    let consensus = Consensus {
+        name: keys()[0].0,
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary: channel(10).0,
+        tx_output: OutputSender::Individual(channel(10).0),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    let missing_target = Digest::default();
+
+    let (_, mut middle) = mock_certificate(authorities[1], 2, BTreeSet::new());
+    middle.header.virtual_edges.insert(missing_target.clone());
+    let middle_digest = middle.digest();
+    state.observe(middle);
+
+    let block = mock_certificate(authorities[2], 3, [middle_digest].iter().cloned().collect()).1;
+    assert!(consensus.has_two_hop_virtual_path(&block, &missing_target, &state));
+    assert!(!state.observed.contains_key(&missing_target));
+}
+
+#[test]
+fn unfinished_aba_instance_survives_dag_gc() {
+    let committee = mock_committee();
+    let name = keys()[0].0;
+    let mut state = State::new(Certificate::genesis(&committee));
+    state.last_committed_round = 100;
+    state.aba_instances.insert(
+        1,
+        Aba::new(committee, name, 1, DeterministicCoin::new(0x4f52_4341)),
+    );
+    state.aba_inputs.insert(1);
+
+    state.gc_protocol_state(0);
+
+    assert!(state.aba_instances.contains_key(&1));
+    assert!(state.aba_inputs.contains(&1));
+}
+
+#[test]
+fn forced_admission_accepts_observed_leader_and_late_history() {
+    let committee = mock_committee();
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    let (late_digest, late_parent) = mock_certificate(authorities[1], 1, BTreeSet::new());
+    let (_, leader) = mock_certificate(
+        authorities[0],
+        2,
+        [late_digest.clone()].iter().cloned().collect(),
+    );
+    let leader_digest = leader.digest();
+
+    state.observe(leader.clone());
+    state.force_observed_history_to_dag(leader, 2);
+    assert!(state.dag_digests.contains(&leader_digest));
+    assert!(!state.dag_digests.contains(&late_digest));
+
+    state.observe(late_parent);
+    assert!(state.dag_digests.contains(&late_digest));
+}
+
+#[test]
 fn commit_rule_three_counts_exact_three_edge_virtual_paths() {
     let committee = mock_committee();
     let consensus = Consensus {
@@ -324,7 +394,7 @@ fn commit_rule_three_counts_exact_three_edge_virtual_paths() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(10).0,
-        tx_output: channel(10).0,
+        tx_output: OutputSender::Individual(channel(10).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -368,7 +438,7 @@ async fn commit_rule_two_condition_three_forces_leader_grade_two() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_output,
+        tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
@@ -387,7 +457,9 @@ async fn commit_rule_two_condition_three_forces_leader_grade_two() {
     }
 
     assert!(!state.grade_two.contains(&leader_digest));
-    consensus.evaluate_commit_rule_two(3, &mut state, true).await;
+    consensus
+        .evaluate_commit_rule_two(3, &mut state, true)
+        .await;
     assert!(state.grade_two.contains(&leader_digest));
     assert!(state.dag_digests.contains(&leader_digest));
     assert!(state.aba_inputs.contains(&1));
@@ -410,7 +482,7 @@ async fn leader_commits_wait_for_the_previous_leader() {
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_output,
+        tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));

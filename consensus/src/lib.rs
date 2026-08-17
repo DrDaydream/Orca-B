@@ -5,7 +5,9 @@ use crypto::{Digest, PublicKey};
 use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, ConsensusCommand, ConsensusMessage, Round};
 use std::cmp::max;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 pub mod aba;
@@ -25,23 +27,6 @@ type Dag = HashMap<Round, HashMap<PublicKey, (Digest, Certificate)>>;
 type VDag = HashMap<Round, HashMap<PublicKey, (Digest, Certificate)>>;
 
 #[derive(Default)]
-struct RuleOneSupport {
-    processed_observed: HashSet<Digest>,
-    processed_dag: HashSet<Digest>,
-    observed: HashSet<PublicKey>,
-    dag: HashSet<PublicKey>,
-}
-
-#[derive(Default)]
-struct RuleTwoSupport {
-    processed_observed: HashSet<Digest>,
-    processed_dag: HashSet<Digest>,
-    observed_strong: HashSet<PublicKey>,
-    dag_strong: HashSet<PublicKey>,
-    dag_strong_or_virtual: HashSet<PublicKey>,
-}
-
-#[derive(Default)]
 struct AbaSupport {
     processed_grade_two: HashSet<Digest>,
     strong: HashSet<PublicKey>,
@@ -58,6 +43,7 @@ struct State {
     /// Keeps the latest committed certificate (and its parents) for every authority. Anything older
     /// must be regularly cleaned up through the function `update`.
     dag: Dag,
+    dag_by_digest: HashMap<Digest, Certificate>,
     /// Blocks locally delivered by GRBC with grade 1.
     vdag: VDag,
     /// Blocks for which a valid grade-2 proof has been delivered.
@@ -67,18 +53,23 @@ struct State {
     /// Direct digest lookup over Dag union VDag. This avoids scanning every
     /// round for each step of a reachability query.
     observed: HashMap<Digest, Certificate>,
-    /// Memoized strong-path answers keyed by (source, target). Positive
-    /// answers remain valid because certificate edges are immutable. Negative
-    /// answers are discarded whenever a newly observed block may fill a gap.
-    strong_path_cache: HashMap<(Digest, Digest), bool>,
+    /// Locates an observed leader even before it reaches grade 1.
+    observed_by_round: HashMap<Round, HashMap<PublicKey, Digest>>,
+    strong_ancestors: HashMap<Digest, HashSet<Digest>>,
+    strong_children: HashMap<Digest, HashSet<Digest>>,
+    observed_strong_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
+    dag_strong_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
+    observed_direct_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
+    dag_direct_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
     /// Number of strong/weak dependencies not yet known to have entered Dag.
     missing_dependencies: HashMap<Digest, usize>,
     /// Reverse dependency index used to wake only blocks affected by a newly
     /// promoted Dag certificate.
     dependency_waiters: HashMap<Digest, HashSet<Digest>>,
+    /// Missing causal history authorized for direct Dag admission by a
+    /// commit-ready leader. Arrival at any verified GRBC stage wakes it.
+    forced_history_waiters: HashMap<Digest, HashSet<Round>>,
     promotion_queue: VecDeque<Digest>,
-    rule_one_support: HashMap<(Round, Digest), RuleOneSupport>,
-    rule_two_support: HashMap<(Round, Digest), RuleTwoSupport>,
     aba_support: HashMap<(Round, Digest), AbaSupport>,
     /// The authority designated as leader for every round.
     leaders: HashMap<Round, PublicKey>,
@@ -88,10 +79,18 @@ struct State {
     skipped_leaders: HashSet<Round>,
     /// Commit-ready leaders waiting for the previous round's leader.
     pending_leaders: BTreeMap<Round, Certificate>,
+    /// Time when the leader first satisfied a commit rule. Benchmark latency
+    /// ends here rather than after predecessor/output waiting.
+    rule_ready_at_ms: HashMap<Round, u128>,
+    pending_order: HashMap<Round, Vec<Certificate>>,
+    ready_pending: BTreeSet<Round>,
+    commit_tx: Option<mpsc::UnboundedSender<Vec<Certificate>>>,
     aba_instances: HashMap<Round, Aba<DeterministicCoin>>,
     aba_inputs: HashSet<Round>,
     aba_decisions: HashMap<Round, BinaryValue>,
     buffered_aba: HashMap<Round, Vec<(PublicKey, AbaMessage)>>,
+    /// ABA broadcasts accumulated during one consensus ingress batch.
+    aba_outbox: Vec<Vec<u8>>,
     missing_leader_requests: HashSet<Round>,
     /// Leaders made commit-ready directly by rules 1 or 2. ABA can help
     /// propagate input 1 but can never override this local fast-path result.
@@ -99,6 +98,7 @@ struct State {
     /// Highest leader round whose r+3 deadline has been processed. This keeps
     /// zero-input handling incremental instead of rescanning round 1 onward.
     zero_input_checked_through: Round,
+    highest_entered_round: Round,
 }
 
 impl State {
@@ -110,15 +110,28 @@ impl State {
 
         let genesis_dag: Dag = [(0, genesis)].iter().cloned().collect();
 
-        let dag_digests = genesis_dag
+        let dag_by_digest: HashMap<_, _> = genesis_dag
             .values()
             .flat_map(|authorities| authorities.values())
-            .map(|(digest, _)| digest.clone())
+            .map(|(digest, certificate)| (digest.clone(), certificate.clone()))
             .collect();
+        let dag_digests = dag_by_digest.keys().cloned().collect();
         let observed = genesis_dag
             .values()
             .flat_map(|authorities| authorities.values())
             .map(|(digest, certificate)| (digest.clone(), certificate.clone()))
+            .collect();
+        let observed_by_round = genesis_dag
+            .iter()
+            .map(|(round, authorities)| {
+                (
+                    *round,
+                    authorities
+                        .iter()
+                        .map(|(authority, (digest, _))| (*authority, digest.clone()))
+                        .collect(),
+                )
+            })
             .collect();
 
         Self {
@@ -130,40 +143,181 @@ impl State {
                 .map(|(x, (_, y))| (*x, y.round()))
                 .collect(),
             dag: genesis_dag,
+            dag_by_digest,
             // Genesis blocks already belong to the ordering DAG, so they must
             // not also appear in VDag.
             vdag: HashMap::new(),
             grade_two: HashSet::new(),
             dag_digests,
             observed,
-            strong_path_cache: HashMap::new(),
+            observed_by_round,
+            strong_ancestors: HashMap::new(),
+            strong_children: HashMap::new(),
+            observed_strong_support: HashMap::new(),
+            dag_strong_support: HashMap::new(),
+            observed_direct_support: HashMap::new(),
+            dag_direct_support: HashMap::new(),
             missing_dependencies: HashMap::new(),
             dependency_waiters: HashMap::new(),
+            forced_history_waiters: HashMap::new(),
             promotion_queue: VecDeque::new(),
-            rule_one_support: HashMap::new(),
-            rule_two_support: HashMap::new(),
             aba_support: HashMap::new(),
             leaders: HashMap::new(),
             committed_leaders: [0].iter().cloned().collect(),
             skipped_leaders: HashSet::new(),
             pending_leaders: BTreeMap::new(),
+            rule_ready_at_ms: HashMap::new(),
+            pending_order: HashMap::new(),
+            ready_pending: BTreeSet::new(),
+            commit_tx: None,
             aba_instances: HashMap::new(),
             aba_inputs: HashSet::new(),
             aba_decisions: HashMap::new(),
             buffered_aba: HashMap::new(),
+            aba_outbox: Vec::new(),
             missing_leader_requests: HashSet::new(),
             direct_commit_ready: HashSet::new(),
             zero_input_checked_through: 0,
+            highest_entered_round: 1,
+        }
+    }
+
+    fn record_rule_ready(&mut self, round: Round) {
+        self.rule_ready_at_ms.entry(round).or_insert_with(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("System clock is before Unix epoch")
+                .as_millis()
+        });
+    }
+
+    /// Record valid data seen at any GRBC stage. If it belongs to the causal
+    /// history of a commit-ready leader, admit it immediately without waiting
+    /// for grade 1 or grade 2.
+    fn observe(&mut self, certificate: Certificate) -> HashSet<Round> {
+        let digest = certificate.digest();
+        self.observed_by_round
+            .entry(certificate.round())
+            .or_default()
+            .insert(certificate.origin(), digest.clone());
+        match self.observed.entry(digest.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(certificate);
+                return HashSet::new();
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(certificate.clone());
+            }
+        }
+        self.index_strong_paths(&certificate);
+
+        let owners = self
+            .forced_history_waiters
+            .remove(&digest)
+            .unwrap_or_default();
+        for owner_round in &owners {
+            self.force_observed_history_to_dag(certificate.clone(), *owner_round);
+        }
+        owners
+    }
+
+    fn index_strong_paths(&mut self, certificate: &Certificate) {
+        let digest = certificate.digest();
+        let mut additions = HashSet::new();
+        for parent in &certificate.header.parents {
+            self.observed_direct_support
+                .entry((certificate.round(), parent.clone()))
+                .or_default()
+                .insert(certificate.origin());
+            self.strong_children
+                .entry(parent.clone())
+                .or_default()
+                .insert(digest.clone());
+            additions.insert(parent.clone());
+            if let Some(ancestors) = self.strong_ancestors.get(parent) {
+                additions.extend(ancestors.iter().cloned());
+            }
+        }
+        self.propagate_strong_ancestors(digest, additions);
+    }
+
+    fn propagate_strong_ancestors(&mut self, source: Digest, additions: HashSet<Digest>) {
+        let mut pending = vec![(source, additions)];
+        while let Some((digest, candidates)) = pending.pop() {
+            let ancestors = self.strong_ancestors.entry(digest.clone()).or_default();
+            let fresh: HashSet<_> = candidates
+                .into_iter()
+                .filter(|ancestor| ancestors.insert(ancestor.clone()))
+                .collect();
+            if fresh.is_empty() {
+                continue;
+            }
+            if let Some(block) = self.observed.get(&digest) {
+                for ancestor in &fresh {
+                    self.observed_strong_support
+                        .entry((block.round(), ancestor.clone()))
+                        .or_default()
+                        .insert(block.origin());
+                    if self.dag_digests.contains(&digest) {
+                        self.dag_strong_support
+                            .entry((block.round(), ancestor.clone()))
+                            .or_default()
+                            .insert(block.origin());
+                    }
+                }
+            }
+            if let Some(children) = self.strong_children.get(&digest).cloned() {
+                for child in children {
+                    pending.push((child, fresh.clone()));
+                }
+            }
+        }
+    }
+
+    /// Orca-A forced admission: once a leader is commit-ready, insert every
+    /// currently observed strong/weak/virtual ancestor directly into Dag and
+    /// remember missing digests so their later observation completes history.
+    fn force_observed_history_to_dag(&mut self, root: Certificate, owner_round: Round) {
+        let mut pending = vec![root];
+        let mut visited = HashSet::new();
+        while let Some(certificate) = pending.pop() {
+            let digest = certificate.digest();
+            if !visited.insert(digest.clone()) {
+                continue;
+            }
+            for dependency in certificate
+                .header
+                .parents
+                .iter()
+                .chain(&certificate.header.weak_edges)
+                .chain(&certificate.header.virtual_edges)
+            {
+                if self.dag_digests.contains(dependency) {
+                    continue;
+                }
+                if let Some(ancestor) = self.observed.get(dependency).cloned() {
+                    pending.push(ancestor);
+                } else {
+                    self.forced_history_waiters
+                        .entry(dependency.clone())
+                        .or_default()
+                        .insert(owner_round);
+                }
+            }
+            if !self.dag_digests.contains(&digest) {
+                self.promote_to_dag(certificate);
+            }
         }
     }
 
     /// Insert a block delivered by GRBC at grade 1 into the validated DAG.
-    fn insert_grade_one(&mut self, certificate: Certificate) {
+    fn insert_grade_one(&mut self, certificate: Certificate) -> HashSet<Round> {
         let round = certificate.round();
         let origin = certificate.origin();
         let digest = certificate.digest();
-        self.observed.insert(digest.clone(), certificate.clone());
-        self.strong_path_cache.retain(|_, reachable| *reachable);
+        if self.dag_digests.contains(&digest) {
+            return self.observe(certificate);
+        }
         let missing: HashSet<_> = certificate
             .header
             .parents
@@ -178,14 +332,16 @@ impl State {
                 .or_default()
                 .insert(digest.clone());
         }
-        self.missing_dependencies.insert(digest.clone(), missing.len());
+        self.missing_dependencies
+            .insert(digest.clone(), missing.len());
         if missing.is_empty() && self.grade_two.contains(&digest) {
             self.promotion_queue.push_back(digest.clone());
         }
         self.vdag
             .entry(round)
             .or_insert_with(HashMap::new)
-            .insert(origin, (digest, certificate));
+            .insert(origin, (digest, certificate.clone()));
+        self.observe(certificate)
     }
 
     /// Promote a grade-1 block into Tusk's ordering DAG. A block contained in
@@ -194,6 +350,14 @@ impl State {
         let round = certificate.round();
         let origin = certificate.origin();
         let digest = certificate.digest();
+
+        self.observed_by_round
+            .entry(round)
+            .or_default()
+            .insert(origin, digest.clone());
+        self.observed
+            .entry(digest.clone())
+            .or_insert_with(|| certificate.clone());
 
         if let Some(authorities) = self.vdag.get_mut(&round) {
             let same_block = authorities
@@ -210,17 +374,71 @@ impl State {
         self.dag
             .entry(round)
             .or_insert_with(HashMap::new)
-            .insert(origin, (digest.clone(), certificate));
-        self.dag_digests.insert(digest);
+            .insert(origin, (digest.clone(), certificate.clone()));
+        self.dag_by_digest.insert(digest.clone(), certificate);
+        if !self.dag_digests.insert(digest.clone()) {
+            return;
+        }
+        if let Some(ancestors) = self.strong_ancestors.get(&digest) {
+            for ancestor in ancestors {
+                self.dag_strong_support
+                    .entry((round, ancestor.clone()))
+                    .or_default()
+                    .insert(origin);
+            }
+        }
+        for parent in &self
+            .dag_by_digest
+            .get(&digest)
+            .expect("new Dag block missing from digest index")
+            .header
+            .parents
+        {
+            self.dag_direct_support
+                .entry((round, parent.clone()))
+                .or_default()
+                .insert(origin);
+        }
+        if let Some(waiters) = self.dependency_waiters.remove(&digest) {
+            for waiter in waiters {
+                if let Some(missing) = self.missing_dependencies.get_mut(&waiter) {
+                    *missing = missing.saturating_sub(1);
+                    if *missing == 0 && self.grade_two.contains(&waiter) {
+                        self.promotion_queue.push_back(waiter);
+                    }
+                }
+            }
+        }
+        self.wake_pending(round);
     }
 
-    fn mark_grade_two(&mut self, digest: Digest) {
-        if self.grade_two.insert(digest.clone())
+    fn predecessor_resolved(&self, round: Round) -> bool {
+        round > 0
+            && (self.committed_leaders.contains(&(round - 1))
+                || self.skipped_leaders.contains(&(round - 1)))
+    }
+
+    fn wake_pending(&mut self, round: Round) {
+        if self.pending_leaders.contains_key(&round) && self.predecessor_resolved(round) {
+            self.ready_pending.insert(round);
+        }
+    }
+
+    fn mark_skipped(&mut self, round: Round) {
+        if self.skipped_leaders.insert(round) {
+            self.wake_pending(round + 1);
+        }
+    }
+
+    fn mark_grade_two(&mut self, digest: Digest) -> bool {
+        let inserted = self.grade_two.insert(digest.clone());
+        if inserted
             && self.missing_dependencies.get(&digest) == Some(&0)
             && self.observed.contains_key(&digest)
         {
             self.promotion_queue.push_back(digest);
         }
+        inserted
     }
 
     /// Promote every grade-2 VDag block whose strong and weak dependencies are
@@ -241,42 +459,31 @@ impl State {
             self.promote_to_dag(certificate.clone());
             self.missing_dependencies.remove(&digest);
             promoted.push(certificate);
-
-            if let Some(waiters) = self.dependency_waiters.remove(&digest) {
-                for waiter in waiters {
-                    if let Some(missing) = self.missing_dependencies.get_mut(&waiter) {
-                        *missing = missing.saturating_sub(1);
-                        if *missing == 0 && self.grade_two.contains(&waiter) {
-                            self.promotion_queue.push_back(waiter);
-                        }
-                    }
-                }
-            }
         }
         promoted
     }
 
     /// Update and clean up internal state base on committed certificates.
-    fn update(&mut self, certificate: &Certificate, gc_depth: Round) {
-        self.last_committed
-            .entry(certificate.origin())
-            .and_modify(|r| *r = max(*r, certificate.round()))
-            .or_insert_with(|| certificate.round());
+    fn update(&mut self, certificates: &[Certificate], gc_depth: Round) {
+        for certificate in certificates {
+            self.last_committed
+                .entry(certificate.origin())
+                .and_modify(|r| *r = max(*r, certificate.round()))
+                .or_insert_with(|| certificate.round());
+        }
 
         let last_committed_round = *self.last_committed.values().max().unwrap();
         self.last_committed_round = last_committed_round;
 
-        for (name, round) in &self.last_committed {
-            self.dag.retain(|r, authorities| {
-                authorities.retain(|n, _| n != name || r >= round);
-                !authorities.is_empty() && r + gc_depth >= last_committed_round
-            });
-            self.vdag.retain(|r, authorities| {
-                authorities.retain(|n, _| n != name || r >= round);
-                !authorities.is_empty() && r + gc_depth >= last_committed_round
-            });
-        }
-
+        let last_committed = &self.last_committed;
+        self.dag.retain(|r, authorities| {
+            authorities.retain(|name, _| last_committed.get(name).map_or(true, |round| r >= round));
+            !authorities.is_empty() && *r + gc_depth >= last_committed_round
+        });
+        self.vdag.retain(|r, authorities| {
+            authorities.retain(|name, _| last_committed.get(name).map_or(true, |round| r >= round));
+            !authorities.is_empty() && *r + gc_depth >= last_committed_round
+        });
     }
 
     fn gc_protocol_state(&mut self, gc_depth: Round) {
@@ -291,10 +498,23 @@ impl State {
             .flat_map(|authorities| authorities.values())
             .map(|(digest, _)| digest.clone())
             .collect();
-        self.observed.retain(|digest, _| retained.contains(digest));
+        self.dag_by_digest
+            .retain(|digest, _| retained.contains(digest));
+        self.observed.retain(|digest, certificate| {
+            retained.contains(digest) || certificate.round() >= gc_round
+        });
+        let observed = &self.observed;
+        self.observed_by_round.retain(|round, blocks| {
+            blocks.retain(|_, digest| observed.contains_key(digest));
+            *round >= gc_round && !blocks.is_empty()
+        });
         self.grade_two.retain(|digest| retained.contains(digest));
-        self.strong_path_cache.retain(|(source, target), reachable| {
-            *reachable && retained.contains(source) && retained.contains(target)
+        let observed = &self.observed;
+        self.strong_ancestors
+            .retain(|digest, _| observed.contains_key(digest));
+        self.strong_children.retain(|digest, children| {
+            children.retain(|child| observed.contains_key(child));
+            observed.contains_key(digest) || !children.is_empty()
         });
         self.missing_dependencies
             .retain(|digest, _| retained.contains(digest));
@@ -302,22 +522,37 @@ impl State {
             waiters.retain(|digest| retained.contains(digest));
             !waiters.is_empty()
         });
+        let dag_digests = &self.dag_digests;
+        self.forced_history_waiters.retain(|digest, owners| {
+            owners.retain(|round| *round >= gc_round);
+            !owners.is_empty() && !dag_digests.contains(digest)
+        });
         self.promotion_queue
             .retain(|digest| retained.contains(digest));
-        self.rule_one_support
+        self.observed_strong_support
             .retain(|(round, _), _| *round >= gc_round);
-        self.rule_two_support
+        self.dag_strong_support
             .retain(|(round, _), _| *round >= gc_round);
+        self.observed_direct_support
+            .retain(|(round, _), _| *round >= gc_round);
+        self.dag_direct_support
+            .retain(|(round, _), _| *round >= gc_round);
+        let active_aba: HashSet<_> = self.aba_instances.keys().cloned().collect();
         self.aba_support
-            .retain(|(round, _), _| *round >= gc_round);
+            .retain(|(round, _), _| *round >= gc_round || active_aba.contains(round));
         // `dag_digests` is intentionally monotonic: membership proves that a
         // dependency entered Dag before its full certificate was garbage
         // collected, and later promotions still rely on that proof.
-        self.aba_instances.retain(|round, _| *round >= gc_round);
-        self.aba_inputs.retain(|round| *round >= gc_round);
+        // Unfinished ABA instances are independent of DAG GC and retain all
+        // BVAL/AUX/DECIDE state until they produce a certified output.
+        self.aba_inputs
+            .retain(|round| *round >= gc_round || active_aba.contains(round));
         self.aba_decisions.retain(|round, _| *round >= gc_round);
-        self.buffered_aba.retain(|round, _| *round >= gc_round);
-        self.missing_leader_requests.retain(|round| *round >= gc_round);
+        let aba_decisions = &self.aba_decisions;
+        self.buffered_aba
+            .retain(|round, _| *round >= gc_round || !aba_decisions.contains_key(round));
+        self.missing_leader_requests
+            .retain(|round| *round >= gc_round);
         self.direct_commit_ready.retain(|round| *round >= gc_round);
         self.leaders.retain(|round, _| *round >= gc_round);
         self.committed_leaders.retain(|round| *round >= gc_round);
@@ -338,10 +573,16 @@ pub struct Consensus {
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
     tx_primary: Sender<ConsensusCommand>,
     /// Outputs the sequence of ordered certificates to the application layer.
-    tx_output: Sender<Certificate>,
+    tx_output: OutputSender,
 
     /// The genesis certificates.
     genesis: Vec<Certificate>,
+}
+
+#[derive(Clone)]
+enum OutputSender {
+    Individual(Sender<Certificate>),
+    Batch(Sender<Vec<Certificate>>),
 }
 
 impl Consensus {
@@ -360,7 +601,33 @@ impl Consensus {
                 gc_depth,
                 rx_primary,
                 tx_primary,
-                tx_output,
+                tx_output: OutputSender::Individual(tx_output),
+                genesis: Certificate::genesis(&committee),
+            }
+            .run()
+            .await;
+        });
+    }
+
+    /// Production entry point with one channel operation per ordered commit
+    /// batch. The legacy `spawn` API remains for unit tests and embedders that
+    /// consume certificates individually.
+    pub fn spawn_batch(
+        name: PublicKey,
+        committee: Committee,
+        gc_depth: Round,
+        rx_primary: Receiver<ConsensusMessage>,
+        tx_primary: Sender<ConsensusCommand>,
+        tx_output: Sender<Vec<Certificate>>,
+    ) {
+        tokio::spawn(async move {
+            Self {
+                name,
+                committee: committee.clone(),
+                gc_depth,
+                rx_primary,
+                tx_primary,
+                tx_output: OutputSender::Batch(tx_output),
                 genesis: Certificate::genesis(&committee),
             }
             .run()
@@ -372,26 +639,97 @@ impl Consensus {
         // The consensus state (everything else is immutable).
         let mut state = State::new(self.genesis.clone());
 
+        let (commit_tx, mut commit_rx) = mpsc::unbounded_channel::<Vec<Certificate>>();
+        state.commit_tx = Some(commit_tx);
+        let tx_cleanup = self.tx_primary.clone();
+        let tx_output = self.tx_output.clone();
+        tokio::spawn(async move {
+            while let Some(sequence) = commit_rx.recv().await {
+                if tx_cleanup
+                    .send(ConsensusCommand::CleanupBatch(sequence.clone()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let output_failed = match &tx_output {
+                    OutputSender::Batch(sender) => sender.send(sequence).await.is_err(),
+                    OutputSender::Individual(sender) => {
+                        let mut failed = false;
+                        for certificate in sequence {
+                            if sender.send(certificate).await.is_err() {
+                                failed = true;
+                                break;
+                            }
+                        }
+                        failed
+                    }
+                };
+                if output_failed {
+                    return;
+                }
+            }
+        });
+
         // Listen to incoming certificates.
         while let Some(message) = self.rx_primary.recv().await {
-            let (observed_round, promoted) = match message {
+            if let ConsensusMessage::RoundAdvanced(round) = message {
+                if round > state.highest_entered_round {
+                    state.highest_entered_round = round;
+                    self.input_zero_at_round_end(round, &mut state).await;
+                    self.flush_aba_outbox(&mut state).await;
+                }
+                continue;
+            }
+            let (
+                observed_round,
+                observed_origin,
+                first_observation,
+                grade_two_changed,
+                promoted,
+                history_owners,
+            ) = match message {
+                ConsensusMessage::RoundAdvanced(_) => unreachable!(),
+                ConsensusMessage::Observed(header) => {
+                    let round = header.round;
+                    let certificate = Certificate {
+                        header,
+                        votes: Vec::new(),
+                    };
+                    let origin = certificate.origin();
+                    let first = !state.observed.contains_key(&certificate.digest());
+                    let owners = state.observe(certificate);
+                    (round, origin, first, false, Vec::new(), owners)
+                }
                 ConsensusMessage::GradeOne(certificate) => {
                     debug!("Grade 1 delivered {:?}", certificate);
                     let round = certificate.round();
-                    state.insert_grade_one(certificate);
-                    (round, state.promote_ready())
+                    let origin = certificate.origin();
+                    let first = !state.observed.contains_key(&certificate.digest());
+                    let owners = state.insert_grade_one(certificate);
+                    (round, origin, first, false, state.promote_ready(), owners)
                 }
                 ConsensusMessage::GradeTwo(certificate) => {
                     debug!("Grade 2 delivered {:?}", certificate);
                     let round = certificate.round();
-                    state.mark_grade_two(certificate.digest());
-                    (round, state.promote_ready())
+                    let first = !state.observed.contains_key(&certificate.digest());
+                    let owners = state.observe(certificate.clone());
+                    let changed = state.mark_grade_two(certificate.digest());
+                    (
+                        round,
+                        certificate.origin(),
+                        first,
+                        changed,
+                        state.promote_ready(),
+                        owners,
+                    )
                 }
                 ConsensusMessage::Aba(sender, bytes) => {
                     match bincode::deserialize::<AbaMessage>(&bytes) {
                         Ok(message) => self.process_aba_message(sender, message, &mut state).await,
                         Err(error) => warn!("Ignoring malformed ABA message: {}", error),
                     }
+                    self.flush_aba_outbox(&mut state).await;
                     continue;
                 }
                 ConsensusMessage::AbaBatch(sender, batch) => {
@@ -403,9 +741,20 @@ impl Consensus {
                             Err(error) => warn!("Ignoring malformed ABA message: {}", error),
                         }
                     }
+                    self.flush_aba_outbox(&mut state).await;
                     continue;
                 }
             };
+
+            // Refresh only cached orders affected by newly arrived forced
+            // causal history; this avoids rescanning historical leaders.
+            for owner_round in history_owners {
+                if let Some(leader) = state.pending_leaders.get(&owner_round).cloned() {
+                    let ordered = self.order_dag(&leader, &state);
+                    state.pending_order.insert(owner_round, ordered);
+                    state.wake_pending(owner_round);
+                }
+            }
 
             // Designation happens as soon as the round is observed, even if
             // none of its grade-1 blocks is ready to enter Dag yet.
@@ -413,45 +762,57 @@ impl Consensus {
             if state.leaders.insert(observed_round, designated).is_none() {
                 debug!("Round {} designated leader {}", observed_round, designated);
             }
-            self.ensure_aba_instance(observed_round, &mut state).await;
+            if first_observation {
+                self.ensure_aba_instance(observed_round, &mut state).await;
+                // The designated leader may arrive after its r+2 Grade-2
+                // supporters. Reconcile only that leader's GRBC-derived ABA
+                // support instead of rescanning historical leaders.
+                if observed_origin == self.ordering_leader_authority(observed_round) {
+                    self.evaluate_aba_r_plus_two_input(observed_round, &mut state)
+                        .await;
+                }
+            }
 
             // Incremental hot path: a block in support round r can affect only
             // the leaders at r-1 (rule 1) and r-2 (rule 2 / ABA input). Also
             // inspect rounds of blocks newly promoted from VDag, since a late
             // promotion can cross a Dag-only threshold.
-            let mut affected_rounds: HashSet<_> = promoted
-                .iter()
-                .map(Certificate::round)
-                .collect();
-            affected_rounds.insert(observed_round);
+            let promoted_rounds: HashSet<_> = promoted.iter().map(Certificate::round).collect();
+            let mut affected_rounds = promoted_rounds.clone();
+            if first_observation {
+                affected_rounds.insert(observed_round);
+            }
             for support_round in affected_rounds {
                 self.evaluate_commit_rule_one(support_round, &mut state, true)
                     .await;
                 self.evaluate_commit_rule_two(support_round, &mut state, true)
                     .await;
+            }
+            let mut aba_rounds = promoted_rounds;
+            if grade_two_changed {
+                aba_rounds.insert(observed_round);
+            }
+            for support_round in aba_rounds {
                 if support_round >= 3 {
                     self.evaluate_aba_r_plus_two_input(support_round - 2, &mut state)
                         .await;
                 }
             }
 
-            let entered_round = state
-                .dag
-                .iter()
-                .filter(|(_, blocks)| {
-                    blocks
-                        .keys()
-                        .map(|name| self.committee.stake(name))
-                        .sum::<Stake>()
-                        >= self.committee.quorum_threshold()
-                })
-                .map(|(round, _)| round + 1)
-                .max()
-                .unwrap_or(1);
-            self.input_zero_at_round_end(entered_round, &mut state)
-                .await;
             self.resolve_requested_leaders(&mut state).await;
+            self.flush_aba_outbox(&mut state).await;
         }
+    }
+
+    async fn flush_aba_outbox(&mut self, state: &mut State) {
+        if state.aba_outbox.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut state.aba_outbox);
+        self.tx_primary
+            .send(ConsensusCommand::AbaBroadcast(batch))
+            .await
+            .expect("Failed to send ABA batch to primary");
     }
 
     async fn ensure_aba_instance(&mut self, leader_round: Round, state: &mut State) {
@@ -484,9 +845,6 @@ impl Consensus {
         state: &mut State,
     ) {
         let instance = message.instance;
-        if instance + self.gc_depth < state.last_committed_round {
-            return;
-        }
         if !state.aba_instances.contains_key(&instance) {
             if state.aba_decisions.contains_key(&instance) {
                 return;
@@ -534,42 +892,25 @@ impl Consensus {
         actions: Vec<AbaAction>,
         state: &mut State,
     ) {
-        let mut broadcasts = Vec::new();
         for action in actions {
             match action {
                 AbaAction::Broadcast(message) => {
                     let bytes =
                         bincode::serialize(&message).expect("Failed to serialize ABA message");
-                    broadcasts.push(bytes);
+                    state.aba_outbox.push(bytes);
                 }
                 AbaAction::Decide(value) => {
                     // ABA is the cold-path trigger for an older leader. Before
                     // applying its output, perform one final targeted scan of
                     // that leader's rule-1 and rule-2 support rounds. A direct
                     // rule result retains precedence over ABA 0.
-                    Box::pin(self.evaluate_commit_rule_one(
-                        leader_round + 1,
-                        state,
-                        false,
-                    ))
-                    .await;
-                    Box::pin(self.evaluate_commit_rule_two(
-                        leader_round + 2,
-                        state,
-                        false,
-                    ))
-                    .await;
+                    Box::pin(self.evaluate_commit_rule_one(leader_round + 1, state, false)).await;
+                    Box::pin(self.evaluate_commit_rule_two(leader_round + 2, state, false)).await;
                     if state.aba_decisions.insert(leader_round, value).is_none() {
                         self.apply_aba_decision(leader_round, value, state).await;
                     }
                 }
             }
-        }
-        if !broadcasts.is_empty() {
-            self.tx_primary
-                .send(ConsensusCommand::AbaBroadcast(broadcasts))
-                .await
-                .expect("Failed to send ABA batch to primary");
         }
         // A certified DECIDE contains f+1 authenticated votes, so reliable
         // dissemination no longer depends on this instance retaining all of
@@ -600,7 +941,7 @@ impl Consensus {
                     return;
                 }
                 debug!("ABA skips leader round {}", leader_round);
-                state.skipped_leaders.insert(leader_round);
+                state.mark_skipped(leader_round);
                 self.drain_ready_leaders(state).await;
             }
             BinaryValue::One => {
@@ -611,6 +952,7 @@ impl Consensus {
                     let digest = leader.digest();
                     state.mark_grade_two(digest);
                     state.promote_ready();
+                    state.force_observed_history_to_dag(leader.clone(), leader_round);
                     self.queue_leader_commit(leader, state).await;
                 } else if state.missing_leader_requests.insert(leader_round) {
                     let authority = self.ordering_leader_authority(leader_round);
@@ -631,6 +973,7 @@ impl Consensus {
                 let digest = leader.digest();
                 state.mark_grade_two(digest);
                 state.promote_ready();
+                state.force_observed_history_to_dag(leader.clone(), round);
                 self.queue_leader_commit(leader, state).await;
             }
         }
@@ -663,16 +1006,20 @@ impl Consensus {
             .filter(|(block_digest, _)| state.grade_two.contains(block_digest))
             .map(|(block_digest, block)| (block_digest.clone(), block.clone()))
             .collect();
-        for (block_digest, block) in blocks {
-            if !support.processed_grade_two.insert(block_digest) {
-                continue;
-            }
-            let strong = self.has_strong_path(&block, &digest, state);
+        let fresh: Vec<_> = blocks
+            .into_iter()
+            .filter(|(block_digest, _)| support.processed_grade_two.insert(block_digest.clone()))
+            .map(|(_, block)| block)
+            .collect();
+        let classified = self.classify_paths_parallel(&fresh, &digest, state);
+        // Worker threads only read immutable indexes. All protocol state is
+        // merged here, in the single ordered consensus task.
+        for (origin, strong, strong_or_virtual) in classified {
             if strong {
-                support.strong.insert(block.origin());
+                support.strong.insert(origin);
             }
-            if strong || self.has_two_hop_virtual_path(&block, &digest, state) {
-                support.strong_or_virtual.insert(block.origin());
+            if strong_or_virtual {
+                support.strong_or_virtual.insert(origin);
             }
         }
         let any_strong = !support.strong.is_empty();
@@ -730,51 +1077,25 @@ impl Consensus {
         &self,
         round: Round,
         leader_digest: &Digest,
-        state: &mut State,
+        state: &State,
     ) -> (Stake, Stake) {
-        let key = (round, leader_digest.clone());
-        let mut support = state.rule_one_support.remove(&key).unwrap_or_default();
-        let dag_blocks: Vec<_> = state
-            .dag
-            .get(&round)
-            .into_iter()
-            .flat_map(|authorities| authorities.values())
-            .map(|(digest, certificate)| (digest.clone(), certificate.clone()))
-            .collect();
-        for (digest, certificate) in dag_blocks {
-            if support.processed_dag.insert(digest.clone())
-                && certificate.header.parents.contains(leader_digest)
-            {
-                support.dag.insert(certificate.origin());
-            }
-            support.processed_observed.insert(digest);
-        }
-        let vdag_blocks: Vec<_> = state
-            .vdag
-            .get(&round)
-            .into_iter()
-            .flat_map(|authorities| authorities.values())
-            .map(|(digest, certificate)| (digest.clone(), certificate.clone()))
-            .collect();
-        for (digest, certificate) in vdag_blocks {
-            if support.processed_observed.insert(digest)
-                && certificate.header.parents.contains(leader_digest)
-            {
-                support.observed.insert(certificate.origin());
-            }
-        }
-        support.observed.extend(support.dag.iter().cloned());
-        let observed_stake = support
-            .observed
+        let empty = HashSet::new();
+        let observed = state
+            .observed_direct_support
+            .get(&(round, leader_digest.clone()))
+            .unwrap_or(&empty);
+        let dag = state
+            .dag_direct_support
+            .get(&(round, leader_digest.clone()))
+            .unwrap_or(&empty);
+        let observed_stake = observed
             .iter()
             .map(|authority| self.committee.stake(authority))
             .sum();
-        let dag_stake = support
-            .dag
+        let dag_stake = dag
             .iter()
             .map(|authority| self.committee.stake(authority))
             .sum();
-        state.rule_one_support.insert(key, support);
         (observed_stake, dag_stake)
     }
 
@@ -795,10 +1116,11 @@ impl Consensus {
         {
             return;
         }
-        let (leader_digest, leader) = match self.leader(leader_round, &state.dag) {
-            Some((digest, leader)) => (digest.clone(), leader.clone()),
+        let leader = match self.observed_leader(leader_round, state) {
+            Some(leader) => leader,
             None => return,
         };
+        let leader_digest = leader.digest();
 
         let (observed_stake, dag_stake) = self.strong_support_stake(r, &leader_digest, state);
         if observed_stake < self.committee.quorum_threshold()
@@ -812,6 +1134,8 @@ impl Consensus {
             leader, observed_stake, dag_stake
         );
         state.direct_commit_ready.insert(leader.round());
+        state.skipped_leaders.remove(&leader.round());
+        state.force_observed_history_to_dag(leader.clone(), leader_round);
         if propagate_aba_input {
             self.offer_aba_input(leader.round(), BinaryValue::One, state)
                 .await;
@@ -836,19 +1160,7 @@ impl Consensus {
             return;
         }
 
-        let leader_authority = self.ordering_leader_authority(leader_round);
-        let leader = state
-            .dag
-            .get(&leader_round)
-            .and_then(|round| round.get(&leader_authority))
-            .or_else(|| {
-                state
-                    .vdag
-                    .get(&leader_round)
-                    .and_then(|round| round.get(&leader_authority))
-            })
-            .map(|(_, certificate)| certificate.clone());
-        let leader = match leader {
+        let leader = match self.observed_leader(leader_round, state) {
             Some(leader) => leader,
             None => return,
         };
@@ -877,6 +1189,8 @@ impl Consensus {
             leader, observed_strong, dag_strong, dag_strong_or_virtual
         );
         state.direct_commit_ready.insert(leader.round());
+        state.skipped_leaders.remove(&leader.round());
+        state.force_observed_history_to_dag(leader.clone(), leader_round);
         if propagate_aba_input {
             self.offer_aba_input(leader.round(), BinaryValue::One, state)
                 .await;
@@ -889,49 +1203,32 @@ impl Consensus {
         &self,
         q: Round,
         leader_digest: &Digest,
-        state: &mut State,
+        state: &State,
     ) -> (Stake, Stake, Stake) {
-        let key = (q, leader_digest.clone());
-        let mut support = state.rule_two_support.remove(&key).unwrap_or_default();
+        let empty = HashSet::new();
+        let dag_strong = state
+            .dag_strong_support
+            .get(&(q, leader_digest.clone()))
+            .unwrap_or(&empty);
+        let mut dag_strong_or_virtual = HashSet::new();
         let dag_blocks: Vec<_> = state
             .dag
             .get(&q)
             .into_iter()
             .flat_map(|round| round.values())
-            .map(|(digest, block)| (digest.clone(), block.clone()))
+            .map(|(_, block)| block.clone())
             .collect();
-        for (digest, block) in &dag_blocks {
-            if !support.processed_dag.insert(digest.clone()) {
-                continue;
-            }
-            let strong = self.has_strong_path(block, leader_digest, state);
-            if strong {
-                support.dag_strong.insert(block.origin());
-            }
-            if strong || self.has_two_hop_virtual_path(block, leader_digest, state) {
-                support.dag_strong_or_virtual.insert(block.origin());
-            }
-            support.processed_observed.insert(digest.clone());
-        }
-
-        let vdag_blocks: Vec<_> = state
-            .vdag
-            .get(&q)
-            .into_iter()
-            .flat_map(|round| round.values())
-            .map(|(digest, block)| (digest.clone(), block.clone()))
-            .collect();
-        for (digest, block) in &vdag_blocks {
-            if !support.processed_observed.insert(digest.clone()) {
-                continue;
-            }
-            if self.has_strong_path(block, leader_digest, state) {
-                support.observed_strong.insert(block.origin());
+        for (origin, _, strong_or_virtual) in
+            self.classify_paths_parallel(&dag_blocks, leader_digest, state)
+        {
+            if strong_or_virtual {
+                dag_strong_or_virtual.insert(origin);
             }
         }
-        support
-            .observed_strong
-            .extend(support.dag_strong.iter().cloned());
+        let observed_strong = state
+            .observed_strong_support
+            .get(&(q, leader_digest.clone()))
+            .unwrap_or(&empty);
 
         let stake = |authorities: &HashSet<PublicKey>| {
             authorities
@@ -940,26 +1237,71 @@ impl Consensus {
                 .sum()
         };
         let result = (
-            stake(&support.observed_strong),
-            stake(&support.dag_strong),
-            stake(&support.dag_strong_or_virtual),
+            stake(observed_strong),
+            stake(dag_strong),
+            stake(&dag_strong_or_virtual),
         );
-        state.rule_two_support.insert(key, support);
         result
     }
 
+    /// Evaluate independent reachability queries in parallel and return only
+    /// immutable results. The caller performs the deterministic state update.
+    fn classify_paths_parallel(
+        &self,
+        blocks: &[Certificate],
+        target: &Digest,
+        state: &State,
+    ) -> Vec<(PublicKey, bool, bool)> {
+        if blocks.len() < 8 {
+            return blocks
+                .iter()
+                .map(|block| {
+                    let strong = self.has_strong_path(block, target, state);
+                    let virtual_path =
+                        strong || self.has_two_hop_virtual_path(block, target, state);
+                    (block.origin(), strong, virtual_path)
+                })
+                .collect();
+        }
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .min(4)
+            .min(blocks.len());
+        let chunk_size = (blocks.len() + workers - 1) / workers;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = blocks
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|block| {
+                                let strong = self.has_strong_path(block, target, state);
+                                let virtual_path =
+                                    strong || self.has_two_hop_virtual_path(block, target, state);
+                                (block.origin(), strong, virtual_path)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("path worker panicked"))
+                .collect()
+        })
+    }
+
     /// Strong-path reachability over blocks observed in Dag union VDag.
-    fn has_strong_path(&self, block: &Certificate, target: &Digest, state: &mut State) -> bool {
-        let source = block.digest();
-        let key = (source, target.clone());
-        if let Some(reachable) = state.strong_path_cache.get(&key) {
-            return *reachable;
+    fn has_strong_path(&self, block: &Certificate, target: &Digest, state: &State) -> bool {
+        if let Some(ancestors) = state.strong_ancestors.get(&block.digest()) {
+            return ancestors.contains(target);
         }
         let mut pending: Vec<_> = block.header.parents.iter().cloned().collect();
         let mut visited = HashSet::new();
         while let Some(digest) = pending.pop() {
             if &digest == target {
-                state.strong_path_cache.insert(key, true);
                 return true;
             }
             if !visited.insert(digest.clone()) {
@@ -969,7 +1311,6 @@ impl Consensus {
                 pending.extend(parent.header.parents.iter().cloned());
             }
         }
-        state.strong_path_cache.insert(key, false);
         false
     }
 
@@ -1061,13 +1402,13 @@ impl Consensus {
                             "Leader {:?} marked commit-ready by commit rule 3 through round {}",
                             target, observer_round
                         );
-                        state.pending_leaders.insert(target_round, target);
+                        self.queue_leader_commit(target, state).await;
                     } else {
                         debug!(
                             "Skipping leader round {} by commit rule 3 observed from round {}",
                             target_round, observer_round
                         );
-                        state.skipped_leaders.insert(target_round);
+                        state.mark_skipped(target_round);
                     }
                     self.drain_ready_leaders(state).await;
                 }
@@ -1093,6 +1434,14 @@ impl Consensus {
                     .and_then(|blocks| blocks.get(&authority))
             })
             .map(|(_, certificate)| certificate.clone())
+            .or_else(|| {
+                state
+                    .observed_by_round
+                    .get(&round)
+                    .and_then(|blocks| blocks.get(&authority))
+                    .and_then(|digest| state.observed.get(digest))
+                    .cloned()
+            })
     }
 
     fn observed_certificate<'a>(digest: &Digest, state: &'a State) -> Option<&'a Certificate> {
@@ -1115,47 +1464,97 @@ impl Consensus {
         if state.committed_leaders.contains(&round) {
             return;
         }
+        state.force_observed_history_to_dag(leader.clone(), round);
+        state.record_rule_ready(round);
+        let ordered = self.order_dag(&leader, state);
+        state.pending_order.insert(round, ordered);
         state.pending_leaders.entry(round).or_insert(leader);
+        state.wake_pending(round);
 
         self.drain_ready_leaders(state).await;
     }
 
     async fn drain_ready_leaders(&mut self, state: &mut State) {
         loop {
-            let ready_round = state.pending_leaders.keys().cloned().find(|round| {
-                (state.committed_leaders.contains(&(round - 1))
-                    || state.skipped_leaders.contains(&(round - 1)))
-                    && state
-                        .pending_leaders
-                        .get(round)
-                        .map_or(false, |leader| state.dag_digests.contains(&leader.digest()))
-            });
-            let ready_round = match ready_round {
-                Some(round) => round,
+            let ready_round = match state.ready_pending.iter().next().cloned() {
+                Some(round) => {
+                    state.ready_pending.remove(&round);
+                    round
+                }
                 None => break,
             };
+            let leader_ready = state
+                .pending_leaders
+                .get(&ready_round)
+                .map_or(false, |leader| {
+                    state.predecessor_resolved(ready_round)
+                        && state.dag_digests.contains(&leader.digest())
+                });
+            if !leader_ready {
+                continue;
+            }
             let leader = state.pending_leaders.remove(&ready_round).unwrap();
             if !state.committed_leaders.insert(ready_round) {
                 continue;
             }
+            state.wake_pending(ready_round + 1);
 
-            let sequence = self.order_dag(&leader, state);
-            for certificate in sequence {
-                state.update(&certificate, self.gc_depth);
-
+            let mut sequence = state
+                .pending_order
+                .remove(&ready_round)
+                .unwrap_or_else(|| self.order_dag(&leader, state));
+            sequence.retain(|certificate| {
+                state
+                    .last_committed
+                    .get(&certificate.origin())
+                    .map_or(true, |round| certificate.round() > *round)
+            });
+            let _rule_ready_at_ms =
+                state
+                    .rule_ready_at_ms
+                    .remove(&ready_round)
+                    .unwrap_or_else(|| {
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .expect("System clock is before Unix epoch")
+                            .as_millis()
+                    });
+            let _committed_at_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("System clock is before Unix epoch")
+                .as_millis();
+            state.update(&sequence, self.gc_depth);
+            for certificate in &sequence {
                 #[cfg(not(feature = "benchmark"))]
                 info!("Committed {}", certificate.header);
                 #[cfg(feature = "benchmark")]
                 for digest in certificate.header.payload.keys() {
-                    info!("Committed {} -> {:?}", certificate.header, digest);
+                    info!(
+                        "Committed {} -> {:?} @ {} commit {}",
+                        certificate.header, digest, _rule_ready_at_ms, _committed_at_ms
+                    );
                 }
-
-                self.tx_primary
-                    .send(ConsensusCommand::Cleanup(certificate.clone()))
-                    .await
-                    .expect("Failed to send certificate to primary");
-                if let Err(error) = self.tx_output.send(certificate).await {
-                    warn!("Failed to output certificate: {}", error);
+            }
+            if let Some(commit_tx) = &state.commit_tx {
+                commit_tx.send(sequence).expect("Commit writer stopped");
+            } else {
+                for certificate in sequence {
+                    self.tx_primary
+                        .send(ConsensusCommand::Cleanup(certificate.clone()))
+                        .await
+                        .expect("Failed to send certificate to primary");
+                    match &self.tx_output {
+                        OutputSender::Individual(sender) => {
+                            if let Err(error) = sender.send(certificate).await {
+                                warn!("Failed to output certificate: {}", error);
+                            }
+                        }
+                        OutputSender::Batch(sender) => {
+                            if let Err(error) = sender.send(vec![certificate]).await {
+                                warn!("Failed to output certificate batch: {}", error);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1288,27 +1687,22 @@ impl Consensus {
         while let Some(x) = buffer.pop() {
             debug!("Sequencing {:?}", x);
             ordered.push(x.clone());
-            for parent in &x.header.parents {
-                let (digest, certificate) = match state
-                    .dag
-                    .get(&(x.round() - 1))
-                    .map(|x| x.values().find(|(x, _)| x == parent))
-                    .flatten()
-                {
-                    Some(x) => x,
+            for parent in x.header.parents.iter().chain(&x.header.weak_edges) {
+                let certificate = match state.dag_by_digest.get(parent) {
+                    Some(certificate) => certificate,
                     None => continue, // We already ordered or GC up to here.
                 };
 
                 // We skip the certificate if we (1) already processed it or (2) we reached a round that we already
                 // committed for this authority.
-                let mut skip = already_ordered.contains(&digest);
+                let mut skip = already_ordered.contains(parent);
                 skip |= state
                     .last_committed
                     .get(&certificate.origin())
-                    .map_or_else(|| false, |r| r == &certificate.round());
+                    .map_or(false, |r| certificate.round() <= *r);
                 if !skip {
                     buffer.push(certificate);
-                    already_ordered.insert(digest);
+                    already_ordered.insert(parent.clone());
                 }
             }
         }

@@ -44,9 +44,12 @@ class LogParser:
                 results = p.map(self._parse_primaries, primaries)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse nodes\' logs: {e}')
-        proposals, commits, self.configs, primary_ips = zip(*results)
+        proposals, commits, final_commits, self.configs, primary_ips = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
+        self.final_commits = self._merge_results(
+            [x.items() for x in final_commits]
+        )
 
         # Parse the workers logs.
         try:
@@ -102,9 +105,31 @@ class LogParser:
         tmp = [(d, self._to_posix(t)) for t, d in tmp]
         proposals = self._merge_results([tmp])
 
-        tmp = findall(r'\[(.*Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)', log)
-        tmp = [(d, self._to_posix(t)) for t, d in tmp]
+        # Prefer the time when the carrying leader first completed its commit
+        # rule. Legacy logs without this field remain parseable.
+        tmp = findall(
+            r'Committed B\d+\([^ ]+\) -> ([^ ]+=) @ (\d+)', log
+        )
+        tmp = [(d, int(t) / 1_000) for d, t in tmp]
+        if not tmp:
+            tmp = findall(r'\[(.*Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)', log)
+            tmp = [(d, self._to_posix(t)) for t, d in tmp]
         commits = self._merge_results([tmp])
+
+        # Ordered commit time: the predecessor constraint has been resolved
+        # and the batch has entered the final commit sequence. Legacy logs use
+        # their Committed log timestamp as the closest available equivalent.
+        tmp = findall(
+            r'Committed B\d+\([^ ]+\) -> ([^ ]+=) @ \d+ commit (\d+)',
+            log,
+        )
+        tmp = [(d, int(t) / 1_000) for d, t in tmp]
+        if not tmp:
+            tmp = findall(
+                r'\[(.*Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)', log
+            )
+            tmp = [(d, self._to_posix(t)) for t, d in tmp]
+        final_commits = self._merge_results([tmp])
 
         configs = {
             'header_size': int(
@@ -132,7 +157,7 @@ class LogParser:
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
         
-        return proposals, commits, configs, ip
+        return proposals, commits, final_commits, configs, ip
 
     def _parse_workers(self, log):
         if search(r'(?:panic|Error)', log) is not None:
@@ -166,6 +191,14 @@ class LogParser:
         latency = [c - self.proposals[d] for d, c in self.commits.items()]
         return mean(latency) if latency else 0
 
+    def _final_consensus_latency(self):
+        latency = [
+            c - self.proposals[d]
+            for d, c in self.final_commits.items()
+            if d in self.proposals
+        ]
+        return mean(latency) if latency else 0
+
     def _end_to_end_throughput(self):
         if not self.commits:
             return 0, 0, 0
@@ -185,6 +218,15 @@ class LogParser:
                     start = sent[tx_id]
                     end = self.commits[batch_id]
                     latency += [end-start]
+        return mean(latency) if latency else 0
+
+    def _final_end_to_end_latency(self):
+        latency = []
+        for sent, received in zip(self.sent_samples, self.received_samples):
+            for tx_id, batch_id in received.items():
+                if batch_id in self.final_commits:
+                    assert tx_id in sent
+                    latency += [self.final_commits[batch_id] - sent[tx_id]]
         return mean(latency) if latency else 0
 
     def result(self):

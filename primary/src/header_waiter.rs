@@ -27,6 +27,7 @@ const TIMER_RESOLUTION: u64 = 1_000;
 pub enum WaiterMessage {
     SyncBatches(HashMap<Digest, WorkerId>, Header),
     SyncParents(Vec<Digest>, Header),
+    SyncVirtual(Vec<Digest>, Round, PublicKey),
 }
 
 /// Waits for missing parent certificates and batches' digests.
@@ -56,6 +57,7 @@ pub struct HeaderWaiter {
     /// Keeps the digests of the all certificates for which we sent a sync request,
     /// along with a timestamp (`u128`) indicating when we sent the request.
     parent_requests: HashMap<Digest, (Round, u128)>,
+    virtual_requests: HashMap<Digest, (Round, u128)>,
     /// Keeps the digests of the all tx batches for which we sent a sync request,
     /// similarly to `header_requests`.
     batch_requests: HashMap<Digest, Round>,
@@ -90,6 +92,7 @@ impl HeaderWaiter {
                 tx_core,
                 network: SimpleSender::new(),
                 parent_requests: HashMap::new(),
+                virtual_requests: HashMap::new(),
                 batch_requests: HashMap::new(),
                 pending: HashMap::new(),
             }
@@ -220,6 +223,30 @@ impl HeaderWaiter {
                                 self.network.send(address, Bytes::from(bytes)).await;
                             }
                         }
+
+                        WaiterMessage::SyncVirtual(missing, round, author) => {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Failed to measure time")
+                                .as_millis();
+                            let mut requires_sync = Vec::new();
+                            for digest in missing {
+                                self.virtual_requests.entry(digest.clone()).or_insert_with(|| {
+                                    requires_sync.push(digest);
+                                    (round, now)
+                                });
+                            }
+                            if !requires_sync.is_empty() {
+                                let address = self.committee
+                                    .primary(&author)
+                                    .expect("Author of valid header not in the committee")
+                                    .primary_to_primary;
+                                let message = PrimaryMessage::CertificatesRequest(requires_sync, self.name);
+                                let bytes = bincode::serialize(&message)
+                                    .expect("Failed to serialize virtual sync request");
+                                self.network.send(address, Bytes::from(bytes)).await;
+                            }
+                        }
                     }
                 },
 
@@ -264,6 +291,16 @@ impl HeaderWaiter {
                             retry.push(digest.clone());
                         }
                     }
+                    let virtual_digests: Vec<_> = self.virtual_requests.keys().cloned().collect();
+                    for digest in virtual_digests {
+                        if self.store.read(digest.to_vec()).await.ok().flatten().is_some() {
+                            self.virtual_requests.remove(&digest);
+                        } else if self.virtual_requests.get(&digest)
+                            .map_or(false, |(_, timestamp)| timestamp + (self.sync_retry_delay as u128) < now)
+                        {
+                            retry.push(digest);
+                        }
+                    }
 
                     let addresses = self.committee
                         .others_primaries(&self.name)
@@ -292,6 +329,7 @@ impl HeaderWaiter {
                 self.pending.retain(|_, (r, _)| r > &mut gc_round);
                 self.batch_requests.retain(|_, r| r > &mut gc_round);
                 self.parent_requests.retain(|_, (r, _)| r > &mut gc_round);
+                self.virtual_requests.retain(|_, (r, _)| r > &mut gc_round);
             }
         }
     }

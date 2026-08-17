@@ -87,14 +87,11 @@ impl Synchronizer {
     /// we return an empty vector, synchronize with other nodes, and re-schedule processing
     /// of the header for when we will have all the parents.
     pub async fn get_parents(&mut self, header: &Header) -> DagResult<Vec<Certificate>> {
-        let mut missing = Vec::new();
+        let mut missing_required = Vec::new();
+        let mut missing_weak = Vec::new();
+        let mut missing_virtual = Vec::new();
         let mut parents = Vec::new();
-        for digest in header
-            .parents
-            .iter()
-            .chain(&header.weak_edges)
-            .chain(&header.virtual_edges)
-        {
+        for digest in &header.parents {
             if let Some(genesis) = self
                 .genesis
                 .iter()
@@ -107,31 +104,64 @@ impl Synchronizer {
 
             match self.store.read(digest.to_vec()).await? {
                 Some(certificate) => parents.push(bincode::deserialize(&certificate)?),
-                None => missing.push(digest.clone()),
+                None => missing_required.push(digest.clone()),
             };
         }
-
-        if missing.is_empty() {
-            return Ok(parents);
+        for digest in &header.weak_edges {
+            if self
+                .genesis
+                .iter()
+                .any(|(candidate, _)| candidate == digest)
+            {
+                continue;
+            }
+            match self.store.read(digest.to_vec()).await? {
+                Some(certificate) => parents.push(bincode::deserialize(&certificate)?),
+                None => missing_weak.push(digest.clone()),
+            }
         }
-
-        self.tx_header_waiter
-            .send(WaiterMessage::SyncParents(missing, header.clone()))
-            .await
-            .expect("Failed to send sync parents request");
-        Ok(Vec::new())
+        for digest in &header.virtual_edges {
+            if self
+                .genesis
+                .iter()
+                .any(|(candidate, _)| candidate == digest)
+            {
+                continue;
+            }
+            match self.store.read(digest.to_vec()).await? {
+                Some(certificate) => parents.push(bincode::deserialize(&certificate)?),
+                None => missing_virtual.push(digest.clone()),
+            }
+        }
+        let mut missing = missing_required.clone();
+        missing.extend(missing_weak);
+        if !missing.is_empty() {
+            self.tx_header_waiter
+                .send(WaiterMessage::SyncParents(missing, header.clone()))
+                .await
+                .expect("Failed to send sync parents request");
+        }
+        if !missing_virtual.is_empty() {
+            self.tx_header_waiter
+                .send(WaiterMessage::SyncVirtual(
+                    missing_virtual,
+                    header.round,
+                    header.author,
+                ))
+                .await
+                .expect("Failed to send virtual-only sync request");
+        }
+        if missing_required.is_empty() {
+            Ok(parents)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// Check whether we have all the ancestors of the certificate. If we don't, send the certificate to
     /// the `CertificateWaiter` which will trigger re-processing once we have all the missing data.
     pub async fn deliver_certificate(&mut self, certificate: &Certificate) -> DagResult<bool> {
-        for digest in certificate
-            .header
-            .parents
-            .iter()
-            .chain(&certificate.header.weak_edges)
-            .chain(&certificate.header.virtual_edges)
-        {
+        for digest in &certificate.header.parents {
             if self.genesis.iter().any(|(x, _)| x == digest) {
                 continue;
             }
@@ -143,6 +173,27 @@ impl Synchronizer {
                     .expect("Failed to send sync certificate request");
                 return Ok(false);
             };
+        }
+        Ok(true)
+    }
+
+    pub async fn ready_for_round_advance(&mut self, certificate: &Certificate) -> DagResult<bool> {
+        for digest in certificate
+            .header
+            .parents
+            .iter()
+            .chain(&certificate.header.weak_edges)
+        {
+            if self
+                .genesis
+                .iter()
+                .any(|(candidate, _)| candidate == digest)
+            {
+                continue;
+            }
+            if self.store.read(digest.to_vec()).await?.is_none() {
+                return Ok(false);
+            }
         }
         Ok(true)
     }

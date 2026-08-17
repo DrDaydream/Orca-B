@@ -35,10 +35,14 @@ pub type Round = u64;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
+    /// One network frame carrying GRBC traffic and pending ABA traffic.
+    Bundle(Vec<PrimaryMessage>),
     Header(Header),
     Vote(Vote),
+    VoteBatch(Vec<Vote>),
     Certificate(Certificate),
     GradeVote(GradeVote),
+    GradeVoteBatch(Vec<GradeVote>),
     GradedCertificate(GradedCertificate),
     Consensus(ConsensusNetworkMessage),
     LeaderRequest(Round, PublicKey, /* requestor */ PublicKey),
@@ -94,6 +98,14 @@ impl Primary {
                         .send(certificate)
                         .await
                         .expect("Failed to send cleanup"),
+                    ConsensusCommand::CleanupBatch(certificates) => {
+                        for certificate in certificates {
+                            tx_cleanup
+                                .send(certificate)
+                                .await
+                                .expect("Failed to send cleanup batch");
+                        }
+                    }
                     ConsensusCommand::AbaBroadcast(mut messages) => {
                         // Coalesce bursts from independent ABA instances. The
                         // Core signs the resulting batch once.
@@ -108,6 +120,11 @@ impl Primary {
                                     }
                                     Some(ConsensusCommand::Cleanup(certificate)) => {
                                         tx_cleanup.send(certificate).await.expect("Failed to send cleanup");
+                                    }
+                                    Some(ConsensusCommand::CleanupBatch(certificates)) => {
+                                        for certificate in certificates {
+                                            tx_cleanup.send(certificate).await.expect("Failed to send cleanup batch");
+                                        }
                                     }
                                     Some(command) => {
                                         tx_consensus_commands.send(command).await.expect("Failed to send consensus command");
