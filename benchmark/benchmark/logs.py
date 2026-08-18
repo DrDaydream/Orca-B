@@ -22,7 +22,7 @@ class LogParser:
 
         self.faults = faults
         if isinstance(faults, int):
-            self.committee_size = len(primaries) + int(faults)
+            self.committee_size = len(primaries)
             self.workers =  len(workers) // len(primaries)
         else:
             self.committee_size = '?'
@@ -44,12 +44,16 @@ class LogParser:
                 results = p.map(self._parse_primaries, primaries)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse nodes\' logs: {e}')
-        proposals, commits, final_commits, self.configs, primary_ips = zip(*results)
+        proposals, commits, final_commits, header_proposals, header_commits, rule_orders, commit_rules, self.configs, primary_ips = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
         self.final_commits = self._merge_results(
             [x.items() for x in final_commits]
         )
+        self.header_proposals = self._merge_results([x.items() for x in header_proposals])
+        self.header_commits = self._merge_tagged_results(header_commits)
+        self.rule_orders = self._merge_results([x.items() for x in rule_orders])
+        self.commit_rules = self._merge_commit_rules(commit_rules)
 
         # Parse the workers logs.
         try:
@@ -78,6 +82,21 @@ class LogParser:
             for k, v in x:
                 if not k in merged or merged[k] > v:
                     merged[k] = v
+        return merged
+
+    def _merge_tagged_results(self, inputs):
+        merged = {}
+        for values in inputs:
+            for digest, value in values.items():
+                if digest not in merged or merged[digest][0] > value[0]:
+                    merged[digest] = value
+        return merged
+
+    def _merge_commit_rules(self, inputs):
+        merged = {}
+        for values in inputs:
+            for leader, value in values.items():
+                merged.setdefault(leader, value)
         return merged
 
     def _parse_clients(self, log):
@@ -131,6 +150,15 @@ class LogParser:
             tmp = [(d, self._to_posix(t)) for t, d in tmp]
         final_commits = self._merge_results([tmp])
 
+        tmp = findall(r'\[(.*Z) .* Header created round \d+ digest (\S+)', log)
+        header_proposals = self._merge_results([[(d, self._to_posix(t)) for t, d in tmp]])
+        tmp = findall(r'\[(.*Z) .* Header committed round \d+ digest (\S+) leader (true|false)', log)
+        header_commits = {d: (self._to_posix(t), leader == 'true') for t, d, leader in tmp}
+        tmp = findall(r'\[(.*Z) .* Header rule-ordered round \d+ digest (\S+)', log)
+        rule_orders = self._merge_results([[(d, self._to_posix(t)) for t, d in tmp]])
+        tmp = findall(r'Commit rule stats leader (\S+) rule ([123]) outcome (commit|skip) blocks (\d+)', log)
+        commit_rules = {leader: (int(rule), outcome, int(blocks)) for leader, rule, outcome, blocks in tmp}
+
         configs = {
             'header_size': int(
                 search(r'Header size .* (\d+)', log).group(1)
@@ -157,7 +185,7 @@ class LogParser:
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
         
-        return proposals, commits, final_commits, configs, ip
+        return proposals, commits, final_commits, header_proposals, header_commits, rule_orders, commit_rules, configs, ip
 
     def _parse_workers(self, log):
         if search(r'(?:panic|Error)', log) is not None:
@@ -229,6 +257,33 @@ class LogParser:
                     latency += [self.final_commits[batch_id] - sent[tx_id]]
         return mean(latency) if latency else 0
 
+    def _header_latency_stats(self):
+        leaders, non_leaders, leader_times = [], [], []
+        for digest, (committed, is_leader) in self.header_commits.items():
+            if digest not in self.header_proposals:
+                continue
+            (leaders if is_leader else non_leaders).append(committed - self.header_proposals[digest])
+            if is_leader:
+                leader_times.append(committed)
+        rule_order = [t - self.header_proposals[d] for d, t in self.rule_orders.items() if d in self.header_proposals]
+        leader_times.sort()
+        intervals = [b - a for a, b in zip(leader_times, leader_times[1:])]
+        avg = lambda values: mean(values) if values else 0
+        return avg(leaders), avg(non_leaders), avg(leaders + non_leaders), avg(intervals), avg(rule_order)
+
+    def _commit_rule_ratios(self):
+        leader_total = len(self.commit_rules)
+        block_total = sum(value[2] for value in self.commit_rules.values())
+        categories = ((1, None), (2, None), (3, 'commit'), (3, 'skip'))
+        leader_ratios, block_ratios = [], []
+        for rule, outcome in categories:
+            matches = lambda value: value[0] == rule and (outcome is None or value[1] == outcome)
+            leaders = sum(matches(value) for value in self.commit_rules.values())
+            blocks = sum(value[2] for value in self.commit_rules.values() if matches(value))
+            leader_ratios.append(100 * leaders / leader_total if leader_total else 0)
+            block_ratios.append(100 * blocks / block_total if block_total else 0)
+        return leader_ratios, block_ratios
+
     def result(self):
         header_size = self.configs[0]['header_size']
         max_header_delay = self.configs[0]['max_header_delay']
@@ -242,6 +297,8 @@ class LogParser:
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1_000
+        leader_latency, non_leader_latency, all_header_latency, leader_interval, rule_order_latency = (x * 1_000 for x in self._header_latency_stats())
+        rule_leaders, rule_blocks = self._commit_rule_ratios()
 
         return (
             '\n'
@@ -269,6 +326,18 @@ class LogParser:
             f' Consensus TPS: {round(consensus_tps):,} tx/s\n'
             f' Consensus BPS: {round(consensus_bps):,} B/s\n'
             f' Consensus latency: {round(consensus_latency):,} ms\n'
+            f' Leader commit latency: {round(leader_latency):,} ms\n'
+            f' Non-leader commit latency: {round(non_leader_latency):,} ms\n'
+            f' All committed headers latency: {round(all_header_latency):,} ms\n'
+            f' Leader commit interval: {round(leader_interval):,} ms\n'
+            f' Non-leader rule-order latency: {round(rule_order_latency):,} ms\n'
+            f' Rule 1 leader ratio: {rule_leaders[0]:.2f}%\n'
+            f' Rule 2 leader ratio: {rule_leaders[1]:.2f}%\n'
+            f' Rule 3 commit leader ratio: {rule_leaders[2]:.2f}%\n'
+            f' Rule 3 skip leader ratio: {rule_leaders[3]:.2f}%\n'
+            f' Rule 1 block ratio: {rule_blocks[0]:.2f}%\n'
+            f' Rule 2 block ratio: {rule_blocks[1]:.2f}%\n'
+            f' Rule 3 block ratio: {rule_blocks[2]:.2f}%\n'
             '\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'

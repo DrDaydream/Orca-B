@@ -492,11 +492,15 @@ async fn leader_commits_wait_for_the_previous_leader() {
     state.promote_to_dag(leader_one.clone());
     state.promote_to_dag(leader_two.clone());
 
-    consensus.queue_leader_commit(leader_two, &mut state).await;
+    consensus
+        .queue_leader_commit(leader_two, 1, &mut state)
+        .await;
     assert!(!state.committed_leaders.contains(&2));
     assert!(state.pending_leaders.contains_key(&2));
 
-    consensus.queue_leader_commit(leader_one, &mut state).await;
+    consensus
+        .queue_leader_commit(leader_one, 1, &mut state)
+        .await;
     assert!(state.committed_leaders.contains(&1));
     assert!(state.committed_leaders.contains(&2));
     assert!(state.pending_leaders.is_empty());

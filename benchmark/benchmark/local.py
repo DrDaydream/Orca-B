@@ -74,7 +74,7 @@ class LocalBench:
             self.node_parameters.print(PathMaker.parameters_file())
 
             # Run the clients (they will wait for the nodes to be ready).
-            workers_addresses = committee.workers_addresses(self.faults)
+            workers_addresses = committee.workers_addresses(0)
             rate_share = ceil(rate / committee.workers())
             for i, addresses in enumerate(workers_addresses):
                 for (id, address) in addresses:
@@ -88,13 +88,14 @@ class LocalBench:
                     self._background_run(cmd, log_file)
 
             # Run the primaries (except the faulty ones).
-            for i, address in enumerate(committee.primary_addresses(self.faults)):
+            for i, address in enumerate(committee.primary_addresses(0)):
                 cmd = CommandMaker.run_primary(
                     PathMaker.key_file(i),
                     PathMaker.committee_file(),
                     PathMaker.db_path(i),
                     PathMaker.parameters_file(),
-                    debug=debug
+                    debug=debug,
+                    faults=self.faults
                 )
                 log_file = PathMaker.primary_log_file(i)
                 self._background_run(cmd, log_file)
