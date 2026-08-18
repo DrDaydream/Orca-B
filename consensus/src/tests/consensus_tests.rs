@@ -59,6 +59,7 @@ pub fn mock_committee() -> Committee {
                         stake: 1,
                         primary: PrimaryAddresses {
                             primary_to_primary: "0.0.0.0:0".parse().unwrap(),
+                            aba_to_aba: "0.0.0.0:0".parse().unwrap(),
                             worker_to_primary: "0.0.0.0:0".parse().unwrap(),
                         },
                         workers: HashMap::default(),

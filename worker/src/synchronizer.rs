@@ -173,7 +173,9 @@ impl Synchronizer {
                             }
                         }
                         self.pending.retain(|_, (r, _, _)| r > &mut gc_round);
-                    }
+                    },
+                    // Batch state is routed directly to BatchMaker by the receiver.
+                    PrimaryWorkerMessage::BatchSilent(_, _) => {}
                 },
 
                 // Stream out the futures of the `FuturesUnordered` that completed.

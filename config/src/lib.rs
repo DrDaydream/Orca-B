@@ -113,6 +113,8 @@ impl Parameters {
 pub struct PrimaryAddresses {
     /// Address to receive messages from other primaries (WAN).
     pub primary_to_primary: SocketAddr,
+    /// Address dedicated to ABA messages from other primaries (WAN).
+    pub aba_to_aba: SocketAddr,
     /// Address to receive messages from our workers (LAN).
     pub worker_to_primary: SocketAddr,
 }

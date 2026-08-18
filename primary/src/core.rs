@@ -2,8 +2,7 @@
 use crate::aggregators::{CertificatesAggregator, GradeVotesAggregator, VotesAggregator};
 use crate::error::{DagError, DagResult};
 use crate::messages::{
-    Certificate, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GradeVote,
-    GradedCertificate, Header, Vote,
+    Certificate, ConsensusCommand, ConsensusMessage, GradeVote, GradedCertificate, Header, Vote,
 };
 use crate::primary::{PrimaryMessage, Round};
 use crate::proposer::ProposerMessage;
@@ -173,24 +172,8 @@ impl Core {
     async fn process_consensus_command(&mut self, command: ConsensusCommand) -> DagResult<()> {
         match command {
             ConsensusCommand::Cleanup(_) | ConsensusCommand::CleanupBatch(_) => unreachable!(),
-            ConsensusCommand::AbaBroadcast(messages) => {
-                let payload = bincode::serialize(&messages).expect("Failed to serialize ABA batch");
-                let message =
-                    ConsensusNetworkMessage::new(payload, self.name, &mut self.signature_service)
-                        .await;
-                let addresses = self
-                    .committee
-                    .others_primaries(&self.name)
-                    .iter()
-                    .map(|(_, x)| x.primary_to_primary)
-                    .collect();
-                let bytes = bincode::serialize(&PrimaryMessage::Consensus(message))
-                    .expect("Failed to serialize ABA message");
-                let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
-                self.cancel_handlers
-                    .entry(self.current_header.round)
-                    .or_default()
-                    .extend(handlers);
+            ConsensusCommand::AbaBroadcast(_) => {
+                unreachable!("ABA broadcasts use the dedicated broadcaster")
             }
             ConsensusCommand::LeaderRequest(round, leader) => {
                 let addresses = self

@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use bytes::BufMut as _;
 use bytes::BytesMut;
-use clap::{crate_name, crate_version, App, AppSettings};
+use clap::{crate_name, crate_version, App, AppSettings, Arg};
 use env_logger::Env;
 use futures::future::join_all;
 use futures::sink::SinkExt as _;
@@ -22,6 +22,20 @@ async fn main() -> Result<()> {
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
         .args_from_usage("--rate=<INT> 'The rate (txs/s) at which to send the transactions'")
         .args_from_usage("--nodes=[ADDR]... 'Network addresses that must be reachable before starting the benchmark.'")
+        .arg(
+            Arg::with_name("silence-schedule")
+                .long("silence-schedule")
+                .takes_value(true)
+                .default_value("")
+                .help("Pre-generated client silence bitmap (1 pauses, 0 sends)"),
+        )
+        .arg(
+            Arg::with_name("silence-slot-ms")
+                .long("silence-slot-ms")
+                .takes_value(true)
+                .default_value("0")
+                .help("Duration of each pre-generated silence slot"),
+        )
         .setting(AppSettings::ArgRequiredElseHelp)
         .get_matches();
 
@@ -51,6 +65,29 @@ async fn main() -> Result<()> {
         .map(|x| x.parse::<SocketAddr>())
         .collect::<Result<Vec<_>, _>>()
         .context("Invalid socket address format")?;
+    let silence_schedule = matches
+        .value_of("silence-schedule")
+        .unwrap()
+        .as_bytes()
+        .to_vec();
+    if silence_schedule
+        .iter()
+        .any(|value| !matches!(value, b'0' | b'1'))
+    {
+        return Err(anyhow::Error::msg(
+            "Silence schedule must contain only 0 and 1",
+        ));
+    }
+    let silence_slot_ms = matches
+        .value_of("silence-slot-ms")
+        .unwrap()
+        .parse::<u64>()
+        .context("Silence slot duration must be a non-negative integer")?;
+    if !silence_schedule.is_empty() && silence_slot_ms == 0 {
+        return Err(anyhow::Error::msg(
+            "A non-empty silence schedule requires a positive slot duration",
+        ));
+    }
 
     info!("Node address: {}", target);
 
@@ -65,6 +102,8 @@ async fn main() -> Result<()> {
         size,
         rate,
         nodes,
+        silence_schedule,
+        silence_slot_ms,
     };
 
     // Wait for all nodes to be online and synchronized.
@@ -79,6 +118,16 @@ struct Client {
     size: usize,
     rate: u64,
     nodes: Vec<SocketAddr>,
+    silence_schedule: Vec<u8>,
+    silence_slot_ms: u64,
+}
+
+fn client_is_silent(schedule: &[u8], slot_ms: u64, elapsed: Duration) -> bool {
+    if schedule.is_empty() || slot_ms == 0 {
+        return false;
+    }
+    let slot = (elapsed.as_millis() / slot_ms as u128) as usize;
+    schedule.get(slot) == Some(&b'1')
 }
 
 impl Client {
@@ -109,10 +158,19 @@ impl Client {
 
         // NOTE: This log entry is used to compute performance.
         info!("Start sending transactions");
+        let schedule_start = Instant::now();
 
         'main: loop {
             interval.as_mut().tick().await;
             let now = Instant::now();
+
+            if client_is_silent(
+                &self.silence_schedule,
+                self.silence_slot_ms,
+                schedule_start.elapsed(),
+            ) {
+                continue;
+            }
 
             for x in 0..burst {
                 if x == counter % burst {
@@ -154,5 +212,19 @@ impl Client {
             })
         }))
         .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn follows_pre_generated_silence_slots() {
+        let schedule = b"101";
+        assert!(client_is_silent(schedule, 200, Duration::from_millis(0)));
+        assert!(!client_is_silent(schedule, 200, Duration::from_millis(200)));
+        assert!(client_is_silent(schedule, 200, Duration::from_millis(400)));
+        assert!(!client_is_silent(schedule, 200, Duration::from_millis(600)));
     }
 }

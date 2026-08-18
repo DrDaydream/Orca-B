@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::watch;
 
 #[cfg(test)]
 #[path = "tests/worker_tests.rs"]
@@ -71,8 +72,9 @@ impl Worker {
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
-        worker.handle_primary_messages();
-        worker.handle_clients_transactions(tx_primary.clone());
+        let (tx_batch_silent, rx_batch_silent) = watch::channel((Round::default(), false));
+        worker.handle_primary_messages(tx_batch_silent);
+        worker.handle_clients_transactions(tx_primary.clone(), rx_batch_silent);
         worker.handle_workers_messages(tx_primary);
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
@@ -99,7 +101,7 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self) {
+    fn handle_primary_messages(&self, tx_batch_silent: watch::Sender<(Round, bool)>) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
         // Receive incoming messages from our primary.
@@ -112,7 +114,10 @@ impl Worker {
         Receiver::spawn(
             address,
             /* handler */
-            PrimaryReceiverHandler { tx_synchronizer },
+            PrimaryReceiverHandler {
+                tx_synchronizer,
+                tx_batch_silent,
+            },
         );
 
         // The `Synchronizer` is responsible to keep the worker in sync with the others. It handles the commands
@@ -135,7 +140,11 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle clients transactions.
-    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
+    fn handle_clients_transactions(
+        &self,
+        tx_primary: Sender<SerializedBatchDigestMessage>,
+        rx_batch_silent: watch::Receiver<(Round, bool)>,
+    ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
@@ -159,6 +168,7 @@ impl Worker {
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
             /* rx_transaction */ rx_batch_maker,
+            /* rx_batch_silent */ rx_batch_silent,
             /* tx_message */ tx_quorum_waiter,
             /* workers_addresses */
             self.committee
@@ -295,23 +305,28 @@ impl MessageHandler for WorkerReceiverHandler {
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_synchronizer: Sender<PrimaryWorkerMessage>,
+    tx_batch_silent: watch::Sender<(Round, bool)>,
 }
 
 #[async_trait]
 impl MessageHandler for PrimaryReceiverHandler {
-    async fn dispatch(
-        &self,
-        _writer: &mut Writer,
-        serialized: Bytes,
-    ) -> Result<(), Box<dyn Error>> {
+    async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+        let _ = writer.send(Bytes::from("Ack")).await;
+
         // Deserialize the message and send it to the synchronizer.
         match bincode::deserialize(&serialized) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
+            Ok(PrimaryWorkerMessage::BatchSilent(round, silent)) => {
+                let is_newer = round >= self.tx_batch_silent.borrow().0;
+                if is_newer {
+                    let _ = self.tx_batch_silent.send((round, silent));
+                }
+            }
             Ok(message) => self
                 .tx_synchronizer
                 .send(message)
                 .await
-                .expect("Failed to send transaction"),
+                .expect("Failed to send primary command"),
         }
         Ok(())
     }

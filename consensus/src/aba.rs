@@ -378,6 +378,7 @@ mod tests {
                         stake: 1,
                         primary: PrimaryAddresses {
                             primary_to_primary: "127.0.0.1:0".parse().unwrap(),
+                            aba_to_aba: "127.0.0.1:0".parse().unwrap(),
                             worker_to_primary: "127.0.0.1:0".parse().unwrap(),
                         },
                         workers: HashMap::new(),

@@ -14,6 +14,7 @@ use network::ReliableSender;
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::watch;
 use tokio::time::{sleep, Duration, Instant};
 
 #[cfg(test)]
@@ -31,6 +32,8 @@ pub struct BatchMaker {
     max_batch_delay: u64,
     /// Channel to receive transactions from the network.
     rx_transaction: Receiver<Transaction>,
+    /// Current proposer round and whether local batch production is paused.
+    rx_batch_silent: watch::Receiver<(u64, bool)>,
     /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_message: Sender<QuorumWaiterMessage>,
     /// The network addresses of the other workers that share our worker id.
@@ -48,6 +51,7 @@ impl BatchMaker {
         batch_size: usize,
         max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>,
+        rx_batch_silent: watch::Receiver<(u64, bool)>,
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
@@ -56,6 +60,7 @@ impl BatchMaker {
                 batch_size,
                 max_batch_delay,
                 rx_transaction,
+                rx_batch_silent,
                 tx_message,
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
@@ -73,7 +78,30 @@ impl BatchMaker {
         tokio::pin!(timer);
 
         loop {
+            if self.rx_batch_silent.borrow().1 {
+                if self.rx_batch_silent.changed().await.is_err() {
+                    return;
+                }
+                if !self.rx_batch_silent.borrow().1 {
+                    timer
+                        .as_mut()
+                        .reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
+                }
+                continue;
+            }
+
             tokio::select! {
+                biased;
+
+                changed = self.rx_batch_silent.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    if !self.rx_batch_silent.borrow().1 {
+                        timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
+                    }
+                },
+
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
                     self.current_batch_size += transaction.len();

@@ -27,6 +27,7 @@ class Committee:
                 "stake": 1,
                 "primary: {
                     "primary_to_primary": x.x.x.x:x,
+                    "aba_to_aba": x.x.x.x:x,
                     "worker_to_primary": x.x.x.x:x,
                 },
                 "workers": {
@@ -66,9 +67,10 @@ class Committee:
             host = hosts.pop(0)
             primary_addr = {
                 'primary_to_primary': f'{host}:{port}',
-                'worker_to_primary': f'{host}:{port + 1}'
+                'worker_to_primary': f'{host}:{port + 1}',
+                'aba_to_aba': f'{host}:{port + 2}'
             }
-            port += 2
+            port += 3
 
             workers_addr = OrderedDict()
             for j, host in enumerate(hosts):
@@ -117,6 +119,7 @@ class Committee:
         for name in names:
             addresses = self.json['authorities'][name]['primary']
             ips.add(self.ip(addresses['primary_to_primary']))
+            ips.add(self.ip(addresses['aba_to_aba']))
             ips.add(self.ip(addresses['worker_to_primary']))
 
             for worker in self.json['authorities'][name]['workers'].values():

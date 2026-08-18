@@ -11,8 +11,14 @@ case "$NODES" in 10|20|50) ;; *) echo "usage: $0 <10|20|50> [seconds] [total-tps
 
 FAULTS="${ORCA_FAULTS:-0}"
 RULE3_BEHAVIOR="${ORCA_RULE3_BEHAVIOR:-mixed}"
+ADVERSARY_SEED="${ORCA_ADVERSARY_SEED:-0}"
+CLIENT_DURING_SILENCE="${ORCA_CLIENT_DURING_SILENCE:-send}"
+CLIENT_SILENCE_SLOT_MS="${ORCA_CLIENT_SILENCE_SLOT_MS:-}"
 [[ "$FAULTS" =~ ^[0-9]+$ ]] || { echo "ORCA_FAULTS must be a non-negative integer" >&2; exit 2; }
+(( FAULTS < NODES )) || { echo "ORCA_FAULTS must be smaller than the node count" >&2; exit 2; }
+[[ "$ADVERSARY_SEED" =~ ^[0-9]+$ ]] || { echo "ORCA_ADVERSARY_SEED must be a non-negative integer" >&2; exit 2; }
 case "$RULE3_BEHAVIOR" in mixed|silent|participate) ;; *) echo "ORCA_RULE3_BEHAVIOR must be mixed, silent, or participate" >&2; exit 2;; esac
+case "$CLIENT_DURING_SILENCE" in send|pause) ;; *) echo "ORCA_CLIENT_DURING_SILENCE must be send or pause" >&2; exit 2;; esac
 
 REMOTE_USER="${REMOTE_USER:-ubuntu}"
 REMOTE_DIR="${REMOTE_DIR:-/home/ubuntu/Orca-B}"
@@ -32,6 +38,26 @@ for ip in "${IPS[@]}"; do [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo
 RATE_SHARE=$(((TOTAL_RATE + NODES - 1) / NODES))
 TX_NODES=""
 for ip in "${IPS[@]}"; do TX_NODES+="${ip}:3003 "; done
+[[ -f deploy/committee.json && -f deploy/parameters.json ]] || { echo "missing deploy/committee.json or deploy/parameters.json" >&2; exit 1; }
+KEY_FILES=()
+for ((i=0; i<NODES; i++)); do
+  [[ -f "deploy/node-${i}.json" ]] || { echo "missing deploy/node-${i}.json" >&2; exit 1; }
+  KEY_FILES+=("deploy/node-${i}.json")
+done
+if [[ -z "$CLIENT_SILENCE_SLOT_MS" ]]; then
+  CLIENT_SILENCE_SLOT_MS="$(python3 -c 'import json; print(json.load(open("deploy/parameters.json"))["max_header_delay"])')"
+fi
+[[ "$CLIENT_SILENCE_SLOT_MS" =~ ^[1-9][0-9]*$ ]] || { echo "ORCA_CLIENT_SILENCE_SLOT_MS must be positive" >&2; exit 2; }
+mapfile -t CLIENT_SCHEDULES < <(
+  ORCA_CLIENT_DURING_SILENCE="$CLIENT_DURING_SILENCE" \
+  ORCA_RULE3_BEHAVIOR="$RULE3_BEHAVIOR" \
+  ORCA_ADVERSARY_SEED="$ADVERSARY_SEED" \
+  PYTHONPATH=benchmark python3 -m benchmark.adversary_schedule \
+    --committee deploy/committee.json --faults "$FAULTS" \
+    --duration "$DURATION" --slot-ms "$CLIENT_SILENCE_SLOT_MS" \
+    --key-files "${KEY_FILES[@]}"
+)
+[[ "${#CLIENT_SCHEDULES[@]}" -eq "$NODES" ]] || { echo "failed to generate client silence schedules" >&2; exit 1; }
 remote() { ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@$1" "$2"; }
 wait_batch() { (( $1 % MAX_PARALLEL == 0 )) && wait || true; }
 
@@ -46,7 +72,7 @@ stop_all() {
 }
 trap stop_all EXIT INT TERM
 
-echo "nodes=$NODES duration=${DURATION}s total-rate=$TOTAL_RATE per-client=$RATE_SHARE faults=$FAULTS rule3=$RULE3_BEHAVIOR"
+echo "nodes=$NODES duration=${DURATION}s total-rate=$TOTAL_RATE per-client=$RATE_SHARE faults=$FAULTS rule3=$RULE3_BEHAVIOR seed=$ADVERSARY_SEED client-during-silence=$CLIENT_DURING_SILENCE slot=${CLIENT_SILENCE_SLOT_MS}ms"
 for i in "${!IPS[@]}"; do
   remote "${IPS[$i]}" "test -x '$REMOTE_DIR/target/release/node' && test -x '$REMOTE_DIR/target/release/benchmark_client' && test -f '$REMOTE_DIR/deploy/node-${i}.json' && test -f '$REMOTE_DIR/deploy/committee.json' && test -f '$REMOTE_DIR/deploy/parameters.json'"
 done
@@ -62,15 +88,20 @@ for i in "${!IPS[@]}"; do
   remote "${IPS[$i]}" "cd '$REMOTE_DIR' && tmux new-session -d -s orca-worker \"RUST_LOG=info ./target/release/node -vv run --keys deploy/node-${i}.json --committee deploy/committee.json --parameters deploy/parameters.json --store run/db-worker worker --id 0 |& tee run/logs/worker-${i}-0.log\""
 done
 for i in "${!IPS[@]}"; do
-  remote "${IPS[$i]}" "cd '$REMOTE_DIR' && tmux new-session -d -s orca-primary \"RUST_LOG=info ORCA_FAULTS='$FAULTS' ORCA_RULE3_BEHAVIOR='$RULE3_BEHAVIOR' ./target/release/node -vv run --keys deploy/node-${i}.json --committee deploy/committee.json --parameters deploy/parameters.json --store run/db-primary primary |& tee run/logs/primary-${i}.log\""
+  remote "${IPS[$i]}" "cd '$REMOTE_DIR' && tmux new-session -d -s orca-primary \"RUST_LOG=info ORCA_FAULTS='$FAULTS' ORCA_RULE3_BEHAVIOR='$RULE3_BEHAVIOR' ORCA_ADVERSARY_SEED='$ADVERSARY_SEED' ./target/release/node -vv run --keys deploy/node-${i}.json --committee deploy/committee.json --parameters deploy/parameters.json --store run/db-primary primary |& tee run/logs/primary-${i}.log\""
 done
 sleep 6
 
 for i in "${!IPS[@]}"; do
   remote "${IPS[$i]}" "ss -ltn | grep -q ':3003 '" || { remote "${IPS[$i]}" "tail -100 '$REMOTE_DIR/run/logs/worker-${i}-0.log'"; exit 1; }
+  remote "${IPS[$i]}" "ss -ltn | grep -q ':3005 '" || { remote "${IPS[$i]}" "tail -100 '$REMOTE_DIR/run/logs/primary-${i}.log'"; exit 1; }
 done
 for i in "${!IPS[@]}"; do
-  remote "${IPS[$i]}" "cd '$REMOTE_DIR' && tmux new-session -d -s orca-client \"RUST_LOG=info ./target/release/benchmark_client '${IPS[$i]}:3003' --size '$TX_SIZE' --rate '$RATE_SHARE' --nodes $TX_NODES |& tee run/logs/client-${i}-0.log\""
+  SILENCE_ARGS=""
+  if [[ "$CLIENT_DURING_SILENCE" == "pause" ]]; then
+    SILENCE_ARGS="--silence-schedule '${CLIENT_SCHEDULES[$i]}' --silence-slot-ms '$CLIENT_SILENCE_SLOT_MS'"
+  fi
+  remote "${IPS[$i]}" "cd '$REMOTE_DIR' && tmux new-session -d -s orca-client \"RUST_LOG=info ./target/release/benchmark_client '${IPS[$i]}:3003' --size '$TX_SIZE' --rate '$RATE_SHARE' $SILENCE_ARGS --nodes $TX_NODES |& tee run/logs/client-${i}-0.log\""
 done
 
 ready=0

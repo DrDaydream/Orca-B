@@ -30,15 +30,16 @@ pub fn committee() -> Committee {
             .enumerate()
             .map(|(i, (id, _))| {
                 let primary = PrimaryAddresses {
-                    primary_to_primary: format!("127.0.0.1:{}", 100 + i).parse().unwrap(),
-                    worker_to_primary: format!("127.0.0.1:{}", 200 + i).parse().unwrap(),
+                    primary_to_primary: format!("127.0.0.1:{}", 1_100 + i).parse().unwrap(),
+                    aba_to_aba: format!("127.0.0.1:{}", 1_150 + i).parse().unwrap(),
+                    worker_to_primary: format!("127.0.0.1:{}", 1_200 + i).parse().unwrap(),
                 };
                 let workers = vec![(
                     0,
                     WorkerAddresses {
-                        primary_to_worker: format!("127.0.0.1:{}", 300 + i).parse().unwrap(),
-                        transactions: format!("127.0.0.1:{}", 400 + i).parse().unwrap(),
-                        worker_to_worker: format!("127.0.0.1:{}", 500 + i).parse().unwrap(),
+                        primary_to_worker: format!("127.0.0.1:{}", 1_300 + i).parse().unwrap(),
+                        transactions: format!("127.0.0.1:{}", 1_400 + i).parse().unwrap(),
+                        worker_to_worker: format!("127.0.0.1:{}", 1_500 + i).parse().unwrap(),
                     },
                 )]
                 .iter()
@@ -65,6 +66,9 @@ pub fn committee_with_base_port(base_port: u16) -> Committee {
 
         let port = primary.primary_to_primary.port();
         primary.primary_to_primary.set_port(base_port + port);
+
+        let port = primary.aba_to_aba.port();
+        primary.aba_to_aba.set_port(base_port + port);
 
         let port = primary.worker_to_primary.port();
         primary.worker_to_primary.set_port(base_port + port);

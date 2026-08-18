@@ -2,11 +2,14 @@
 use super::*;
 use crate::common::transaction;
 use tokio::sync::mpsc::channel;
+use tokio::sync::watch;
+use tokio::time::{timeout, Duration};
 
 #[tokio::test]
 async fn make_batch() {
     let (tx_transaction, rx_transaction) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
+    let (_tx_batch_silent, rx_batch_silent) = watch::channel((0, false));
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
     // Spawn a `BatchMaker` instance.
@@ -14,6 +17,7 @@ async fn make_batch() {
         /* max_batch_size */ 200,
         /* max_batch_delay */ 1_000_000, // Ensure the timer is not triggered.
         rx_transaction,
+        rx_batch_silent,
         tx_message,
         /* workers_addresses */ dummy_addresses,
     );
@@ -35,6 +39,7 @@ async fn make_batch() {
 async fn batch_timeout() {
     let (tx_transaction, rx_transaction) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
+    let (_tx_batch_silent, rx_batch_silent) = watch::channel((0, false));
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
     // Spawn a `BatchMaker` instance.
@@ -42,6 +47,7 @@ async fn batch_timeout() {
         /* max_batch_size */ 200,
         /* max_batch_delay */ 50, // Ensure the timer is triggered.
         rx_transaction,
+        rx_batch_silent,
         tx_message,
         /* workers_addresses */ dummy_addresses,
     );
@@ -54,6 +60,40 @@ async fn batch_timeout() {
     let QuorumWaiterMessage { batch, handlers: _ } = rx_message.recv().await.unwrap();
     match bincode::deserialize(&batch).unwrap() {
         WorkerMessage::Batch(batch) => assert_eq!(batch, expected_batch),
+        _ => panic!("Unexpected message"),
+    }
+}
+
+#[tokio::test]
+async fn silent_batch_maker_resumes_without_dropping_transactions() {
+    let (tx_transaction, rx_transaction) = channel(2);
+    let (tx_message, mut rx_message) = channel(1);
+    let (tx_batch_silent, rx_batch_silent) = watch::channel((1, true));
+    let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
+
+    BatchMaker::spawn(
+        200,
+        20,
+        rx_transaction,
+        rx_batch_silent,
+        tx_message,
+        dummy_addresses,
+    );
+
+    tx_transaction.send(transaction()).await.unwrap();
+    tx_transaction.send(transaction()).await.unwrap();
+    assert!(timeout(Duration::from_millis(60), rx_message.recv())
+        .await
+        .is_err());
+
+    tx_batch_silent.send((2, false)).unwrap();
+    let QuorumWaiterMessage { batch, handlers: _ } =
+        timeout(Duration::from_millis(200), rx_message.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    match bincode::deserialize(&batch).unwrap() {
+        WorkerMessage::Batch(batch) => assert_eq!(batch, vec![transaction(), transaction()]),
         _ => panic!("Unexpected message"),
     }
 }

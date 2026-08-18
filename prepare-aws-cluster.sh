@@ -29,6 +29,7 @@ for i, ip in enumerate(ips):
         "primary": {
             "primary_to_primary": f"{ip}:3000",
             "worker_to_primary": f"{ip}:3001",
+            "aba_to_aba": f"{ip}:3005",
         },
         "stake": 1,
         "workers": {"0": {

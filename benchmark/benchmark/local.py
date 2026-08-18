@@ -5,6 +5,7 @@ from os.path import basename, splitext
 from time import sleep
 
 from benchmark.commands import CommandMaker
+from benchmark.adversary_schedule import build_client_schedules, client_silence_slot_ms
 from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameters, ConfigError
 from benchmark.logs import LogParser, ParseError
 from benchmark.utils import Print, BenchError, PathMaker
@@ -76,13 +77,21 @@ class LocalBench:
             # Run the clients (they will wait for the nodes to be ready).
             workers_addresses = committee.workers_addresses(0)
             rate_share = ceil(rate / committee.workers())
+            silence_slot_ms = client_silence_slot_ms(
+                self.node_parameters.json['max_header_delay']
+            )
+            silence_schedules = build_client_schedules(
+                names, self.faults, self.duration, silence_slot_ms
+            )
             for i, addresses in enumerate(workers_addresses):
                 for (id, address) in addresses:
                     cmd = CommandMaker.run_client(
                         address,
                         self.tx_size,
                         rate_share,
-                        [x for y in workers_addresses for _, x in y]
+                        [x for y in workers_addresses for _, x in y],
+                        silence_schedules[names[i]],
+                        silence_slot_ms,
                     )
                     log_file = PathMaker.client_log_file(i, id)
                     self._background_run(cmd, log_file)

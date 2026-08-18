@@ -17,8 +17,9 @@ use bytes::Bytes;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
 use futures::sink::SinkExt as _;
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use log::info;
-use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
+use network::{MessageHandler, Receiver as NetworkReceiver, ReliableSender, Writer};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::sync::atomic::AtomicU64;
@@ -54,6 +55,8 @@ pub enum PrimaryWorkerMessage {
     Synchronize(Vec<Digest>, /* target */ PublicKey),
     /// The primary indicates a round update.
     Cleanup(Round),
+    /// Pause or resume local batch production for a proposer round.
+    BatchSilent(Round, bool),
 }
 
 /// The messages sent by the workers to their primary.
@@ -63,6 +66,42 @@ pub enum WorkerPrimaryMessage {
     OurBatch(Digest, WorkerId),
     /// The worker indicates it received a batch's digest from another authority.
     OthersBatch(Digest, WorkerId),
+}
+
+fn spawn_aba_broadcaster(
+    name: PublicKey,
+    committee: Committee,
+    mut signature_service: SignatureService,
+    mut rx_messages: Receiver<Vec<Vec<u8>>>,
+) {
+    tokio::spawn(async move {
+        let addresses: Vec<_> = committee
+            .others_primaries(&name)
+            .iter()
+            .map(|(_, address)| address.aba_to_aba)
+            .collect();
+        let mut network = ReliableSender::new();
+        let mut pending = FuturesUnordered::new();
+
+        loop {
+            tokio::select! {
+                Some(messages) = rx_messages.recv() => {
+                    let payload = bincode::serialize(&messages)
+                        .expect("Failed to serialize ABA batch");
+                    let message = ConsensusNetworkMessage::new(
+                        payload,
+                        name,
+                        &mut signature_service,
+                    ).await;
+                    let bytes = bincode::serialize(&message)
+                        .expect("Failed to serialize ABA network message");
+                    pending.extend(network.broadcast(addresses.clone(), Bytes::from(bytes)).await);
+                }
+                Some(_) = pending.next(), if !pending.is_empty() => {}
+                else => break,
+            }
+        }
+    });
 }
 
 pub struct Primary;
@@ -87,6 +126,7 @@ impl Primary {
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_consensus_commands, rx_consensus_commands) = channel(CHANNEL_CAPACITY);
+        let (tx_aba_broadcast, rx_aba_broadcast) = channel(CHANNEL_CAPACITY);
         let (tx_cleanup, rx_cleanup) = channel(CHANNEL_CAPACITY);
 
         tokio::spawn(async move {
@@ -131,8 +171,8 @@ impl Primary {
                                 }
                             }
                         }
-                        tx_consensus_commands
-                            .send(ConsensusCommand::AbaBroadcast(messages))
+                        tx_aba_broadcast
+                            .send(messages)
                             .await
                             .expect("Failed to send ABA batch");
                     }
@@ -174,6 +214,21 @@ impl Primary {
             name, address
         );
 
+        // ABA has a dedicated socket and bypasses the GRBC Core input queue.
+        let mut address = committee
+            .primary(&name)
+            .expect("Our public key or worker id is not in the committee")
+            .aba_to_aba;
+        address.set_ip("0.0.0.0".parse().unwrap());
+        NetworkReceiver::spawn(
+            address,
+            AbaReceiverHandler {
+                committee: committee.clone(),
+                tx_consensus: tx_consensus.clone(),
+            },
+        );
+        info!("Primary {} listening to ABA messages on {}", name, address);
+
         // Spawn the network receiver listening to messages from our workers.
         let mut address = committee
             .primary(&name)
@@ -204,6 +259,12 @@ impl Primary {
 
         // The `SignatureService` is used to require signatures on specific digests.
         let signature_service = SignatureService::new(secret);
+        spawn_aba_broadcaster(
+            name,
+            committee.clone(),
+            signature_service.clone(),
+            rx_aba_broadcast,
+        );
 
         // The `Core` receives and handles headers, votes, and certificates from the other primaries.
         Core::spawn(
@@ -286,6 +347,32 @@ impl Primary {
 struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
+}
+
+/// Dedicated ABA ingress. Authentication and decoding happen outside Core;
+/// consensus remains the single ordered state mutator.
+#[derive(Clone)]
+struct AbaReceiverHandler {
+    committee: Committee,
+    tx_consensus: Sender<ConsensusMessage>,
+}
+
+#[async_trait]
+impl MessageHandler for AbaReceiverHandler {
+    async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+        let message: ConsensusNetworkMessage =
+            bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
+        message.verify(&self.committee)?;
+        let batch = bincode::deserialize::<Vec<Vec<u8>>>(&message.payload)
+            .map_err(DagError::SerializationError)?;
+
+        let _ = writer.send(Bytes::from("Ack")).await;
+        self.tx_consensus
+            .send(ConsensusMessage::AbaBatch(message.author, batch))
+            .await
+            .expect("Failed to deliver ABA batch");
+        Ok(())
+    }
 }
 
 #[async_trait]

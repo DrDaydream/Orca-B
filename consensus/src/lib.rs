@@ -73,6 +73,9 @@ struct State {
     aba_support: HashMap<(Round, Digest), AbaSupport>,
     /// The authority designated as leader for every round.
     leaders: HashMap<Round, PublicKey>,
+    /// Cached per-round result of the dynamic adversary selection.
+    adversarial_leaders: HashMap<Round, bool>,
+    deferred_rule_one: HashMap<Round, bool>,
     /// Leader rounds already committed, preventing duplicate commits.
     committed_leaders: HashSet<Round>,
     /// Leader rounds explicitly skipped by commit rule 3.
@@ -168,6 +171,8 @@ impl State {
             promotion_queue: VecDeque::new(),
             aba_support: HashMap::new(),
             leaders: HashMap::new(),
+            adversarial_leaders: HashMap::new(),
+            deferred_rule_one: HashMap::new(),
             committed_leaders: [0].iter().cloned().collect(),
             skipped_leaders: HashSet::new(),
             pending_leaders: BTreeMap::new(),
@@ -564,6 +569,9 @@ impl State {
             .retain(|round| *round >= gc_round);
         self.direct_commit_ready.retain(|round| *round >= gc_round);
         self.leaders.retain(|round, _| *round >= gc_round);
+        self.adversarial_leaders
+            .retain(|round, _| *round >= gc_round);
+        self.deferred_rule_one.retain(|round, _| *round >= gc_round);
         self.committed_leaders.retain(|round| *round >= gc_round);
         self.skipped_leaders.retain(|round| *round >= gc_round);
     }
@@ -595,19 +603,43 @@ enum OutputSender {
 }
 
 impl Consensus {
-    fn adversarial_schedule_enabled() -> bool {
-        std::env::var("ORCA_FAULTS")
+    fn adversarial_leader(&self, round: Round, state: &mut State) -> bool {
+        if let Some(selected) = state.adversarial_leaders.get(&round) {
+            return *selected;
+        }
+
+        let faults = std::env::var("ORCA_FAULTS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .map_or(false, |faults| faults > 0)
+            .unwrap_or(0);
+        let seed = std::env::var("ORCA_ADVERSARY_SEED")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let authorities: Vec<_> = self.committee.authorities.keys().cloned().collect();
+        let leader = self.ordering_leader_authority(round);
+        let selected =
+            primary::adversary::selected(&leader, &authorities, round, faults, seed, None);
+        state.adversarial_leaders.insert(round, selected);
+        selected
     }
 
-    fn scheduled_rule(&self, round: Round) -> u8 {
-        if !Self::adversarial_schedule_enabled() {
-            return 0;
+    fn defer_rule_one_to_rule_two(&self, round: Round, state: &mut State) -> bool {
+        if let Some(deferred) = state.deferred_rule_one.get(&round) {
+            return *deferred;
         }
-        let index = round.saturating_sub(1);
-        ((index + index / 3) % 3 + 1) as u8
+        let faults = std::env::var("ORCA_FAULTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let seed = std::env::var("ORCA_ADVERSARY_SEED")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let leader = self.ordering_leader_authority(round);
+        let deferred = faults > 0 && primary::adversary::defer_to_rule_two(&leader, round, seed);
+        state.deferred_rule_one.insert(round, deferred);
+        deferred
     }
 
     fn mark_rule_skipped(&self, round: Round, rule: u8, state: &mut State) {
@@ -1169,7 +1201,9 @@ impl Consensus {
             return;
         }
         let leader_round = r - 1;
-        if Self::adversarial_schedule_enabled() && self.scheduled_rule(leader_round) != 1 {
+        if self.adversarial_leader(leader_round, state)
+            || self.defer_rule_one_to_rule_two(leader_round, state)
+        {
             return;
         }
         if state.committed_leaders.contains(&leader_round)
@@ -1215,7 +1249,7 @@ impl Consensus {
             return;
         }
         let leader_round = q - 2;
-        if Self::adversarial_schedule_enabled() && self.scheduled_rule(leader_round) != 2 {
+        if self.adversarial_leader(leader_round, state) {
             return;
         }
         if state.committed_leaders.contains(&leader_round)
