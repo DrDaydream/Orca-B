@@ -1,174 +1,299 @@
-# Orca-B AWS EC2 10/20/50 节点部署
+# Orca-B：AWS EC2 10 / 20 / 50 节点完整部署
 
-每台 EC2 运行一个 Primary、一个 Worker 和一个 benchmark client。Node 0 同时作为控制机。所有协议通信必须使用私网 IP。
+本文对应当前仓库的 `prepare-aws-cluster.sh` 与 `run-multi-servers.sh`。每台 EC2 运行一个 Primary、一个 Worker 和一个 benchmark client；node-0 同时作为控制机和第 0 个节点。Orca-B 的 ABA 使用独立 TCP 端口 3005，这是它与 Orca-A 部署最重要的区别。
 
-> 最新敌手模式：benchmark 中 `faults > 0` 时，所有节点仍保持在线。每轮根据 `ORCA_ADVERSARY_SEED`、轮次和委员会确定性伪随机选出 `f` 个敌手。若本轮 leader 被选为敌手，它会强制进入 Rule 3，不再检查 Rule 1/2；非敌手 leader 仍正常检查 Rule 1/2，未命中才进入 Rule 3。非 leader 敌手静默。`ORCA_RULE3_BEHAVIOR=mixed`（默认）根据相同种子确定该 Rule 3 leader 静默或参与，也可设为 `silent` 或 `participate`。静默节点暂停 Header 和本地 batch 生产，但继续接收协议消息；ABA 独立运行。
+## 1. 资源与参数
 
-当 `faults > 0` 时，非敌手 leader 还会通过独立的确定性随机硬币分流：约一半正常尝试 Rule 1，另一半跳过 Rule 1 等待 Rule 2，使长时间测试中的 Rule 1:Rule 2 接近 1:1。Orca-B 原有的较早 ABA 结果仍计入 Rule 2。统计百分比以包含 Rule 3 的全部 leader 为分母，因此两项不一定各为 50%。
+| 项目 | 值 |
+|---|---|
+| AMI | Ubuntu Server 24.04 LTS，x86_64 |
+| 节点数 | 10、20 或 50 |
+| 登录用户 | `ubuntu` |
+| 项目目录 | `/home/ubuntu/Orca-B` |
+| 仓库 | `https://github.com/DrDaydream/Orca-B.git` |
+| 推荐实例 | 10 节点至少 4 vCPU / 16 GiB；20/50 节点建议 8 vCPU / 32 GiB |
+| 磁盘 | 至少 30 GiB gp3 |
+| 网络 | 同一 Region、同一 VPC，建议同一 AZ |
+| 控制机 | node-0，同时参与协议 |
 
-Client 在敌手静默时间段的行为由 `ORCA_CLIENT_DURING_SILENCE` 控制：`send`（默认）继续发送，`pause` 按 benchmark 启动前生成的单向墙钟时间表暂停发送，不使用 Worker → Client 控制消息。时间槽默认等于 `max_header_delay`，也可设置 `ORCA_CLIENT_SILENCE_SLOT_MS`。
+Orca-B 的 READY 工作队列无界，20/50 节点高压测试需监控内存。先用 10 节点、20 秒、10,000 总 TPS 跑通。协议要求 `n >= 3f+1`，建议最大敌手数为 10 节点 f=3、20 节点 f=6、50 节点 f=16。
 
-```bash
-# 本地测试先把 benchmark/fabfile.py 中的 faults 改为大于 0。
-ORCA_CLIENT_DURING_SILENCE=send fab local
-ORCA_CLIENT_DURING_SILENCE=pause ORCA_CLIENT_SILENCE_SLOT_MS=200 fab local
-ORCA_FAULTS=1 ORCA_CLIENT_DURING_SILENCE=pause ./run-multi-servers.sh 10 20 10000
-```
+## 2. AWS 控制台与安全组
 
-## 1. AWS 资源
+1. AWS Console -> EC2 -> Security Groups -> Create security group。
+2. 名称填写 `orca-b-sg`，选择实例所在 VPC。
+3. 创建 ED25519 key pair `orca-b-aws.pem`。
+4. Launch instances，选择 Ubuntu 24.04 x86_64、相同 VPC/子网/安全组，数量为 10、20 或 50。
+5. 建议同一实例类型、同一 AZ、至少 30 GiB gp3。
+6. 实例通过 2/2 status checks 后，按顺序命名 `orca-b-node-0` 至 `orca-b-node-N-1`。
+7. 50 节点前在 Service Quotas 检查 On-Demand vCPU 配额。
 
-- Ubuntu Server 24.04 LTS x86_64。
-- 所有实例位于同一 Region、VPC，建议同一 Availability Zone。
-- 10 节点：建议每台至少 4 vCPU / 16 GiB RAM。
-- 20/50 节点：READY 验签工作队列无上限，建议 8 vCPU / 32 GiB RAM 并监控 RSS。
-- 磁盘至少 30 GiB gp3。
+入站规则：
 
-安全组入站规则：
+| 协议/端口 | Source | 用途 |
+|---|---|---|
+| TCP 22 | 你的公网 IP /32 | 本地登录 |
+| TCP 22 | `orca-b-sg` 自身 | node-0 私网 SSH |
+| TCP 3000-3005 | `orca-b-sg` 自身 | Orca-B 内部协议 |
 
-| 端口 | 来源 | 用途 |
-|---:|---|---|
-| 22/TCP | 你的 IP 和安全组自身 | SSH |
-| 3000–3005/TCP | 安全组自身 | Orca-B 私网通信 |
-
-不要将 3000–3005 开放给 `0.0.0.0/0`。
+不要向 `0.0.0.0/0` 开放 3000-3005。
 
 | 端口 | 用途 |
 |---:|---|
-| 3000 | Primary ↔ Primary（GRBC、READY、同步） |
-| 3001 | Worker → Primary |
-| 3002 | Primary → Worker |
-| 3003 | Client → Worker |
-| 3004 | Worker ↔ Worker |
-| 3005 | ABA ↔ ABA（独立发送、接收和验签队列） |
+| 3000 | Primary <-> Primary，GRBC/READY/同步 |
+| 3001 | Worker -> Primary |
+| 3002 | Primary -> Worker |
+| 3003 | Client -> Worker |
+| 3004 | Worker <-> Worker |
+| 3005 | ABA <-> ABA 独立通道 |
 
-## 2. Node 0 连接所有节点
+## 2.1 五大洲跨 Region 部署
 
-将 AWS pem 放到 Node 0 的 `~/.ssh/orca-cluster-key.pem`，权限设为 400。创建 `~/.ssh/config`：
+单 Region 基线可以使用安全组自身作为来源。五大洲实验建议在 5 个 Region 各放 2/4/10 台，对应 10/20/50 节点，例如 `us-east-1`、`sa-east-1`、`eu-west-2`、`ap-southeast-1`、`ap-southeast-2`。
 
-```text
+为五个 VPC 使用不重叠 CIDR，例如 `10.10.0.0/16` 到 `10.50.0.0/16`。通过 AWS Cloud WAN 或 Transit Gateway inter-Region peering 建立私网连接，并在所有 route table 中配置双向路由。跨 Region 安全组不能只引用另一个 Region 的安全组名称；每个 Region 的入站规则应允许：
+
+- TCP 22：你的公网 IP /32 和 node-0 VPC CIDR；
+- TCP 3000-3005：全部五个集群 VPC CIDR，3005 不能遗漏；
+- 出站：集群 CIDR、软件源和时间同步所需流量。
+
+hosts、committee 的常规地址和 `aba_to_aba` 都必须填写私网可路由地址。node-0 必须能通过私网 SSH 到所有节点，并能访问每台的 3000-3005。固定公网 IP + /32 allowlist 可以作为无私网互联时的临时方案，但不建议，且跨 Region 流量会产生费用。记录每个 Region 的节点数、RTT 和实例类型，结果才可复现。
+
+
+## 3. 配置 node-0 SSH
+
+在本地电脑执行：
+
+~~~bash
+chmod 400 ~/Downloads/orca-b-aws.pem
+scp -i ~/Downloads/orca-b-aws.pem ~/Downloads/orca-b-aws.pem \
+  ubuntu@NODE0_PUBLIC_IP:/home/ubuntu/.ssh/orca-b-aws.pem
+ssh -i ~/Downloads/orca-b-aws.pem ubuntu@NODE0_PUBLIC_IP
+~~~
+
+在 node-0 执行：
+
+~~~bash
+chmod 400 ~/.ssh/orca-b-aws.pem
+nano ~/.ssh/config
+~~~
+
+写入：
+
+~~~sshconfig
 Host 10.*
     User ubuntu
-    IdentityFile /home/ubuntu/.ssh/orca-cluster-key.pem
+    IdentityFile /home/ubuntu/.ssh/orca-b-aws.pem
     StrictHostKeyChecking accept-new
     ConnectTimeout 8
-```
+    ServerAliveInterval 5
+    ServerAliveCountMax 2
+~~~
 
-在项目中创建 `deploy/hosts-10.txt`、`hosts-20.txt` 或 `hosts-50.txt`，每行一个私网 IP，第一行是 Node 0。
+若 VPC 私网不是 `10.*`，改为实际网段或 `Host *`。然后：
 
-## 3. 在每台机器安装和编译
+~~~bash
+chmod 600 ~/.ssh/config
+git clone https://github.com/DrDaydream/Orca-B.git ~/Orca-B
+cd ~/Orca-B
+cp deploy/hosts-10.txt.example deploy/hosts-10.txt 2>/dev/null || touch deploy/hosts-10.txt
+nano deploy/hosts-10.txt
+~~~
 
-```bash
+每行只写一个 Private IPv4，node-0 必须是第一行。20/50 节点分别使用 `deploy/hosts-20.txt`、`deploy/hosts-50.txt`。
+
+~~~bash
+wc -l deploy/hosts-10.txt
+sort deploy/hosts-10.txt | uniq -d
+while read -r ip; do ssh "$ip" hostname; done < deploy/hosts-10.txt
+~~~
+
+必须分别得到 10 行、无重复输出、所有节点都能返回 hostname。
+
+## 4. 安装并编译全部节点
+
+在 node-0 的 `~/Orca-B` 中执行，20/50 节点替换 hosts 文件：
+
+~~~bash
+while read -r ip; do
+  ssh "$ip" 'bash -s' <<'REMOTE' &
+set -Eeuo pipefail
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   build-essential cmake clang-14 libclang-14-dev git curl tmux jq \
   python3 python3-pip netcat-openbsd chrony
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+sudo systemctl enable --now chrony
+if [[ ! -x "$HOME/.cargo/bin/cargo" ]]; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+fi
 source "$HOME/.cargo/env"
-git clone https://github.com/DrDaydream/Orca-B.git "$HOME/Orca-B"
+rustup default stable
+if [[ -d "$HOME/Orca-B/.git" ]]; then
+  git -C "$HOME/Orca-B" pull --ff-only
+else
+  git clone https://github.com/DrDaydream/Orca-B.git "$HOME/Orca-B"
+fi
 cd "$HOME/Orca-B"
-git pull --ff-only
-LIBCLANG_PATH=/usr/lib/llvm-14/lib CLANG_PATH=/usr/bin/clang-14 \
-CC=/usr/bin/clang-14 CXX=/usr/bin/clang++-14 CXXFLAGS='-include cstdint' \
+LIBCLANG_PATH=/usr/lib/llvm-14/lib \
+CLANG_PATH=/usr/bin/clang-14 \
+CC=/usr/bin/clang-14 \
+CXX=/usr/bin/clang++-14 \
+CXXFLAGS='-include cstdint' \
 cargo build --release --features benchmark
-python3 -m pip install --user --break-system-packages -r benchmark/requirements.txt
-```
+test -x target/release/node
+test -x target/release/benchmark_client
+REMOTE
+done < deploy/hosts-10.txt
+wait
+~~~
 
-**所有机器必须运行完全相同的 Git commit。** 新旧二进制混用可能导致网络消息反序列化失败。检查：
+首次 RocksDB 编译会较久。确认所有机器版本相同：
 
-```bash
-while read -r ip; do ssh "$ip" 'git -C ~/Orca-B rev-parse HEAD'; done < deploy/hosts-10.txt
-```
+~~~bash
+while read -r ip; do
+  ssh "$ip" 'git -C ~/Orca-B rev-parse HEAD'
+done < deploy/hosts-10.txt
+~~~
 
-## 4. 生成密钥和委员会
+## 5. 生成并分发配置
 
-在 Node 0 生成 N 个密钥：
+仓库脚本会生成 N 个密钥、3000-3005 committee、`max_header_delay=200` 的参数文件，并分发到各节点：
 
-```bash
-cd ~/Orca-B
-mkdir -p deploy
-for i in $(seq 0 9); do ./target/release/node generate_keys --filename "deploy/node-${i}.json"; done
-```
-
-20/50 节点将 `9` 改为 `19`/`49`。也可以直接使用仓库脚本生成并分发全部配置：
-
-```bash
+~~~bash
 cd ~/Orca-B
 chmod +x prepare-aws-cluster.sh
+HOSTS_FILE=deploy/hosts-10.txt ./prepare-aws-cluster.sh 10
+~~~
+
+20/50 节点：
+
+~~~bash
+HOSTS_FILE=deploy/hosts-20.txt ./prepare-aws-cluster.sh 20
+HOSTS_FILE=deploy/hosts-50.txt ./prepare-aws-cluster.sh 50
+~~~
+
+脚本依赖 `~/.ssh/config`，也可覆盖路径：
+
+~~~bash
+REMOTE_USER=ubuntu \
+REMOTE_DIR=/home/ubuntu/Orca-B \
+HOSTS_FILE=/home/ubuntu/Orca-B/deploy/hosts-10.txt \
 ./prepare-aws-cluster.sh 10
-```
+~~~
 
-脚本根据 hosts 文件生成 `deploy/committee.json`：每个 authority 的常规端口是对应私网 IP 的 3000–3004，ABA 独立使用 3005，stake 为 1，worker id 为 0，并校验所有服务器上的 committee SHA-256。
+每次更改节点规模都必须重新运行。每台只接收自己的 `node-i.json`，所有节点的 `committee.json` 和 `parameters.json` 必须相同。检查：
 
-`deploy/parameters.json` 建议：
+~~~bash
+while read -r ip; do
+  ssh "$ip" 'sha256sum ~/Orca-B/deploy/committee.json'
+done < deploy/hosts-10.txt
+~~~
 
-```json
-{
-  "batch_size": 500000,
-  "gc_depth": 50,
-  "header_size": 1000,
-  "max_batch_delay": 200,
-  "max_header_delay": 2000,
-  "sync_retry_delay": 10000,
-  "sync_retry_nodes": 3
-}
-```
+## 6. 敌手与 ABA 选项
 
-若主要比较延迟，三个协议必须使用同一 `max_header_delay`。不要用 Orca-B 200 ms 直接对比 Bullshark 2000 ms。
+| 环境变量 | 默认值 | 含义 |
+|---|---|---|
+| `ORCA_FAULTS` | `0` | 每轮敌手数；0 为无敌手 |
+| `ORCA_ADVERSARY_SEED` | `0` | 确定性随机种子 |
+| `ORCA_RULE3_BEHAVIOR` | `mixed` | `mixed`、`silent` 或 `participate` |
+| `ORCA_CLIENT_DURING_SILENCE` | `send` | `send` 保持输入；`pause` 按时序表暂停 |
+| `ORCA_CLIENT_SILENCE_SLOT_MS` | `max_header_delay` | 静默时间槽毫秒数 |
 
-将 `node-i.json`、`committee.json` 和 `parameters.json` 分发到对应机器的 `~/Orca-B/deploy/`。分发后比较所有 `committee.json` 的 SHA-256。
+当 `ORCA_FAULTS>0` 时，每轮按种子选择 f 个敌手。敌手 leader 强制进入 Rule 3；`mixed` 确定性地选择静默或参与，`silent` 始终静默，`participate` 始终参与。非敌手 leader 的 Rule 1/Rule 2 长期约 1:1，但比例以所有 leader 为分母。
 
-## 5. 运行
+ABA 独立运行：静默 Primary 不创建 Header，但继续接收协议消息，ABA 仍可处理输入输出。进入 `r+3` 前完成的 ABA 结果计入 Rule 2，之后计入 Rule 3。缺少本地 leader 不等于 ABA 不能输入 1。安全组缺少 TCP 3005 会造成 ABA 停滞。
 
-Node 0：
+`pause` 使用 benchmark 运行前生成的单向墙钟时间表，不使用 Worker -> Client 反馈；`send` 保持交易流量，便于区分协议静默与输入下降的影响。
 
-```bash
+## 7. 运行 10 / 20 / 50 节点
+
+参数为节点数、正式运行秒数、集群总 TPS；TPS 会均摊到全部 Client。
+
+无敌手基线：
+
+~~~bash
 cd ~/Orca-B
 chmod +x run-multi-servers.sh
 ./run-multi-servers.sh 10 20 10000
-./run-multi-servers.sh 20 60 20000
-./run-multi-servers.sh 50 60 50000
-```
+./run-multi-servers.sh 20 60 10000
+./run-multi-servers.sh 50 60 10000
+~~~
 
-参数中的 TPS 是**集群总输入速率**，脚本会分摊给每个 client。脚本会先等待所有 client 连通全部 Worker，再计时，最后下载日志并调用 `LogParser`。
+推荐最大容错敌手测试：
 
-最新结果在原有 TPS、`Consensus latency` 和 `End-to-end latency` 之外，还输出 leader/非 leader 提交延迟、leader 间隔、非 leader 规则排序延迟、Rule 1/2/3 的 leader 和区块比例，以及已完成 ABA 节点实例的平均、最大和最小时长。测试结束时仍未决定的 ABA 不计入时长统计。
+~~~bash
+ORCA_FAULTS=3 ORCA_ADVERSARY_SEED=42 \
+ORCA_RULE3_BEHAVIOR=mixed ORCA_CLIENT_DURING_SILENCE=pause \
+./run-multi-servers.sh 10 20 10000
 
-`faults > 0` 时使用主动敌手调度：所有 EC2 节点仍然启动。每轮根据 `ORCA_ADVERSARY_SEED`、轮次和委员会确定性伪随机选出 `f` 个敌手；敌手 leader 强制进入 Rule 3，非敌手 leader 正常检查 Rule 1/2。静默敌手不创建 Header，并暂停本地 batch 生产，但继续接收消息且 ABA 继续独立运行。默认种子为 `0`，例如 `ORCA_ADVERSARY_SEED=42 fab local` 可得到另一条可复现轨迹。ABA 在进入 `r+3` 前输出的结果归入 Rule 2，之后的结果归入 Rule 3。
+ORCA_FAULTS=6 ORCA_ADVERSARY_SEED=42 \
+ORCA_RULE3_BEHAVIOR=mixed ORCA_CLIENT_DURING_SILENCE=pause \
+./run-multi-servers.sh 20 60 10000
 
-若本轮随机敌手中包含 leader，可在运行 Fabric 前通过 `ORCA_RULE3_BEHAVIOR` 选择该强制 Rule 3 leader 的行为：`silent` 表示静默，`participate` 表示继续参与，`mixed`（默认）表示根据相同种子确定性选择静默或参与，两种结果概率各为 1/2。例如：`ORCA_RULE3_BEHAVIOR=silent fab local`。该参数会自动传入本地或远端 Primary。
+ORCA_FAULTS=16 ORCA_ADVERSARY_SEED=42 \
+ORCA_RULE3_BEHAVIOR=mixed ORCA_CLIENT_DURING_SILENCE=pause \
+./run-multi-servers.sh 50 60 10000
+~~~
 
-本地 Fabric 示例：
+对照组：
 
-```bash
-# 默认：每个 Rule 3 leader 以 1/2 概率静默、1/2 概率参与
-ORCA_RULE3_BEHAVIOR=mixed fab local
+~~~bash
+# 敌手 leader 静默，但 Client 仍发送
+ORCA_FAULTS=3 ORCA_RULE3_BEHAVIOR=silent \
+ORCA_CLIENT_DURING_SILENCE=send \
+./run-multi-servers.sh 10 20 10000
 
-# Rule 3 leader 全部静默
-ORCA_RULE3_BEHAVIOR=silent fab local
+# 敌手 leader 继续参与
+ORCA_FAULTS=3 ORCA_RULE3_BEHAVIOR=participate \
+ORCA_CLIENT_DURING_SILENCE=send \
+./run-multi-servers.sh 10 20 10000
+~~~
 
-# 对照组：Rule 3 leader 全部参与
-ORCA_RULE3_BEHAVIOR=participate fab local
-```
+自定义路径：
 
-Fabric 是否启用敌手调度仍由 `benchmark/fabfile.py` 中的 `faults` 决定；必须满足 `faults > 0`，上述 Rule 3 行为才会生效。
+~~~bash
+REMOTE_USER=ubuntu \
+REMOTE_DIR=/home/ubuntu/Orca-B \
+HOSTS_FILE=/home/ubuntu/Orca-B/deploy/hosts-10.txt \
+./run-multi-servers.sh 10 20 10000
+~~~
 
-AWS 多服务器脚本从 Node 0 的 `ORCA_FAULTS` 和 `ORCA_RULE3_BEHAVIOR` 环境变量读取设置。`ORCA_FAULTS` 必须大于 0 才会启用敌手调度。例如：
+脚本等待全部 Worker 和 Client 就绪后计时，结束时下载日志到 `benchmark/logs/` 并输出 TPS、延迟、Rule 1/2/3 比例及已完成 ABA 实例的平均/最大/最小时长。未完成 ABA 不计入时长统计。
 
-```bash
-cd ~/Orca-B
-ORCA_FAULTS=1 ORCA_RULE3_BEHAVIOR=mixed ./run-multi-servers.sh 10 20 10000
-ORCA_FAULTS=1 ORCA_RULE3_BEHAVIOR=silent ./run-multi-servers.sh 10 20 10000
-ORCA_FAULTS=1 ORCA_RULE3_BEHAVIOR=participate ./run-multi-servers.sh 10 20 10000
-```
+## 8. 运行前检查
 
-## 6. 故障排查
+~~~bash
+# 所有版本相同
+while read -r ip; do ssh "$ip" 'git -C ~/Orca-B rev-parse HEAD'; done < deploy/hosts-10.txt
 
-- `hostname contains invalid characters`：hosts 文件只写纯 IP，不要写 `ubuntu@` 或空格。
-- `NoneType ... group`：client 没有打印 `Start sending transactions`，先检查全部 3003 端口。
-- `Malformed/Serialization`：确认所有机器 commit 完全相同并重启全部进程。
-- RocksDB bindgen 报错：确认 clang-14 环境变量完整。
-- ready=0/N：在 Node 0 执行 `while read ip; do nc -vz -w3 "$ip" 3003; done < deploy/hosts-N.txt`。
-- ABA 无法推进：检查安全组已开放集群内部 TCP 3005，并执行 `while read ip; do nc -vz -w3 "$ip" 3005; done < deploy/hosts-N.txt`。
-- 内存持续增长：检查 READY 验签是否长期低于输入速率；无界队列不会丢消息，但也不会自动限制内存。
+# 测试运行期间检查 Worker 和 ABA 端口
+while read -r ip; do
+  nc -vz -w 2 "$ip" 3003
+  nc -vz -w 2 "$ip" 3005
+done < deploy/hosts-10.txt
 
-测试完后停止或终止 EC2，并检查 EBS 卷、Elastic IP 和跨 AZ 流量费用。
+# 时间、资源
+while read -r ip; do
+  ssh "$ip" 'chronyc tracking | head -5; nproc; free -h; df -h /'
+done < deploy/hosts-10.txt
+~~~
+
+## 9. 排障
+
+- `hostname contains invalid characters`：hosts 只能写纯私网 IP。
+- `ready=0/N`：检查全部 Worker 的 3003 和 `run/logs/worker-*-0.log`。
+- `NoneType object has no attribute group`：至少一个 Client 未打印 `Start sending transactions`。
+- ABA 无法推进：检查安全组自身 TCP 3005、committee 的 `aba_to_aba` 地址以及 Primary 日志。
+- `librocksdb-sys` / bindgen 报错：使用 clang-14 的完整编译环境变量。
+- `Malformed` / `Serialization`：所有机器必须使用同一 commit 和 committee。
+- 全 0：检查测试是否真正开始、Primary 是否提交、运行时间是否过短。
+- 内存持续增长：降低总 TPS，查看 READY/ABA 队列积压。
+- `Connection refused`：进程未监听；`timed out`：通常是安全组、NACL、UFW 或地址错误。
+
+~~~bash
+ssh NODE_PRIVATE_IP 'tail -100 ~/Orca-B/run/logs/primary-INDEX.log'
+ssh NODE_PRIVATE_IP 'tail -100 ~/Orca-B/run/logs/worker-INDEX-0.log'
+ssh NODE_PRIVATE_IP 'tail -100 ~/Orca-B/run/logs/client-INDEX-0.log'
+~~~
+
+同一实验对比必须固定硬件、节点规模、总 TPS、持续时间、参数和种子。测试后停止或终止 EC2，并检查 EBS、Elastic IP、公网 IPv4 与跨 AZ 流量费用。不要把 pem 或 `deploy/node-*.json` 上传到 GitHub。

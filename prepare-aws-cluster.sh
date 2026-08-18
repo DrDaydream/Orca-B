@@ -44,7 +44,7 @@ parameters = {
     "gc_depth": 50,
     "header_size": 1000,
     "max_batch_delay": 200,
-    "max_header_delay": 2000,
+    "max_header_delay": 200,
     "sync_retry_delay": 10000,
     "sync_retry_nodes": 3,
 }
