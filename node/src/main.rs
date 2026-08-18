@@ -47,8 +47,10 @@ async fn main() -> Result<()> {
         0 => "error",
         1 => "warn",
         2 => "info",
-        3 => "debug",
-        _ => "trace",
+        // Keep benchmark-critical records while suppressing the high-volume
+        // protocol debug/trace stream even when Fabric passes --debug.
+        3 => "info",
+        _ => "info",
     };
     let mut logger = env_logger::Builder::from_env(Env::default().default_filter_or(log_level));
     #[cfg(feature = "benchmark")]

@@ -107,6 +107,9 @@ struct State {
     /// zero-input handling incremental instead of rescanning round 1 onward.
     zero_input_checked_through: Round,
     highest_entered_round: Round,
+    /// Prevent duplicate benchmark records when a preordered DAG is revisited.
+    #[cfg(feature = "benchmark")]
+    logged_rule_order: HashMap<Digest, Round>,
 }
 
 impl State {
@@ -191,6 +194,8 @@ impl State {
             direct_commit_ready: HashSet::new(),
             zero_input_checked_through: 0,
             highest_entered_round: 1,
+            #[cfg(feature = "benchmark")]
+            logged_rule_order: HashMap::new(),
         }
     }
 
@@ -577,6 +582,8 @@ impl State {
         self.deferred_rule_one.retain(|round, _| *round >= gc_round);
         self.committed_leaders.retain(|round| *round >= gc_round);
         self.skipped_leaders.retain(|round| *round >= gc_round);
+        #[cfg(feature = "benchmark")]
+        self.logged_rule_order.retain(|_, round| *round >= gc_round);
     }
 }
 
@@ -1579,7 +1586,12 @@ impl Consensus {
         let ordered = self.order_dag(&leader, state);
         #[cfg(feature = "benchmark")]
         for certificate in &ordered {
-            if certificate.origin() != self.ordering_leader_authority(certificate.round()) {
+            if certificate.origin() != self.ordering_leader_authority(certificate.round())
+                && state
+                    .logged_rule_order
+                    .insert(certificate.header.digest(), certificate.round())
+                    .is_none()
+            {
                 info!(
                     "Header rule-ordered round {} digest {:?}",
                     certificate.round(),
