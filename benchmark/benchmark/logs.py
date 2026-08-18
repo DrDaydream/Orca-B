@@ -44,7 +44,7 @@ class LogParser:
                 results = p.map(self._parse_primaries, primaries)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse nodes\' logs: {e}')
-        proposals, commits, final_commits, header_proposals, header_commits, rule_orders, commit_rules, self.configs, primary_ips = zip(*results)
+        proposals, commits, final_commits, header_proposals, header_commits, rule_orders, commit_rules, aba_durations, self.configs, primary_ips = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
         self.final_commits = self._merge_results(
@@ -54,6 +54,9 @@ class LogParser:
         self.header_commits = self._merge_tagged_results(header_commits)
         self.rule_orders = self._merge_results([x.items() for x in rule_orders])
         self.commit_rules = self._merge_commit_rules(commit_rules)
+        # Keep every completed node-instance sample. Unfinished ABA instances
+        # have no duration log and are intentionally excluded.
+        self.aba_durations = [duration for values in aba_durations for duration in values]
 
         # Parse the workers logs.
         try:
@@ -158,6 +161,7 @@ class LogParser:
         rule_orders = self._merge_results([[(d, self._to_posix(t)) for t, d in tmp]])
         tmp = findall(r'Commit rule stats leader (\S+) rule ([123]) outcome (commit|skip) blocks (\d+)', log)
         commit_rules = {leader: (int(rule), outcome, int(blocks)) for leader, rule, outcome, blocks in tmp}
+        aba_durations = [int(value) for value in findall(r'ABA duration round \d+ ms (\d+)', log)]
 
         configs = {
             'header_size': int(
@@ -185,7 +189,7 @@ class LogParser:
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
         
-        return proposals, commits, final_commits, header_proposals, header_commits, rule_orders, commit_rules, configs, ip
+        return proposals, commits, final_commits, header_proposals, header_commits, rule_orders, commit_rules, aba_durations, configs, ip
 
     def _parse_workers(self, log):
         if search(r'(?:panic|Error)', log) is not None:
@@ -299,6 +303,9 @@ class LogParser:
         end_to_end_latency = self._end_to_end_latency() * 1_000
         leader_latency, non_leader_latency, all_header_latency, leader_interval, rule_order_latency = (x * 1_000 for x in self._header_latency_stats())
         rule_leaders, rule_blocks = self._commit_rule_ratios()
+        aba_average = mean(self.aba_durations) if self.aba_durations else 0
+        aba_maximum = max(self.aba_durations) if self.aba_durations else 0
+        aba_minimum = min(self.aba_durations) if self.aba_durations else 0
 
         return (
             '\n'
@@ -338,6 +345,9 @@ class LogParser:
             f' Rule 1 block ratio: {rule_blocks[0]:.2f}%\n'
             f' Rule 2 block ratio: {rule_blocks[1]:.2f}%\n'
             f' Rule 3 block ratio: {rule_blocks[2]:.2f}%\n'
+            f' ABA average duration: {round(aba_average):,} ms\n'
+            f' ABA maximum duration: {round(aba_maximum):,} ms\n'
+            f' ABA minimum duration: {round(aba_minimum):,} ms\n'
             '\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'

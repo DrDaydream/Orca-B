@@ -21,6 +21,9 @@ pub mod proposer_tests;
 pub struct Proposer {
     /// The public key of this primary.
     name: PublicKey,
+    /// Authorities in the same deterministic order used by consensus to
+    /// designate each round's leader.
+    leader_schedule: Vec<PublicKey>,
     /// Service to sign headers.
     signature_service: SignatureService,
     /// The size of the headers' payload.
@@ -59,6 +62,8 @@ impl Proposer {
         rx_workers: Receiver<(Digest, WorkerId)>,
         tx_core: Sender<Header>,
     ) {
+        let mut leader_schedule: Vec<_> = committee.authorities.keys().cloned().collect();
+        leader_schedule.sort();
         let genesis = Certificate::genesis(committee)
             .iter()
             .map(|x| x.digest())
@@ -67,6 +72,7 @@ impl Proposer {
         tokio::spawn(async move {
             Self {
                 name,
+                leader_schedule,
                 signature_service,
                 header_size,
                 max_header_delay,
@@ -83,6 +89,34 @@ impl Proposer {
             .run()
             .await;
         });
+    }
+
+    fn scheduled_rule(round: Round) -> u8 {
+        let index = round.saturating_sub(1);
+        ((index + index / 3) % 3 + 1) as u8
+    }
+
+    /// In adversarial benchmarks, a rule-3 leader may either withhold its
+    /// vertex or keep participating. In `mixed` mode the designated leader
+    /// makes an independent random choice for that round.
+    fn silence_rule_three_leader(&self) -> bool {
+        let faults = std::env::var("ORCA_FAULTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        if faults == 0 || Self::scheduled_rule(self.round) != 3 {
+            return false;
+        }
+        let leader = self.leader_schedule[self.round as usize % self.leader_schedule.len()];
+        if self.name != leader {
+            return false;
+        }
+
+        match std::env::var("ORCA_RULE3_BEHAVIOR").as_deref() {
+            Ok("silent") => true,
+            Ok("participate") => false,
+            _ => rand::random::<bool>(),
+        }
     }
 
     async fn make_header(&mut self) {
@@ -136,9 +170,17 @@ impl Proposer {
             let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
             if (timer_expired || enough_digests) && enough_parents {
-                // Make a new header.
-                self.make_header().await;
-                self.payload_size = 0;
+                if self.silence_rule_three_leader() {
+                    // Consume this round's parent set so an elapsed timer does
+                    // not spin. Keep payload digests for the next round.
+                    self.last_parents.clear();
+                    self.last_weak_edges.clear();
+                    self.last_virtual_edges.clear();
+                } else {
+                    // Make a new header.
+                    self.make_header().await;
+                    self.payload_size = 0;
+                }
 
                 // Reschedule the timer.
                 let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);

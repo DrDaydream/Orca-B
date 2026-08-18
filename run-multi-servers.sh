@@ -9,6 +9,11 @@ case "$NODES" in 10|20|50) ;; *) echo "usage: $0 <10|20|50> [seconds] [total-tps
 [[ "$DURATION" =~ ^[1-9][0-9]*$ ]] || exit 2
 [[ "$TOTAL_RATE" =~ ^[1-9][0-9]*$ ]] || exit 2
 
+FAULTS="${ORCA_FAULTS:-0}"
+RULE3_BEHAVIOR="${ORCA_RULE3_BEHAVIOR:-mixed}"
+[[ "$FAULTS" =~ ^[0-9]+$ ]] || { echo "ORCA_FAULTS must be a non-negative integer" >&2; exit 2; }
+case "$RULE3_BEHAVIOR" in mixed|silent|participate) ;; *) echo "ORCA_RULE3_BEHAVIOR must be mixed, silent, or participate" >&2; exit 2;; esac
+
 REMOTE_USER="${REMOTE_USER:-ubuntu}"
 REMOTE_DIR="${REMOTE_DIR:-/home/ubuntu/Orca-B}"
 HOSTS_FILE="${HOSTS_FILE:-deploy/hosts-${NODES}.txt}"
@@ -41,7 +46,7 @@ stop_all() {
 }
 trap stop_all EXIT INT TERM
 
-echo "nodes=$NODES duration=${DURATION}s total-rate=$TOTAL_RATE per-client=$RATE_SHARE"
+echo "nodes=$NODES duration=${DURATION}s total-rate=$TOTAL_RATE per-client=$RATE_SHARE faults=$FAULTS rule3=$RULE3_BEHAVIOR"
 for i in "${!IPS[@]}"; do
   remote "${IPS[$i]}" "test -x '$REMOTE_DIR/target/release/node' && test -x '$REMOTE_DIR/target/release/benchmark_client' && test -f '$REMOTE_DIR/deploy/node-${i}.json' && test -f '$REMOTE_DIR/deploy/committee.json' && test -f '$REMOTE_DIR/deploy/parameters.json'"
 done
@@ -57,7 +62,7 @@ for i in "${!IPS[@]}"; do
   remote "${IPS[$i]}" "cd '$REMOTE_DIR' && tmux new-session -d -s orca-worker \"RUST_LOG=info ./target/release/node -vv run --keys deploy/node-${i}.json --committee deploy/committee.json --parameters deploy/parameters.json --store run/db-worker worker --id 0 |& tee run/logs/worker-${i}-0.log\""
 done
 for i in "${!IPS[@]}"; do
-  remote "${IPS[$i]}" "cd '$REMOTE_DIR' && tmux new-session -d -s orca-primary \"RUST_LOG=info ./target/release/node -vv run --keys deploy/node-${i}.json --committee deploy/committee.json --parameters deploy/parameters.json --store run/db-primary primary |& tee run/logs/primary-${i}.log\""
+  remote "${IPS[$i]}" "cd '$REMOTE_DIR' && tmux new-session -d -s orca-primary \"RUST_LOG=info ORCA_FAULTS='$FAULTS' ORCA_RULE3_BEHAVIOR='$RULE3_BEHAVIOR' ./target/release/node -vv run --keys deploy/node-${i}.json --committee deploy/committee.json --parameters deploy/parameters.json --store run/db-primary primary |& tee run/logs/primary-${i}.log\""
 done
 sleep 6
 
@@ -90,9 +95,10 @@ for i in "${!IPS[@]}"; do
   scp "${SSH_OPTS[@]}" "${REMOTE_USER}@${IPS[$i]}:${REMOTE_DIR}/run/logs/client-${i}-0.log" "$LOCAL_LOGS/"
 done
 cd benchmark
-python3 - "$NODES" <<'PY'
+python3 - "$NODES" "$FAULTS" <<'PY'
 import sys
 from benchmark.logs import LogParser
-print(LogParser.process("logs", faults=0).result())
-print(f"Parsed {sys.argv[1]} active nodes with faults=0")
+faults = int(sys.argv[2])
+print(LogParser.process("logs", faults=faults).result())
+print(f"Parsed {sys.argv[1]} active nodes with faults={faults}")
 PY

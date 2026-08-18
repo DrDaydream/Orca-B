@@ -117,9 +117,35 @@ chmod +x run-multi-servers.sh
 
 参数中的 TPS 是**集群总输入速率**，脚本会分摊给每个 client。脚本会先等待所有 client 连通全部 Worker，再计时，最后下载日志并调用 `LogParser`。
 
-最新结果在原有 TPS、`Consensus latency` 和 `End-to-end latency` 之外，还输出 leader/非 leader 提交延迟、leader 间隔、非 leader 规则排序延迟，以及 Rule 1/2/3 的 leader 和区块比例。
+最新结果在原有 TPS、`Consensus latency` 和 `End-to-end latency` 之外，还输出 leader/非 leader 提交延迟、leader 间隔、非 leader 规则排序延迟、Rule 1/2/3 的 leader 和区块比例，以及已完成 ABA 节点实例的平均、最大和最小时长。测试结束时仍未决定的 ABA 不计入时长统计。
 
 `faults > 0` 时使用主动敌手调度：所有 EC2 节点仍然启动，Primary 命令自动传入 `ORCA_FAULTS`，协议内对 Rule 1/2/3 进行确定性分流。ABA 在进入 `r+3` 前输出的结果归入 Rule 2，之后的结果归入 Rule 3。
+
+Rule 3 leader 的行为可在运行 Fabric 前通过 `ORCA_RULE3_BEHAVIOR` 选择：`silent` 表示全部静默，`participate` 表示全部继续参与，`mixed`（默认）表示每个 Rule 3 leader 独立随机选择静默或参与，两种结果概率各为 1/2。例如：`ORCA_RULE3_BEHAVIOR=silent fab local`。该参数会自动传入本地或远端 Primary。
+
+本地 Fabric 示例：
+
+```bash
+# 默认：每个 Rule 3 leader 以 1/2 概率静默、1/2 概率参与
+ORCA_RULE3_BEHAVIOR=mixed fab local
+
+# Rule 3 leader 全部静默
+ORCA_RULE3_BEHAVIOR=silent fab local
+
+# 对照组：Rule 3 leader 全部参与
+ORCA_RULE3_BEHAVIOR=participate fab local
+```
+
+Fabric 是否启用敌手调度仍由 `benchmark/fabfile.py` 中的 `faults` 决定；必须满足 `faults > 0`，上述 Rule 3 行为才会生效。
+
+AWS 多服务器脚本从 Node 0 的 `ORCA_FAULTS` 和 `ORCA_RULE3_BEHAVIOR` 环境变量读取设置。`ORCA_FAULTS` 必须大于 0 才会启用敌手调度。例如：
+
+```bash
+cd ~/Orca-B
+ORCA_FAULTS=1 ORCA_RULE3_BEHAVIOR=mixed ./run-multi-servers.sh 10 20 10000
+ORCA_FAULTS=1 ORCA_RULE3_BEHAVIOR=silent ./run-multi-servers.sh 10 20 10000
+ORCA_FAULTS=1 ORCA_RULE3_BEHAVIOR=participate ./run-multi-servers.sh 10 20 10000
+```
 
 ## 6. 故障排查
 

@@ -6,7 +6,7 @@ use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, ConsensusCommand, ConsensusMessage, Round};
 use std::cmp::max;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -88,6 +88,9 @@ struct State {
     ready_pending: BTreeSet<Round>,
     commit_tx: Option<mpsc::UnboundedSender<Vec<Certificate>>>,
     aba_instances: HashMap<Round, Aba<DeterministicCoin>>,
+    /// Local start time of every unfinished ABA instance. Benchmark duration
+    /// ends at this node's first decision for the instance.
+    aba_started_at: HashMap<Round, Instant>,
     aba_inputs: HashSet<Round>,
     aba_decisions: HashMap<Round, BinaryValue>,
     buffered_aba: HashMap<Round, Vec<(PublicKey, AbaMessage)>>,
@@ -174,6 +177,7 @@ impl State {
             ready_pending: BTreeSet::new(),
             commit_tx: None,
             aba_instances: HashMap::new(),
+            aba_started_at: HashMap::new(),
             aba_inputs: HashSet::new(),
             aba_decisions: HashMap::new(),
             buffered_aba: HashMap::new(),
@@ -861,6 +865,10 @@ impl Consensus {
                 DeterministicCoin::new(0x4f52_4341),
             ),
         );
+        state
+            .aba_started_at
+            .entry(leader_round)
+            .or_insert_with(Instant::now);
         if let Some(buffered) = state.buffered_aba.remove(&leader_round) {
             for (sender, message) in buffered {
                 self.process_aba_message(sender, message, state).await;
@@ -937,6 +945,14 @@ impl Consensus {
                     Box::pin(self.evaluate_commit_rule_one(leader_round + 1, state, false)).await;
                     Box::pin(self.evaluate_commit_rule_two(leader_round + 2, state, false)).await;
                     if state.aba_decisions.insert(leader_round, value).is_none() {
+                        if let Some(started_at) = state.aba_started_at.remove(&leader_round) {
+                            #[cfg(feature = "benchmark")]
+                            info!(
+                                "ABA duration round {} ms {}",
+                                leader_round,
+                                started_at.elapsed().as_millis()
+                            );
+                        }
                         self.apply_aba_decision(leader_round, value, state).await;
                     }
                 }

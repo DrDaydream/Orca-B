@@ -1,4 +1,5 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
+from os import environ
 from os.path import join
 
 from benchmark.utils import PathMaker
@@ -32,7 +33,11 @@ class CommandMaker:
         assert isinstance(parameters, str)
         assert isinstance(debug, bool)
         v = '-vvv' if debug else '-vv'
-        return (f'ORCA_FAULTS={faults} ./node {v} run --keys {keys} --committee {committee} '
+        rule3_behavior = environ.get('ORCA_RULE3_BEHAVIOR', 'mixed').lower()
+        if rule3_behavior not in {'mixed', 'silent', 'participate'}:
+            raise ValueError('ORCA_RULE3_BEHAVIOR must be mixed, silent, or participate')
+        return (f'ORCA_FAULTS={faults} ORCA_RULE3_BEHAVIOR={rule3_behavior} '
+                f'./node {v} run --keys {keys} --committee {committee} '
                 f'--store {store} --parameters {parameters} primary')
 
     @staticmethod
