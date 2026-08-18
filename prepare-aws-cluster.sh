@@ -3,8 +3,8 @@ set -Eeuo pipefail
 
 NODES="${1:?usage: $0 <10|20|50>}"
 case "$NODES" in 10|20|50) ;; *) exit 2;; esac
-REMOTE_USER="${REMOTE_USER:-ubuntu}"
-REMOTE_DIR="${REMOTE_DIR:-/home/ubuntu/Orca-B}"
+REMOTE_USER="${REMOTE_USER:-root}"
+REMOTE_DIR="${REMOTE_DIR:-/root/Orca-B}"
 HOSTS_FILE="${HOSTS_FILE:-deploy/hosts-${NODES}.txt}"
 mapfile -t IPS < <(awk 'NF && $1 !~ /^#/ {print $1}' "$HOSTS_FILE")
 [[ "${#IPS[@]}" -eq "$NODES" ]] || { echo "expected $NODES hosts" >&2; exit 1; }

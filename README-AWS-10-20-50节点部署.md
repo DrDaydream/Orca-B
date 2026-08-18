@@ -8,8 +8,8 @@
 |---|---|
 | AMI | Ubuntu Server 24.04 LTS，x86_64 |
 | 节点数 | 10、20 或 50 |
-| 登录用户 | `ubuntu` |
-| 项目目录 | `/home/ubuntu/Orca-B` |
+| 登录用户 | `root` |
+| 项目目录 | `/root/Orca-B` |
 | 仓库 | `https://github.com/DrDaydream/Orca-B.git` |
 | 推荐实例 | 10 节点至少 4 vCPU / 16 GiB；20/50 节点建议 8 vCPU / 32 GiB |
 | 磁盘 | 至少 30 GiB gp3 |
@@ -17,6 +17,8 @@
 | 控制机 | node-0，同时参与协议 |
 
 Orca-B 的 READY 工作队列无界，20/50 节点高压测试需监控内存。先用 10 节点、20 秒、10,000 总 TPS 跑通。协议要求 `n >= 3f+1`，建议最大敌手数为 10 节点 f=3、20 节点 f=6、50 节点 f=16。
+
+本文假设服务器已经允许 `root` 使用密钥直接 SSH。AWS 官方 Ubuntu AMI 通常默认禁用 root 直登；继续部署前必须先确认 `ssh -i KEY root@PUBLIC_IP` 成功，否则应在镜像层启用 root 登录或改用服务器实际允许的账户。
 
 ## 2. AWS 控制台与安全组
 
@@ -67,8 +69,8 @@ hosts、committee 的常规地址和 `aba_to_aba` 都必须填写私网可路由
 ~~~bash
 chmod 400 ~/Downloads/orca-b-aws.pem
 scp -i ~/Downloads/orca-b-aws.pem ~/Downloads/orca-b-aws.pem \
-  ubuntu@NODE0_PUBLIC_IP:/home/ubuntu/.ssh/orca-b-aws.pem
-ssh -i ~/Downloads/orca-b-aws.pem ubuntu@NODE0_PUBLIC_IP
+  root@NODE0_PUBLIC_IP:/root/.ssh/orca-b-aws.pem
+ssh -i ~/Downloads/orca-b-aws.pem root@NODE0_PUBLIC_IP
 ~~~
 
 在 node-0 执行：
@@ -82,8 +84,8 @@ nano ~/.ssh/config
 
 ~~~sshconfig
 Host 10.*
-    User ubuntu
-    IdentityFile /home/ubuntu/.ssh/orca-b-aws.pem
+    User root
+    IdentityFile /root/.ssh/orca-b-aws.pem
     StrictHostKeyChecking accept-new
     ConnectTimeout 8
     ServerAliveInterval 5
@@ -175,9 +177,9 @@ HOSTS_FILE=deploy/hosts-50.txt ./prepare-aws-cluster.sh 50
 脚本依赖 `~/.ssh/config`，也可覆盖路径：
 
 ~~~bash
-REMOTE_USER=ubuntu \
-REMOTE_DIR=/home/ubuntu/Orca-B \
-HOSTS_FILE=/home/ubuntu/Orca-B/deploy/hosts-10.txt \
+REMOTE_USER=root \
+REMOTE_DIR=/root/Orca-B \
+HOSTS_FILE=/root/Orca-B/deploy/hosts-10.txt \
 ./prepare-aws-cluster.sh 10
 ~~~
 
@@ -252,9 +254,9 @@ ORCA_CLIENT_DURING_SILENCE=send \
 自定义路径：
 
 ~~~bash
-REMOTE_USER=ubuntu \
-REMOTE_DIR=/home/ubuntu/Orca-B \
-HOSTS_FILE=/home/ubuntu/Orca-B/deploy/hosts-10.txt \
+REMOTE_USER=root \
+REMOTE_DIR=/root/Orca-B \
+HOSTS_FILE=/root/Orca-B/deploy/hosts-10.txt \
 ./run-multi-servers.sh 10 20 10000
 ~~~
 

@@ -76,7 +76,7 @@ class Bench:
         ]
         hosts = self.manager.hosts(flat=True)
         try:
-            g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
+            g = Group(*hosts, user='root', connect_kwargs=self.connect)
             g.run(' && '.join(cmd), hide=True)
             Print.heading(f'Initialized testbed of {len(hosts)} nodes')
         except (GroupException, ExecutionError) as e:
@@ -90,7 +90,7 @@ class Bench:
         delete_logs = CommandMaker.clean_logs() if delete_logs else 'true'
         cmd = [delete_logs, f'({CommandMaker.kill()} || true)']
         try:
-            g = Group(*hosts, user='ubuntu', connect_kwargs=self.connect)
+            g = Group(*hosts, user='root', connect_kwargs=self.connect)
             g.run(' && '.join(cmd), hide=True)
         except GroupException as e:
             raise BenchError('Failed to kill nodes', FabricError(e))
@@ -133,7 +133,7 @@ class Bench:
     def _background_run(self, host, command, log_file):
         name = splitext(basename(log_file))[0]
         cmd = f'tmux new -d -s "{name}" "{command} |& tee {log_file}"'
-        c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
+        c = Connection(host, user='root', connect_kwargs=self.connect)
         output = c.run(cmd, hide=True)
         self._check_stderr(output)
 
@@ -156,7 +156,7 @@ class Bench:
                 f'./{self.settings.repo_name}/target/release/'
             )
         ]
-        g = Group(*ips, user='ubuntu', connect_kwargs=self.connect)
+        g = Group(*ips, user='root', connect_kwargs=self.connect)
         g.run(' && '.join(cmd), hide=True)
 
     def _config(self, hosts, node_parameters, bench_parameters):
@@ -202,7 +202,7 @@ class Bench:
         progress = progress_bar(names, prefix='Uploading config files:')
         for i, name in enumerate(progress):
             for ip in committee.ips(name):
-                c = Connection(ip, user='ubuntu', connect_kwargs=self.connect)
+                c = Connection(ip, user='root', connect_kwargs=self.connect)
                 c.run(f'{CommandMaker.cleanup()} || true', hide=True)
                 c.put(PathMaker.committee_file(), '.')
                 c.put(PathMaker.key_file(i), '.')
@@ -290,7 +290,7 @@ class Bench:
         for i, addresses in enumerate(progress):
             for id, address in addresses:
                 host = Committee.ip(address)
-                c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
+                c = Connection(host, user='root', connect_kwargs=self.connect)
                 c.get(
                     PathMaker.client_log_file(i, id), 
                     local=PathMaker.client_log_file(i, id)
@@ -304,7 +304,7 @@ class Bench:
         progress = progress_bar(primary_addresses, prefix='Downloading primaries logs:')
         for i, address in enumerate(progress):
             host = Committee.ip(address)
-            c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
+            c = Connection(host, user='root', connect_kwargs=self.connect)
             c.get(
                 PathMaker.primary_log_file(i), 
                 local=PathMaker.primary_log_file(i)
