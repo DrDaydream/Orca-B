@@ -117,7 +117,9 @@ chmod +x run-multi-servers.sh
 
 参数中的 TPS 是**集群总输入速率**，脚本会分摊给每个 client。脚本会先等待所有 client 连通全部 Worker，再计时，最后下载日志并调用 `LogParser`。
 
-当前结果只输出 `Consensus latency` 和 `End-to-end latency`；内部日志仍保留 commit timestamp，但不在汇总中显示 commit latency。
+最新结果在原有 TPS、`Consensus latency` 和 `End-to-end latency` 之外，还输出 leader/非 leader 提交延迟、leader 间隔、非 leader 规则排序延迟，以及 Rule 1/2/3 的 leader 和区块比例。
+
+`faults > 0` 时使用主动敌手调度：所有 EC2 节点仍然启动，Primary 命令自动传入 `ORCA_FAULTS`，协议内对 Rule 1/2/3 进行确定性分流。ABA 在进入 `r+3` 前输出的结果归入 Rule 2，之后的结果归入 Rule 3。
 
 ## 6. 故障排查
 
