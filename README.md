@@ -139,28 +139,28 @@ The following output was produced by a 4-node, 50,000 tx/s, 20-second local run:
  Max batch delay: 200 ms
 
  + RESULTS:
- Consensus TPS: 47,718 tx/s
- Consensus BPS: 24,431,745 B/s
- Consensus latency: 415 ms
- Leader commit latency: 243 ms
- Non-leader commit latency: 495 ms
- All committed headers latency: 433 ms
+ Consensus TPS: 48,608 tx/s
+ Consensus BPS: 24,887,270 B/s
+ Consensus latency: 359 ms
+ Leader commit latency: 184 ms
+ Non-leader commit latency: 433 ms
+ All committed headers latency: 381 ms
  Leader commit interval: 213 ms
- Non-leader rule-order latency: 476 ms
- Rule 1 leader ratio: 71.30%
- Rule 2 leader ratio: 12.96%
+ Non-leader rule-order latency: 409 ms
+ Rule 1 leader ratio: 70.59%
+ Rule 2 leader ratio: 4.20%
  Rule 3 commit leader ratio: 0.00%
- Rule 3 skip leader ratio: 15.74%
- Rule 1 block ratio: 82.31%
- Rule 2 block ratio: 17.69%
+ Rule 3 skip leader ratio: 25.21%
+ Rule 1 block ratio: 95.30%
+ Rule 2 block ratio: 4.70%
  Rule 3 block ratio: 0.00%
- ABA average duration: 315 ms
- ABA maximum duration: 602 ms
- ABA minimum duration: 205 ms
+ ABA average duration: 283 ms
+ ABA maximum duration: 589 ms
+ ABA minimum duration: 200 ms
 
- End-to-end TPS: 47,381 tx/s
- End-to-end BPS: 24,259,289 B/s
- End-to-end latency: 559 ms
+ End-to-end TPS: 48,283 tx/s
+ End-to-end BPS: 24,721,029 B/s
+ End-to-end latency: 502 ms
 -----------------------------------------
 ~~~
 
