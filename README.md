@@ -45,7 +45,7 @@ Configure the local experiment in `benchmark/fabfile.py`:
 
 ~~~python
 bench_params = {
-    'faults': 1,
+    'faults': 0,
     'nodes': 4,
     'workers': 1,
     'rate': 50_000,
@@ -107,9 +107,66 @@ With `faults > 0`, all nodes derive the same f adversarial authorities each roun
 
 In multi-server deployments ABA uses the committee's dedicated `aba_to_aba` address on TCP port 3005. Local ports are generated automatically.
 
-### Example output
+### No-adversary baseline (`faults = 0`)
 
-This is an actual result parsed from the repository's current 4-node, 1-fault, 20-second local benchmark logs:
+Set `'faults': 0` in `benchmark/fabfile.py` and run:
+
+~~~bash
+RUST_LOG=info fab local
+~~~
+
+The following output was produced by a 4-node, 50,000 tx/s, 20-second local run:
+
+~~~text
+-----------------------------------------
+ SUMMARY:
+-----------------------------------------
+ + CONFIG:
+ Faults: 0 node(s)
+ Committee size: 4 node(s)
+ Worker(s) per node: 1 worker(s)
+ Collocate primary and workers: True
+ Input rate: 50,000 tx/s
+ Transaction size: 512 B
+ Execution time: 20 s
+
+ Header size: 1,000 B
+ Max header delay: 200 ms
+ GC depth: 50 round(s)
+ Sync retry delay: 10,000 ms
+ Sync retry nodes: 3 node(s)
+ batch size: 500,000 B
+ Max batch delay: 200 ms
+
+ + RESULTS:
+ Consensus TPS: 47,718 tx/s
+ Consensus BPS: 24,431,745 B/s
+ Consensus latency: 415 ms
+ Leader commit latency: 243 ms
+ Non-leader commit latency: 495 ms
+ All committed headers latency: 433 ms
+ Leader commit interval: 213 ms
+ Non-leader rule-order latency: 476 ms
+ Rule 1 leader ratio: 71.30%
+ Rule 2 leader ratio: 12.96%
+ Rule 3 commit leader ratio: 0.00%
+ Rule 3 skip leader ratio: 15.74%
+ Rule 1 block ratio: 82.31%
+ Rule 2 block ratio: 17.69%
+ Rule 3 block ratio: 0.00%
+ ABA average duration: 315 ms
+ ABA maximum duration: 602 ms
+ ABA minimum duration: 205 ms
+
+ End-to-end TPS: 47,381 tx/s
+ End-to-end BPS: 24,259,289 B/s
+ End-to-end latency: 559 ms
+-----------------------------------------
+~~~
+
+### Preserved adversarial result (`faults = 1`)
+
+For comparison, this is the previously recorded 4-node, 1-fault, 20-second local result using the adversary commands above:
 
 ~~~text
 -----------------------------------------
