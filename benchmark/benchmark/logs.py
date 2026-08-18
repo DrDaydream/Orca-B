@@ -44,7 +44,7 @@ class LogParser:
                 results = p.map(self._parse_primaries, primaries)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse nodes\' logs: {e}')
-        proposals, commits, final_commits, header_proposals, header_commits, rule_orders, commit_rules, aba_durations, self.configs, primary_ips = zip(*results)
+        proposals, commits, final_commits, header_proposals, header_commits, leader_ready, rule_orders, commit_rules, aba_durations, self.configs, primary_ips = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
         self.final_commits = self._merge_results(
@@ -52,6 +52,7 @@ class LogParser:
         )
         self.header_proposals = self._merge_results([x.items() for x in header_proposals])
         self.header_commits = self._merge_tagged_results(header_commits)
+        self.leader_ready = self._merge_results([x.items() for x in leader_ready])
         self.rule_orders = self._merge_results([x.items() for x in rule_orders])
         self.commit_rules = self._merge_commit_rules(commit_rules)
         # Keep every completed node-instance sample. Unfinished ABA instances
@@ -157,6 +158,8 @@ class LogParser:
         header_proposals = self._merge_results([[(d, self._to_posix(t)) for t, d in tmp]])
         tmp = findall(r'\[(.*Z) .* Header committed round \d+ digest (\S+) leader (true|false)', log)
         header_commits = {d: (self._to_posix(t), leader == 'true') for t, d, leader in tmp}
+        tmp = findall(r'Leader commit-ready round \d+ digest (\S+) at (\d+)', log)
+        leader_ready = {d: int(t) / 1_000 for d, t in tmp}
         tmp = findall(r'\[(.*Z) .* Header rule-ordered round \d+ digest (\S+)', log)
         rule_orders = self._merge_results([[(d, self._to_posix(t)) for t, d in tmp]])
         tmp = findall(r'Commit rule stats leader (\S+) rule ([123]) outcome (commit|skip) blocks (\d+)', log)
@@ -189,7 +192,7 @@ class LogParser:
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
         
-        return proposals, commits, final_commits, header_proposals, header_commits, rule_orders, commit_rules, aba_durations, configs, ip
+        return proposals, commits, final_commits, header_proposals, header_commits, leader_ready, rule_orders, commit_rules, aba_durations, configs, ip
 
     def _parse_workers(self, log):
         if search(r'(?:panic|Error)', log) is not None:
@@ -262,18 +265,26 @@ class LogParser:
         return mean(latency) if latency else 0
 
     def _header_latency_stats(self):
-        leaders, non_leaders, leader_times = [], [], []
+        non_leaders, all_headers, leader_times = [], [], []
         for digest, (committed, is_leader) in self.header_commits.items():
             if digest not in self.header_proposals:
                 continue
-            (leaders if is_leader else non_leaders).append(committed - self.header_proposals[digest])
+            latency = committed - self.header_proposals[digest]
+            all_headers.append(latency)
+            if not is_leader:
+                non_leaders.append(latency)
             if is_leader:
                 leader_times.append(committed)
+        leaders = [
+            ready - self.header_proposals[digest]
+            for digest, ready in self.leader_ready.items()
+            if digest in self.header_proposals
+        ]
         rule_order = [t - self.header_proposals[d] for d, t in self.rule_orders.items() if d in self.header_proposals]
         leader_times.sort()
         intervals = [b - a for a, b in zip(leader_times, leader_times[1:])]
         avg = lambda values: mean(values) if values else 0
-        return avg(leaders), avg(non_leaders), avg(leaders + non_leaders), avg(intervals), avg(rule_order)
+        return avg(leaders), avg(non_leaders), avg(all_headers), avg(intervals), avg(rule_order)
 
     def _commit_rule_ratios(self):
         leader_total = len(self.commit_rules)
