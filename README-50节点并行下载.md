@@ -23,11 +23,14 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 50 -I {} ssh {} '
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 10 -I {} ssh {} '
   set -e
   sudo apt-get update
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential clang libclang-dev cmake pkg-config libssl-dev librocksdb-dev git curl
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential clang-14 libclang-14-dev llvm-14 cmake pkg-config libssl-dev librocksdb-dev git curl
   if ! command -v cargo >/dev/null 2>&1; then curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; fi
   cd /home/ubuntu/Orca-B
   . "$HOME/.cargo/env" 2>/dev/null || true
   cargo fetch
+  test -e /usr/lib/llvm-14/lib/libclang.so || { echo "LLVM 14 libclang not found on $(hostname)" >&2; exit 1; }
+  LIBCLANG_PATH=/usr/lib/llvm-14/lib CLANG_PATH=/usr/bin/clang-14 \
+  CC=/usr/bin/clang-14 CXX=/usr/bin/clang++-14 CXXFLAGS="-include cstdint" \
   CARGO_BUILD_JOBS=2 cargo build --quiet --release --features benchmark
 '
 ~~~
