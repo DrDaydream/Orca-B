@@ -1,9 +1,9 @@
 # Orca-B 50 节点并行下载、依赖安装与编译
 
-在 node0 上执行。节点用户为 `ubuntu`，SSH 密钥由 `/home/ubuntu/.ssh/config` 按 Region 自动选择；`deploy/hosts-50.txt` 每行填写一个私网 IPv4，第一行是 node0。
+在 node0 上执行。节点用户为 `ubuntu`，SSH 密钥由 `~/.ssh/config` 按 Region 自动选择；`deploy/hosts-50.txt` 每行填写一个私网 IPv4，第一行是 node0。
 
 ~~~bash
-cd /home/ubuntu/Orca-B
+cd ~/Orca-B
 HOSTS=deploy/hosts-50.txt
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | wc -l
 ~~~
@@ -39,7 +39,7 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 10 -I {} ssh {} '
 
 ~~~bash
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 50 -I {} ssh {} '
-  printf "%s: " "$(hostname)"; test -x /home/ubuntu/Orca-B/target/release/node && echo "build ok" || echo "build failed"'
+  printf "%s: " "$(hostname)"; test -x ~/Orca-B/target/release/node && echo "build ok" || echo "build failed"'
 ~~~
 
 如跨洲网络拥塞，将 `xargs -P 50` 降为 `-P 10` 或 `-P 20`。
