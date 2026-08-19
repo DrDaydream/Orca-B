@@ -43,3 +43,19 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 50 -I {} ssh {} '
 ~~~
 
 如跨洲网络拥塞，将 `xargs -P 50` 降为 `-P 10` 或 `-P 20`。
+
+## 已通过 Orca-A 安装依赖
+
+如果这些服务器已成功编译 Orca-A，则 APT 软件包、Rust 工具链及 `~/.cargo` 缓存均可复用，无需再次执行 `apt-get` 或安装 Rust。直接编译 Orca-B：
+
+~~~bash
+sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 10 -I {} ssh {} '
+  set -e; cd ~/Orca-B
+  . "$HOME/.cargo/env"
+  LIBCLANG_PATH=/usr/lib/llvm-14/lib CLANG_PATH=/usr/bin/clang-14 \
+  CC=/usr/bin/clang-14 CXX=/usr/bin/clang++-14 CXXFLAGS="-include cstdint" \
+  CARGO_BUILD_JOBS=2 cargo build --quiet --release --features benchmark
+'
+~~~
+
+Orca-B 仍会生成自己的 `~/Orca-B/target/release`，不能直接使用 Orca-A 的二进制。
