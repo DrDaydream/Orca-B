@@ -1,184 +1,135 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Usage:
-#   ./run-multi-servers-direct.sh <10|20|50> <duration_seconds> <total_tps>
-# Example:
-#   ./run-multi-servers-direct.sh 50 300 100000
-
-NODES="${1:-50}"
-DURATION="${2:-300}"
-TOTAL_RATE="${3:-100000}"
-
-REMOTE_USER="${REMOTE_USER:-ubuntu}"
-# Run the script from the repository root. All servers are expected to keep
-# the same absolute repository path as the controller.
-REMOTE_DIR="${REMOTE_DIR:-$PWD}"
-HOSTS_FILE="${HOSTS_FILE:-deploy/hosts-${NODES}.txt}"
-LOCAL_LOGS="${LOCAL_LOGS:-benchmark/logs}"
-TX_SIZE="${TX_SIZE:-512}"
-
-# Give all SSH commands enough time to reach their servers. Clients then wait
-# for the same epoch timestamp and start together.
-START_DELAY="${START_DELAY:-30}"
+# ./run-multi-servers.sh <10|20|50> [seconds] [total-tps]
+NODES="${1:-}"
+DURATION="${2:-20}"
+TOTAL_RATE="${3:-10000}"
+case "$NODES" in 10|20|50) ;; *) echo "usage: $0 <10|20|50> [seconds] [total-tps]" >&2; exit 2;; esac
+[[ "$DURATION" =~ ^[1-9][0-9]*$ ]] || exit 2
+[[ "$TOTAL_RATE" =~ ^[1-9][0-9]*$ ]] || exit 2
 
 FAULTS="${ORCA_FAULTS:-0}"
 RULE3_BEHAVIOR="${ORCA_RULE3_BEHAVIOR:-mixed}"
 ADVERSARY_SEED="${ORCA_ADVERSARY_SEED:-0}"
+CLIENT_DURING_SILENCE="${ORCA_CLIENT_DURING_SILENCE:-send}"
+CLIENT_SILENCE_SLOT_MS="${ORCA_CLIENT_SILENCE_SLOT_MS:-}"
+[[ "$FAULTS" =~ ^[0-9]+$ ]] || { echo "ORCA_FAULTS must be a non-negative integer" >&2; exit 2; }
+(( FAULTS < NODES )) || { echo "ORCA_FAULTS must be smaller than the node count" >&2; exit 2; }
+[[ "$ADVERSARY_SEED" =~ ^[0-9]+$ ]] || { echo "ORCA_ADVERSARY_SEED must be a non-negative integer" >&2; exit 2; }
+case "$RULE3_BEHAVIOR" in mixed|silent|participate) ;; *) echo "ORCA_RULE3_BEHAVIOR must be mixed, silent, or participate" >&2; exit 2;; esac
+case "$CLIENT_DURING_SILENCE" in send|pause) ;; *) echo "ORCA_CLIENT_DURING_SILENCE must be send or pause" >&2; exit 2;; esac
 
-SSH_OPTS=(
-  -o BatchMode=yes
-  -o ConnectTimeout=8
-  -o ServerAliveInterval=5
-  -o ServerAliveCountMax=2
-)
+REMOTE_USER="${REMOTE_USER:-ubuntu}"
+REMOTE_DIR="${REMOTE_DIR:-/home/ubuntu/Orca-B}"
+HOSTS_FILE="${HOSTS_FILE:-deploy/hosts-${NODES}.txt}"
+MAX_PARALLEL="${MAX_PARALLEL:-10}"
+READY_TIMEOUT="${READY_TIMEOUT:-240}"
+TX_SIZE="${TX_SIZE:-512}"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
+LOCAL_LOGS="benchmark/logs"
 
-case "$NODES" in
-  10|20|50) ;;
-  *) echo "Usage: $0 <10|20|50> [duration] [total_tps]" >&2; exit 1 ;;
-esac
+[[ -f "$HOSTS_FILE" ]] || { echo "missing $HOSTS_FILE" >&2; exit 1; }
+mapfile -t IPS < <(sed -e 's/#.*//' -e 's/[[:space:]]//g' "$HOSTS_FILE" | awk 'NF')
+[[ "${#IPS[@]}" -eq "$NODES" ]] || { echo "$HOSTS_FILE must contain exactly $NODES IPs" >&2; exit 1; }
+[[ "$(printf '%s\n' "${IPS[@]}" | sort -u | wc -l)" -eq "$NODES" ]] || { echo "duplicate IP" >&2; exit 1; }
+for ip in "${IPS[@]}"; do [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "invalid IP: $ip"; exit 1; }; done
 
-mapfile -t IPS < <(
-  sed -e 's/#.*//' -e 's/[[:space:]]//g' "$HOSTS_FILE" | awk 'NF'
-)
-
-if [[ "${#IPS[@]}" -ne "$NODES" ]]; then
-  echo "$HOSTS_FILE must contain exactly $NODES IP addresses" >&2
-  exit 1
+RATE_SHARE=$(((TOTAL_RATE + NODES - 1) / NODES))
+TX_NODES=""
+for ip in "${IPS[@]}"; do TX_NODES+="${ip}:3003 "; done
+[[ -f deploy/committee.json && -f deploy/parameters.json ]] || { echo "missing deploy/committee.json or deploy/parameters.json" >&2; exit 1; }
+KEY_FILES=()
+for ((i=0; i<NODES; i++)); do
+  [[ -f "deploy/node-${i}.json" ]] || { echo "missing deploy/node-${i}.json" >&2; exit 1; }
+  KEY_FILES+=("deploy/node-${i}.json")
+done
+if [[ -z "$CLIENT_SILENCE_SLOT_MS" ]]; then
+  CLIENT_SILENCE_SLOT_MS="$(python3 -c 'import json; print(json.load(open("deploy/parameters.json"))["max_header_delay"])')"
 fi
+[[ "$CLIENT_SILENCE_SLOT_MS" =~ ^[1-9][0-9]*$ ]] || { echo "ORCA_CLIENT_SILENCE_SLOT_MS must be positive" >&2; exit 2; }
+mapfile -t CLIENT_SCHEDULES < <(
+  ORCA_CLIENT_DURING_SILENCE="$CLIENT_DURING_SILENCE" \
+  ORCA_RULE3_BEHAVIOR="$RULE3_BEHAVIOR" \
+  ORCA_ADVERSARY_SEED="$ADVERSARY_SEED" \
+  PYTHONPATH=benchmark python3 -m benchmark.adversary_schedule \
+    --committee deploy/committee.json --faults "$FAULTS" \
+    --duration "$DURATION" --slot-ms "$CLIENT_SILENCE_SLOT_MS" \
+    --key-files "${KEY_FILES[@]}"
+)
+[[ "${#CLIENT_SCHEDULES[@]}" -eq "$NODES" ]] || { echo "failed to generate client silence schedules" >&2; exit 1; }
+remote() { ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@$1" "$2"; }
+wait_batch() { (( $1 % MAX_PARALLEL == 0 )) && wait || true; }
 
-remote() {
-  ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@$1" "$2"
-}
-
-stop_nodes() {
-  echo "Stopping clients, primaries, and workers..."
+stop_all() {
+  local count=0
+  echo "[cleanup] stopping $NODES nodes"
   for ip in "${IPS[@]}"; do
-    remote "$ip" \
-      "tmux kill-session -t orca-client 2>/dev/null || true;
-       tmux kill-session -t orca-primary 2>/dev/null || true;
-       tmux kill-session -t orca-worker 2>/dev/null || true" &
+    remote "$ip" "tmux kill-session -t orca-client 2>/dev/null || true; tmux kill-session -t orca-primary 2>/dev/null || true; tmux kill-session -t orca-worker 2>/dev/null || true" &
+    count=$((count+1)); wait_batch "$count"
   done
   wait || true
 }
+trap stop_all EXIT INT TERM
 
-trap stop_nodes INT TERM
-
-# Split total TPS exactly across all clients.
-BASE_RATE=$((TOTAL_RATE / NODES))
-REMAINDER=$((TOTAL_RATE % NODES))
-RATES=()
-TX_NODES=""
-for ((i=0; i<NODES; i++)); do
-  RATES+=("$((BASE_RATE + (i < REMAINDER ? 1 : 0)))")
-  TX_NODES+="${IPS[$i]}:3003 "
+echo "nodes=$NODES duration=${DURATION}s total-rate=$TOTAL_RATE per-client=$RATE_SHARE faults=$FAULTS rule3=$RULE3_BEHAVIOR seed=$ADVERSARY_SEED client-during-silence=$CLIENT_DURING_SILENCE slot=${CLIENT_SILENCE_SLOT_MS}ms"
+for i in "${!IPS[@]}"; do
+  remote "${IPS[$i]}" "test -x '$REMOTE_DIR/target/release/node' && test -x '$REMOTE_DIR/target/release/benchmark_client' && test -f '$REMOTE_DIR/deploy/node-${i}.json' && test -f '$REMOTE_DIR/deploy/committee.json' && test -f '$REMOTE_DIR/deploy/parameters.json'"
 done
 
-echo "Nodes: $NODES"
-echo "Duration: ${DURATION}s"
-echo "Total input rate: $TOTAL_RATE TPS"
-echo "Per-client rates: ${RATES[*]}"
-echo "Faults: $FAULTS; adversary seed: $ADVERSARY_SEED; behavior: $RULE3_BEHAVIOR"
-
-echo "[1/6] Cleaning previous run..."
-for i in "${!IPS[@]}"; do
-  remote "${IPS[$i]}" "
-    tmux kill-session -t orca-client 2>/dev/null || true
-    tmux kill-session -t orca-primary 2>/dev/null || true
-    tmux kill-session -t orca-worker 2>/dev/null || true
-    cd '${REMOTE_DIR}'
-    rm -rf -- run/db-primary run/db-worker run/logs
-    mkdir -p run/logs
-  " &
+count=0
+for ip in "${IPS[@]}"; do
+  remote "$ip" "tmux kill-session -t orca-client 2>/dev/null || true; tmux kill-session -t orca-primary 2>/dev/null || true; tmux kill-session -t orca-worker 2>/dev/null || true; cd '$REMOTE_DIR'; rm -rf run/db-primary run/db-worker run/logs; mkdir -p run/logs" &
+  count=$((count+1)); wait_batch "$count"
 done
 wait
 
-echo "[2/6] Starting all workers concurrently..."
 for i in "${!IPS[@]}"; do
-  remote "${IPS[$i]}" "
-    cd '${REMOTE_DIR}'
-    tmux new-session -d -s orca-worker \
-      \"RUST_LOG=info ./target/release/node -vv run \
-      --keys deploy/node-${i}.json \
-      --committee deploy/committee.json \
-      --parameters deploy/parameters.json \
-      --store run/db-worker \
-      worker --id 0 2>&1 | tee run/logs/worker-${i}-0.log\"
-  " &
+  remote "${IPS[$i]}" "cd '$REMOTE_DIR' && tmux new-session -d -s orca-worker \"RUST_LOG=info ./target/release/node -vv run --keys deploy/node-${i}.json --committee deploy/committee.json --parameters deploy/parameters.json --store run/db-worker worker --id 0 |& tee run/logs/worker-${i}-0.log\""
 done
-wait
-
-echo "[3/6] Starting all primaries concurrently..."
 for i in "${!IPS[@]}"; do
-  remote "${IPS[$i]}" "
-    cd '${REMOTE_DIR}'
-    tmux new-session -d -s orca-primary \
-      \"RUST_LOG=info \
-      ORCA_FAULTS='${FAULTS}' \
-      ORCA_RULE3_BEHAVIOR='${RULE3_BEHAVIOR}' \
-      ORCA_ADVERSARY_SEED='${ADVERSARY_SEED}' \
-      ./target/release/node -vv run \
-      --keys deploy/node-${i}.json \
-      --committee deploy/committee.json \
-      --parameters deploy/parameters.json \
-      --store run/db-primary \
-      primary 2>&1 | tee run/logs/primary-${i}.log\"
-  " &
+  remote "${IPS[$i]}" "cd '$REMOTE_DIR' && tmux new-session -d -s orca-primary \"RUST_LOG=info ORCA_FAULTS='$FAULTS' ORCA_RULE3_BEHAVIOR='$RULE3_BEHAVIOR' ORCA_ADVERSARY_SEED='$ADVERSARY_SEED' ./target/release/node -vv run --keys deploy/node-${i}.json --committee deploy/committee.json --parameters deploy/parameters.json --store run/db-primary primary |& tee run/logs/primary-${i}.log\""
 done
-wait
-
-echo "[4/6] Dispatching all clients concurrently..."
-START_AT_MS=$(( $(date +%s%3N) + START_DELAY * 1000 ))
-CLIENT_TIMEOUT=$((DURATION + START_DELAY + 30))
+sleep 6
 
 for i in "${!IPS[@]}"; do
-  CLIENT_COMMAND="while [ \"\$(date +%s%3N)\" -lt '${START_AT_MS}' ]; do sleep 0.05; done
-timeout '${CLIENT_TIMEOUT}s' ./target/release/benchmark_client \
-  '${IPS[$i]}:3003' \
-  --size '${TX_SIZE}' \
-  --rate '${RATES[$i]}' \
-  --nodes ${TX_NODES} \
-  2>&1 | tee 'run/logs/client-${i}-0.log'"
-
-  printf -v QUOTED_CLIENT_COMMAND '%q' "$CLIENT_COMMAND"
-  remote "${IPS[$i]}" \
-    "cd '${REMOTE_DIR}' && tmux new-session -d -s orca-client ${QUOTED_CLIENT_COMMAND}" &
+  remote "${IPS[$i]}" "ss -ltn | grep -q ':3003 '" || { remote "${IPS[$i]}" "tail -100 '$REMOTE_DIR/run/logs/worker-${i}-0.log'"; exit 1; }
+  remote "${IPS[$i]}" "ss -ltn | grep -q ':3005 '" || { remote "${IPS[$i]}" "tail -100 '$REMOTE_DIR/run/logs/primary-${i}.log'"; exit 1; }
 done
-wait
-
-echo "All clients will start at epoch ${START_AT_MS} ms."
-echo "Waiting ${START_DELAY}s for the common start, then running ${DURATION}s..."
-sleep "$((START_DELAY + DURATION))"
-
-echo "[5/6] Stopping the experiment..."
-stop_nodes
-trap - INT TERM
-
-echo "[6/6] Downloading logs and printing summary..."
-rm -rf -- "$LOCAL_LOGS"
-mkdir -p -- "$LOCAL_LOGS"
-
 for i in "${!IPS[@]}"; do
-  scp "${SSH_OPTS[@]}" \
-    "${REMOTE_USER}@${IPS[$i]}:${REMOTE_DIR}/run/logs/primary-${i}.log" \
-    "$LOCAL_LOGS/" &
-  scp "${SSH_OPTS[@]}" \
-    "${REMOTE_USER}@${IPS[$i]}:${REMOTE_DIR}/run/logs/worker-${i}-0.log" \
-    "$LOCAL_LOGS/" &
-  scp "${SSH_OPTS[@]}" \
-    "${REMOTE_USER}@${IPS[$i]}:${REMOTE_DIR}/run/logs/client-${i}-0.log" \
-    "$LOCAL_LOGS/" &
+  SILENCE_ARGS=""
+  if [[ "$CLIENT_DURING_SILENCE" == "pause" ]]; then
+    SILENCE_ARGS="--silence-schedule '${CLIENT_SCHEDULES[$i]}' --silence-slot-ms '$CLIENT_SILENCE_SLOT_MS'"
+  fi
+  remote "${IPS[$i]}" "cd '$REMOTE_DIR' && tmux new-session -d -s orca-client \"RUST_LOG=info ./target/release/benchmark_client '${IPS[$i]}:3003' --size '$TX_SIZE' --rate '$RATE_SHARE' $SILENCE_ARGS --nodes $TX_NODES |& tee run/logs/client-${i}-0.log\""
 done
-wait
 
-PYTHONPATH=benchmark python3 - "$LOCAL_LOGS" "$FAULTS" <<'PY'
+ready=0
+for ((elapsed=0; elapsed<READY_TIMEOUT; elapsed+=3)); do
+  ready=0; waiting=()
+  for i in "${!IPS[@]}"; do
+    if remote "${IPS[$i]}" "grep -q 'Start sending transactions' '$REMOTE_DIR/run/logs/client-${i}-0.log'"; then ready=$((ready+1)); else waiting+=("$i"); fi
+  done
+  echo "${elapsed}s ready=$ready/$NODES waiting=${waiting[*]:-none}"
+  (( ready == NODES )) && break
+  sleep 3
+done
+(( ready == NODES )) || { echo "clients not ready" >&2; exit 1; }
+
+sleep "$DURATION"
+stop_all
+trap - EXIT INT TERM
+rm -rf "$LOCAL_LOGS"; mkdir -p "$LOCAL_LOGS"
+for i in "${!IPS[@]}"; do
+  scp "${SSH_OPTS[@]}" "${REMOTE_USER}@${IPS[$i]}:${REMOTE_DIR}/run/logs/primary-${i}.log" "$LOCAL_LOGS/"
+  scp "${SSH_OPTS[@]}" "${REMOTE_USER}@${IPS[$i]}:${REMOTE_DIR}/run/logs/worker-${i}-0.log" "$LOCAL_LOGS/"
+  scp "${SSH_OPTS[@]}" "${REMOTE_USER}@${IPS[$i]}:${REMOTE_DIR}/run/logs/client-${i}-0.log" "$LOCAL_LOGS/"
+done
+cd benchmark
+python3 - "$NODES" "$FAULTS" <<'PY'
 import sys
 from benchmark.logs import LogParser
-
-logs = sys.argv[1]
 faults = int(sys.argv[2])
-parser = LogParser.process(logs, faults=faults)
-print(parser.result())
+print(LogParser.process("logs", faults=faults).result())
+print(f"Parsed {sys.argv[1]} active nodes with faults={faults}")
 PY
-
-echo "Experiment completed."
