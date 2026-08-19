@@ -12,8 +12,8 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | wc -l
 
 ~~~bash
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 50 -I {} ssh {} '
-  if [ -d /home/ubuntu/Orca-B/.git ]; then git -C /home/ubuntu/Orca-B pull --ff-only;
-  elif [ ! -e /home/ubuntu/Orca-B ]; then git clone https://github.com/DrDaydream/Orca-B.git /home/ubuntu/Orca-B;
+  if [ -d ~/Orca-B/.git ]; then git -C ~/Orca-B pull --ff-only;
+  elif [ ! -e ~/Orca-B ]; then git clone https://github.com/DrDaydream/Orca-B.git ~/Orca-B;
   else echo "existing non-git directory" >&2; exit 1; fi'
 ~~~
 
@@ -25,7 +25,7 @@ sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$HOSTS" | xargs -P 10 -I {} ssh {} '
   sudo apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential clang-14 libclang-14-dev llvm-14 cmake pkg-config libssl-dev librocksdb-dev git curl
   if ! command -v cargo >/dev/null 2>&1; then curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; fi
-  cd /home/ubuntu/Orca-B
+  cd ~/Orca-B
   . "$HOME/.cargo/env" 2>/dev/null || true
   cargo fetch
   test -e /usr/lib/llvm-14/lib/libclang.so || { echo "LLVM 14 libclang not found on $(hostname)" >&2; exit 1; }
