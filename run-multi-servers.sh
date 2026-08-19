@@ -20,8 +20,8 @@ CLIENT_SILENCE_SLOT_MS="${ORCA_CLIENT_SILENCE_SLOT_MS:-}"
 case "$RULE3_BEHAVIOR" in mixed|silent|participate) ;; *) echo "ORCA_RULE3_BEHAVIOR must be mixed, silent, or participate" >&2; exit 2;; esac
 case "$CLIENT_DURING_SILENCE" in send|pause) ;; *) echo "ORCA_CLIENT_DURING_SILENCE must be send or pause" >&2; exit 2;; esac
 
-REMOTE_USER="${REMOTE_USER:-root}"
-REMOTE_DIR="${REMOTE_DIR:-/root/Orca-B}"
+REMOTE_USER="${REMOTE_USER:-ubuntu}"
+REMOTE_DIR="${REMOTE_DIR:-/home/ubuntu/Orca-B}"
 HOSTS_FILE="${HOSTS_FILE:-deploy/hosts-${NODES}.txt}"
 MAX_PARALLEL="${MAX_PARALLEL:-10}"
 READY_TIMEOUT="${READY_TIMEOUT:-240}"
