@@ -175,7 +175,7 @@ impl fmt::Display for Header {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Vote {
+pub struct GradeOneVote {
     pub id: Digest,
     pub round: Round,
     pub origin: PublicKey,
@@ -183,7 +183,7 @@ pub struct Vote {
     pub signature: Signature,
 }
 
-impl Vote {
+impl GradeOneVote {
     pub async fn new(
         header: &Header,
         author: &PublicKey,
@@ -214,7 +214,7 @@ impl Vote {
     }
 }
 
-impl Hash for Vote {
+impl Hash for GradeOneVote {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
         hasher.update(&self.id);
@@ -224,7 +224,7 @@ impl Hash for Vote {
     }
 }
 
-impl fmt::Debug for Vote {
+impl fmt::Debug for GradeOneVote {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
@@ -240,94 +240,6 @@ impl fmt::Debug for Vote {
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Certificate {
     pub header: Header,
-    pub votes: Vec<(PublicKey, Signature)>,
-}
-
-/// The delivery level produced by a graded reliable broadcast instance.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum Grade {
-    One,
-    Two,
-}
-
-/// A signed acknowledgement that an authority delivered a certificate at grade 1.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct GradeVote {
-    pub id: Digest,
-    pub round: Round,
-    pub origin: PublicKey,
-    pub author: PublicKey,
-    pub signature: Signature,
-}
-
-impl GradeVote {
-    pub async fn new(
-        certificate: &Certificate,
-        author: &PublicKey,
-        signature_service: &mut SignatureService,
-    ) -> Self {
-        Self::new_for(
-            certificate.digest(),
-            certificate.round(),
-            certificate.origin(),
-            author,
-            signature_service,
-        )
-        .await
-    }
-
-    pub async fn new_for(
-        id: Digest,
-        round: Round,
-        origin: PublicKey,
-        author: &PublicKey,
-        signature_service: &mut SignatureService,
-    ) -> Self {
-        let vote = Self {
-            id,
-            round,
-            origin,
-            author: *author,
-            signature: Signature::default(),
-        };
-        let signature = signature_service.request_signature(vote.digest()).await;
-        Self { signature, ..vote }
-    }
-
-    pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        ensure!(
-            committee.stake(&self.author) > 0,
-            DagError::UnknownAuthority(self.author)
-        );
-        self.signature
-            .verify(&self.digest(), &self.author)
-            .map_err(DagError::from)
-    }
-}
-
-impl Hash for GradeVote {
-    fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        // Domain-separate grade votes from ordinary header votes.
-        hasher.update(b"narwhal-grbc-grade-vote-v1");
-        hasher.update(&self.id);
-        hasher.update(self.round.to_le_bytes());
-        hasher.update(&self.origin);
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
-    }
-}
-
-impl fmt::Debug for GradeVote {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "G{}({}, {})", self.round, self.author, self.id)
-    }
-}
-
-/// Proof that more than two thirds of the committee delivered the same certificate.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct GradedCertificate {
-    pub certificate: Certificate,
-    pub grade: Grade,
     pub votes: Vec<(PublicKey, Signature)>,
 }
 
@@ -350,34 +262,6 @@ pub enum ConsensusCommand {
     CleanupBatch(Vec<Certificate>),
     AbaBroadcast(Vec<Vec<u8>>),
     LeaderRequest(Round, PublicKey),
-}
-
-impl GradedCertificate {
-    pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        self.certificate.verify(committee)?;
-        ensure!(self.grade == Grade::Two, DagError::InvalidGrade);
-
-        let template = GradeVote {
-            id: self.certificate.digest(),
-            round: self.certificate.round(),
-            origin: self.certificate.origin(),
-            author: PublicKey::default(),
-            signature: Signature::default(),
-        };
-        let mut weight = 0;
-        let mut used = HashSet::new();
-        for (name, _) in &self.votes {
-            ensure!(used.insert(*name), DagError::AuthorityReuse(*name));
-            let stake = committee.stake(name);
-            ensure!(stake > 0, DagError::UnknownAuthority(*name));
-            weight += stake;
-        }
-        ensure!(
-            weight >= committee.quorum_threshold(),
-            DagError::GradeRequiresQuorum
-        );
-        Signature::verify_batch(&template.digest(), &self.votes).map_err(DagError::from)
-    }
 }
 
 impl Certificate {

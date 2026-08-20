@@ -219,6 +219,38 @@ fn finds_paths_over_strong_and_weak_edges() {
 }
 
 #[test]
+fn order_dag_includes_weak_and_virtual_history() {
+    let committee = mock_committee();
+    let consensus = Consensus {
+        name: keys()[0].0,
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary: channel(1).0,
+        tx_output: OutputSender::Individual(channel(1).0),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+
+    let (weak_digest, weak_parent) = mock_certificate(authorities[1], 1, BTreeSet::new());
+    let (virtual_digest, virtual_parent) = mock_certificate(authorities[2], 2, BTreeSet::new());
+    let (_, mut leader) = mock_certificate(authorities[0], 3, BTreeSet::new());
+    leader.header.weak_edges.insert(weak_digest.clone());
+    leader.header.virtual_edges.insert(virtual_digest.clone());
+    leader.header.id = leader.header.digest();
+
+    state.promote_to_dag(weak_parent);
+    state.promote_to_dag(virtual_parent);
+    state.promote_to_dag(leader.clone());
+    let ordered = consensus.order_dag(&leader, &state);
+
+    assert!(ordered.iter().any(|block| block.digest() == weak_digest));
+    assert!(ordered.iter().any(|block| block.digest() == virtual_digest));
+    assert_eq!(ordered.last().unwrap().digest(), leader.digest());
+}
+
+#[test]
 fn designates_one_leader_every_round() {
     let committee = mock_committee();
     let consensus = Consensus {
