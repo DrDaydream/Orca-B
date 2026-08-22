@@ -217,14 +217,6 @@ For comparison, this is the previously recorded 4-node, 1-fault, 20-second local
 
 Results vary with hardware and load. `Consensus latency` measures header creation to consensus commit; `End-to-end latency` starts when the client submits a sampled transaction. ABA duration statistics include completed local ABA node-instances only.
 
-## Next Steps
-
-- Read [Narwhal and Tusk: A DAG-based Mempool and Efficient BFT Consensus](https://arxiv.org/pdf/2105.11827.pdf).
-- See [benchmark/README.md](benchmark/README.md) for complete benchmark parameters and result semantics.
-- See [README-AWS-10-20-50节点部署.md](README-AWS-10-20-50节点部署.md) for AWS 10/20/50-node deployment, TCP 3005, cross-Region networking, and adversary examples.
-- See [README-WINDOWS五区域PEM部署.md](README-WINDOWS五区域PEM部署.md) when a Windows computer controls five AWS Regions using one PEM per Region.
-- See [README-50节点并行下载.md](README-50节点并行下载.md) for parallel code download, dependency installation, and compilation on 50 nodes.
-- Inspect the [primary](primary), [worker](worker), and [consensus](consensus) crates, including the ABA implementation in `consensus/src/aba.rs`.
 
 ## License
 
