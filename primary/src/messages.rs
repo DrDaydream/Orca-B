@@ -214,13 +214,15 @@ impl GradeOneVoteBatch {
     }
 
     pub fn into_votes(self) -> Vec<GradeOneVote> {
+        let round = self.round;
+        let author = self.author;
         self.votes
             .into_iter()
             .map(|(id, origin, signature)| GradeOneVote {
                 id,
-                round: self.round,
+                round,
                 origin,
-                author: self.author,
+                author,
                 signature,
             })
             .collect()
