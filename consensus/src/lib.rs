@@ -88,7 +88,7 @@ struct State {
     /// Time when the leader first satisfied a commit rule. Benchmark latency
     /// ends here rather than after predecessor/output waiting.
     rule_ready_at_ms: HashMap<Round, u128>,
-    /// First commit rule that made each leader ready (1, 2, or 3/ABA fallback).
+    /// The single terminal rule selected for each leader (1, 2, or 3/ABA fallback).
     leader_commit_rules: HashMap<Round, u8>,
     pending_order: HashMap<Round, Vec<Certificate>>,
     ready_pending: BTreeSet<Round>,
@@ -612,6 +612,8 @@ impl State {
         self.deferred_rule_one.retain(|round, _| *round >= gc_round);
         self.committed_leaders.retain(|round| *round >= gc_round);
         self.skipped_leaders.retain(|round| *round >= gc_round);
+        self.leader_commit_rules
+            .retain(|round, _| *round >= gc_round);
         #[cfg(feature = "benchmark")]
         self.rule_order_ready_at
             .retain(|digest, _| observed.contains_key(digest));
@@ -684,7 +686,13 @@ impl Consensus {
     }
 
     fn mark_rule_skipped(&self, round: Round, rule: u8, state: &mut State) {
+        if state.leader_commit_rules.contains_key(&round)
+            || state.committed_leaders.contains(&round)
+        {
+            return;
+        }
         if state.mark_skipped(round) {
+            state.leader_commit_rules.insert(round, rule);
             state.missing_leader_requests.remove(&round);
             #[cfg(feature = "benchmark")]
             {
@@ -1336,6 +1344,7 @@ impl Consensus {
             return;
         }
         if state.committed_leaders.contains(&leader_round)
+            || state.leader_commit_rules.contains_key(&leader_round)
             || state.pending_leaders.contains_key(&leader_round)
         {
             return;
@@ -1358,7 +1367,6 @@ impl Consensus {
             leader, observed_stake, dag_stake
         );
         state.direct_commit_ready.insert(leader.round());
-        state.skipped_leaders.remove(&leader.round());
         state.force_observed_history_to_dag(leader.clone(), leader_round);
         if propagate_aba_input {
             self.offer_aba_input(leader.round(), BinaryValue::One, state)
@@ -1382,6 +1390,7 @@ impl Consensus {
             return;
         }
         if state.committed_leaders.contains(&leader_round)
+            || state.leader_commit_rules.contains_key(&leader_round)
             || state.pending_leaders.contains_key(&leader_round)
         {
             return;
@@ -1416,7 +1425,6 @@ impl Consensus {
             leader, observed_strong, dag_strong, dag_strong_or_virtual
         );
         state.direct_commit_ready.insert(leader.round());
-        state.skipped_leaders.remove(&leader.round());
         state.force_observed_history_to_dag(leader.clone(), leader_round);
         if propagate_aba_input {
             self.offer_aba_input(leader.round(), BinaryValue::One, state)
@@ -1595,13 +1603,22 @@ impl Consensus {
     /// Queue a leader once and commit ready leaders in consecutive round order.
     async fn queue_leader_commit(&mut self, leader: Certificate, rule: u8, state: &mut State) {
         let round = leader.round();
-        if state.committed_leaders.contains(&round) {
+        if state.committed_leaders.contains(&round)
+            || state.skipped_leaders.contains(&round)
+            || state.pending_leaders.contains_key(&round)
+        {
             return;
+        }
+        if let Some(existing) = state.leader_commit_rules.get(&round) {
+            if *existing != rule {
+                return;
+            }
+        } else {
+            state.leader_commit_rules.insert(round, rule);
         }
         state.missing_leader_requests.remove(&round);
         state.force_observed_history_to_dag(leader.clone(), round);
         let _ = state.record_rule_ready(round);
-        state.leader_commit_rules.entry(round).or_insert(rule);
         let ordered = self.order_dag(&leader, state);
         #[cfg(feature = "benchmark")]
         {
