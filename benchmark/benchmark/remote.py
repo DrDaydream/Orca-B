@@ -68,8 +68,18 @@ class Bench:
             'source $HOME/.cargo/env',
             'rustup default stable',
 
-            # This is missing from the Rocksdb installer (needed for Rocksdb).
-            'sudo apt-get install -y clang',
+            # RocksDB/bindgen require libclang. Pin the remote testbed to
+            # Clang/LLVM 14 so all protocol comparisons use the same toolchain.
+            'sudo apt-get -y install software-properties-common',
+            'sudo add-apt-repository -y universe || true',
+            'sudo apt-get update',
+            'sudo apt-get install -y clang-14 llvm-14 llvm-14-dev libclang-14-dev',
+            'sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-14 140',
+            'sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-14 140',
+            # _update() explicitly sources ~/.cargo/env before cargo build.
+            # Persist the variables there so non-interactive Fabric shells use
+            # the pinned compiler and bindgen can locate libclang 14.
+            'grep -q "LIBCLANG_PATH=/usr/lib/llvm-14/lib" "$HOME/.cargo/env" || printf "\\nexport PATH=/usr/lib/llvm-14/bin:\\$PATH\\nexport CC=/usr/bin/clang-14\\nexport CXX=/usr/bin/clang++-14\\nexport CLANG_PATH=/usr/bin/clang-14\\nexport LIBCLANG_PATH=/usr/lib/llvm-14/lib\\nexport CXXFLAGS=\\\"-include cstdint\\\"\\n" >> "$HOME/.cargo/env"',
 
             # Clone the repo.
             f'(git clone {self.settings.repo_url} || (cd {self.settings.repo_name} ; git pull))'
