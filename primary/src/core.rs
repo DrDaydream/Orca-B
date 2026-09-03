@@ -1,7 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::aggregators::{CertificatesAggregator, GradeOneVotesAggregator};
 use crate::error::{DagError, DagResult};
-use crate::messages::{Certificate, ConsensusCommand, ConsensusMessage, GradeOneVote, Header};
+use crate::messages::{
+    Certificate, ConsensusCommand, ConsensusMessage, GradeOneVote, GradeOneVoteBatch, Header,
+};
 use crate::primary::{PrimaryMessage, Round};
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
@@ -12,7 +14,7 @@ use crypto::Hash as _;
 use crypto::{Digest, PublicKey, Signature, SignatureService};
 use log::{debug, error, warn};
 use network::{CancelHandler, ReliableSender};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use store::Store;
@@ -439,15 +441,16 @@ impl Core {
 
     async fn flush_grbc_outboxes(&mut self) {
         if !self.vote_outbox.is_empty() {
-            let round = self
-                .vote_outbox
-                .iter()
-                .map(|vote| vote.round)
-                .max()
-                .unwrap_or_default();
-            let votes = std::mem::take(&mut self.vote_outbox);
-            self.broadcast_grbc_batch(PrimaryMessage::GradeOneVoteBatch(votes), round)
-                .await;
+            let mut by_round = BTreeMap::<Round, Vec<GradeOneVote>>::new();
+            for vote in std::mem::take(&mut self.vote_outbox) {
+                by_round.entry(vote.round).or_default().push(vote);
+            }
+            for (round, votes) in by_round {
+                let batch = GradeOneVoteBatch::from_votes(votes)
+                    .expect("local GRBC batch mixed voters or rounds");
+                self.broadcast_grbc_batch(PrimaryMessage::GradeOneVoteBatch(batch), round)
+                    .await;
+            }
         }
     }
 
@@ -587,8 +590,8 @@ impl Core {
                 self.sanitize_grade_one_vote(&vote)?;
                 self.process_grade_one_vote(vote).await
             }
-            PrimaryMessage::GradeOneVoteBatch(votes) => {
-                for vote in votes {
+            PrimaryMessage::GradeOneVoteBatch(batch) => {
+                for vote in batch.into_votes() {
                     self.sanitize_grade_one_vote(&vote)?;
                     self.process_grade_one_vote(vote).await?;
                 }

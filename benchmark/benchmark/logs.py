@@ -100,7 +100,13 @@ class LogParser:
         merged = {}
         for values in inputs:
             for leader, value in values.items():
-                merged.setdefault(leader, value)
+                previous = merged.get(leader)
+                if previous is None:
+                    merged[leader] = value
+                elif previous[1] == 'skip' and value[1] == 'commit':
+                    merged[leader] = value
+                elif previous[1] == value[1] == 'commit' and value[0] < previous[0]:
+                    merged[leader] = value
         return merged
 
     def _parse_clients(self, log):
@@ -158,12 +164,56 @@ class LogParser:
         header_proposals = self._merge_results([[(d, self._to_posix(t)) for t, d in tmp]])
         tmp = findall(r'\[(.*Z) .* Header committed round \d+ digest (\S+) leader (true|false)', log)
         header_commits = {d: (self._to_posix(t), leader == 'true') for t, d, leader in tmp}
-        tmp = findall(r'Leader commit-ready round \d+ digest (\S+) at (\d+)', log)
-        leader_ready = {d: int(t) / 1_000 for d, t in tmp}
-        tmp = findall(r'\[(.*Z) .* Header rule-ordered round \d+ digest (\S+)', log)
-        rule_orders = self._merge_results([[(d, self._to_posix(t)) for t, d in tmp]])
-        tmp = findall(r'Commit rule stats leader (\S+) rule ([123]) outcome (commit|skip) blocks (\d+)', log)
-        commit_rules = {leader: (int(rule), outcome, int(blocks)) for leader, rule, outcome, blocks in tmp}
+        outcomes = findall(
+            r'Leader outcome round (\d+) digest (\S+) rule ([123]) '
+            r'outcome (commit|skip) blocks (\d+) ready_at (\d+) '
+            r'commit_at (\d+) headers (\S+)',
+            log,
+        )
+        if outcomes:
+            leader_ready = {
+                digest: int(ready_at) / 1_000
+                for _, digest, _, outcome, _, ready_at, _, _ in outcomes
+                if outcome == 'commit' and digest != '-' and int(ready_at) > 0
+            }
+            ordered = []
+            committed_headers = {}
+            for _, _, _, outcome, _, _, commit_at, headers in outcomes:
+                if outcome != 'commit' or headers == '-':
+                    continue
+                for item in headers.split(','):
+                    digest, ordered_at, is_leader = item.rsplit('@', 2)
+                    committed = int(commit_at) / 1_000
+                    previous = committed_headers.get(digest)
+                    value = (committed, is_leader == '1')
+                    if previous is None or committed < previous[0]:
+                        committed_headers[digest] = value
+                    if is_leader == '0':
+                        ordered.append((digest, int(ordered_at) / 1_000))
+            header_commits = committed_headers
+            rule_orders = self._merge_results([ordered])
+            commit_rules = {
+                int(round): (int(rule), outcome, int(blocks))
+                for round, _, rule, outcome, blocks, _, _, _ in outcomes
+            }
+        else:
+            # Preserve compatibility with logs generated before leader
+            # summaries combined rule outcomes and ordering samples.
+            tmp = findall(r'Leader commit-ready round \d+ digest (\S+) at (\d+)', log)
+            leader_ready = {d: int(t) / 1_000 for d, t in tmp}
+            tmp = findall(r'\[(.*Z) .* Header rule-ordered round \d+ digest (\S+)', log)
+            rule_orders = self._merge_results(
+                [[(d, self._to_posix(t)) for t, d in tmp]]
+            )
+            tmp = findall(
+                r'Commit rule stats leader (\S+) rule ([123]) '
+                r'outcome (commit|skip) blocks (\d+)',
+                log,
+            )
+            commit_rules = {
+                leader: (int(rule), outcome, int(blocks))
+                for leader, rule, outcome, blocks in tmp
+            }
         aba_durations = [int(value) for value in findall(r'ABA duration round \d+ ms (\d+)', log)]
 
         configs = {

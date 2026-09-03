@@ -183,6 +183,50 @@ pub struct GradeOneVote {
     pub signature: Signature,
 }
 
+/// Votes from one authority in one DAG round. The shared voter and round are
+/// encoded once instead of being repeated for every header vote.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GradeOneVoteBatch {
+    pub round: Round,
+    pub author: PublicKey,
+    pub votes: Vec<(Digest, PublicKey, Signature)>,
+}
+
+impl GradeOneVoteBatch {
+    pub fn from_votes(votes: Vec<GradeOneVote>) -> Option<Self> {
+        let first = votes.first()?;
+        let round = first.round;
+        let author = first.author;
+        if votes
+            .iter()
+            .any(|vote| vote.round != round || vote.author != author)
+        {
+            return None;
+        }
+        Some(Self {
+            round,
+            author,
+            votes: votes
+                .into_iter()
+                .map(|vote| (vote.id, vote.origin, vote.signature))
+                .collect(),
+        })
+    }
+
+    pub fn into_votes(self) -> Vec<GradeOneVote> {
+        self.votes
+            .into_iter()
+            .map(|(id, origin, signature)| GradeOneVote {
+                id,
+                round: self.round,
+                origin,
+                author: self.author,
+                signature,
+            })
+            .collect()
+    }
+}
+
 impl GradeOneVote {
     pub async fn new(
         header: &Header,

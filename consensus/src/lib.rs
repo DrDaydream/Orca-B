@@ -6,9 +6,12 @@ use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, ConsensusCommand, ConsensusMessage, Round};
 use std::cmp::max;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time::{self, Duration, Instant};
+
+const LEADER_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 pub mod aba;
 use aba::{Aba, AbaAction, AbaMessage, BinaryValue, DeterministicCoin};
@@ -97,9 +100,14 @@ struct State {
     aba_inputs: HashSet<Round>,
     aba_decisions: HashMap<Round, BinaryValue>,
     buffered_aba: HashMap<Round, Vec<(PublicKey, AbaMessage)>>,
+    /// ABA instances whose relevant leader or grade-2 support changed.
+    dirty_aba_instances: HashSet<Round>,
+    /// Newly delivered grade-2 support indexed by the leader it can affect.
+    pending_aba_evidence: HashMap<Round, HashSet<Digest>>,
     /// ABA broadcasts accumulated during one consensus ingress batch.
-    aba_outbox: Vec<Vec<u8>>,
-    missing_leader_requests: HashSet<Round>,
+    aba_outbox: Vec<AbaMessage>,
+    /// Missing decided leaders and their next rate-limited retry deadline.
+    missing_leader_requests: HashMap<Round, Instant>,
     /// Leaders made commit-ready directly by rules 1 or 2. ABA can help
     /// propagate input 1 but can never override this local fast-path result.
     direct_commit_ready: HashSet<Round>,
@@ -107,9 +115,9 @@ struct State {
     /// zero-input handling incremental instead of rescanning round 1 onward.
     zero_input_checked_through: Round,
     highest_entered_round: Round,
-    /// Prevent duplicate benchmark records when a preordered DAG is revisited.
+    /// Earliest rule-ready time for every preordered non-leader header.
     #[cfg(feature = "benchmark")]
-    logged_rule_order: HashMap<Digest, Round>,
+    rule_order_ready_at: HashMap<Digest, u128>,
 }
 
 impl State {
@@ -189,14 +197,28 @@ impl State {
             aba_inputs: HashSet::new(),
             aba_decisions: HashMap::new(),
             buffered_aba: HashMap::new(),
+            dirty_aba_instances: HashSet::new(),
+            pending_aba_evidence: HashMap::new(),
             aba_outbox: Vec::new(),
-            missing_leader_requests: HashSet::new(),
+            missing_leader_requests: HashMap::new(),
             direct_commit_ready: HashSet::new(),
             zero_input_checked_through: 0,
             highest_entered_round: 1,
             #[cfg(feature = "benchmark")]
-            logged_rule_order: HashMap::new(),
+            rule_order_ready_at: HashMap::new(),
         }
+    }
+
+    fn mark_aba_support_dirty(&mut self, digest: Digest, support_round: Round) {
+        if support_round < 3 {
+            return;
+        }
+        let leader_round = support_round - 2;
+        self.pending_aba_evidence
+            .entry(leader_round)
+            .or_default()
+            .insert(digest);
+        self.dirty_aba_instances.insert(leader_round);
     }
 
     fn record_rule_ready(&mut self, round: Round) -> Option<u128> {
@@ -294,9 +316,8 @@ impl State {
         }
     }
 
-    /// Orca-A forced admission: once a leader is commit-ready, insert every
-    /// currently observed strong/weak/virtual ancestor directly into Dag and
-    /// remember missing digests so their later observation completes history.
+    /// Once a leader is commit-ready, insert every currently observed strong
+    /// or weak ancestor directly into Dag and remember missing dependencies.
     fn force_observed_history_to_dag(&mut self, root: Certificate, owner_round: Round) {
         let mut pending = vec![root];
         let mut visited = HashSet::new();
@@ -310,7 +331,6 @@ impl State {
                 .parents
                 .iter()
                 .chain(&certificate.header.weak_edges)
-                .chain(&certificate.header.virtual_edges)
             {
                 if self.dag_digests.contains(dependency) {
                     continue;
@@ -454,6 +474,11 @@ impl State {
 
     fn mark_grade_two(&mut self, digest: Digest) -> bool {
         let inserted = self.grade_two.insert(digest.clone());
+        if inserted {
+            if let Some(round) = self.observed.get(&digest).map(Certificate::round) {
+                self.mark_aba_support_dirty(digest.clone(), round);
+            }
+        }
         if inserted
             && self.missing_dependencies.get(&digest) == Some(&0)
             && self.observed.contains_key(&digest)
@@ -573,8 +598,13 @@ impl State {
         let aba_decisions = &self.aba_decisions;
         self.buffered_aba
             .retain(|round, _| *round >= gc_round || !aba_decisions.contains_key(round));
+        self.dirty_aba_instances.retain(|round| *round >= gc_round);
+        self.pending_aba_evidence.retain(|round, digests| {
+            digests.retain(|digest| observed.contains_key(digest));
+            *round >= gc_round && !digests.is_empty()
+        });
         self.missing_leader_requests
-            .retain(|round| *round >= gc_round);
+            .retain(|round, _| *round >= gc_round);
         self.direct_commit_ready.retain(|round| *round >= gc_round);
         self.leaders.retain(|round, _| *round >= gc_round);
         self.adversarial_leaders
@@ -583,7 +613,8 @@ impl State {
         self.committed_leaders.retain(|round| *round >= gc_round);
         self.skipped_leaders.retain(|round| *round >= gc_round);
         #[cfg(feature = "benchmark")]
-        self.logged_rule_order.retain(|_, round| *round >= gc_round);
+        self.rule_order_ready_at
+            .retain(|digest, _| observed.contains_key(digest));
     }
 }
 
@@ -654,11 +685,18 @@ impl Consensus {
 
     fn mark_rule_skipped(&self, round: Round, rule: u8, state: &mut State) {
         if state.mark_skipped(round) {
+            state.missing_leader_requests.remove(&round);
             #[cfg(feature = "benchmark")]
-            info!(
-                "Commit rule stats leader round-{} rule {} outcome skip blocks 0",
-                round, rule
-            );
+            {
+                let decided_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("System clock is before Unix epoch")
+                    .as_millis();
+                info!(
+                    "Leader outcome round {} digest - rule {} outcome skip blocks 0 ready_at 0 commit_at {} headers -",
+                    round, rule, decided_at
+                );
+            }
         }
     }
 
@@ -747,8 +785,24 @@ impl Consensus {
             }
         });
 
-        // Listen to incoming certificates.
-        while let Some(message) = self.rx_primary.recv().await {
+        // Listen to incoming certificates and retry decided-but-missing leaders.
+        loop {
+            let next_leader_retry = state.missing_leader_requests.values().min().copied();
+            let message = tokio::select! {
+                message = self.rx_primary.recv() => match message {
+                    Some(message) => message,
+                    None => break,
+                },
+                _ = async {
+                    match next_leader_retry {
+                        Some(deadline) => time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.retry_missing_leaders(&mut state).await;
+                    continue;
+                }
+            };
             if let ConsensusMessage::RoundAdvanced(round) = message {
                 if round > state.highest_entered_round {
                     state.highest_entered_round = round;
@@ -757,70 +811,57 @@ impl Consensus {
                 }
                 continue;
             }
-            let (
-                observed_round,
-                observed_origin,
-                first_observation,
-                grade_two_changed,
-                promoted,
-                history_owners,
-            ) = match message {
-                ConsensusMessage::RoundAdvanced(_) => unreachable!(),
-                ConsensusMessage::Observed(header) => {
-                    let round = header.round;
-                    let certificate = Certificate {
-                        header,
-                        votes: Vec::new(),
-                    };
-                    let origin = certificate.origin();
-                    let first = !state.observed.contains_key(&certificate.digest());
-                    let owners = state.observe(certificate);
-                    (round, origin, first, false, Vec::new(), owners)
-                }
-                ConsensusMessage::GradeOne(certificate) => {
-                    debug!("Grade 1 delivered {:?}", certificate);
-                    let round = certificate.round();
-                    let origin = certificate.origin();
-                    let first = !state.observed.contains_key(&certificate.digest());
-                    let owners = state.insert_grade_one(certificate);
-                    (round, origin, first, false, state.promote_ready(), owners)
-                }
-                ConsensusMessage::GradeTwo(certificate) => {
-                    debug!("Grade 2 delivered {:?}", certificate);
-                    let round = certificate.round();
-                    let first = !state.observed.contains_key(&certificate.digest());
-                    let owners = state.observe(certificate.clone());
-                    let changed = state.mark_grade_two(certificate.digest());
-                    (
-                        round,
-                        certificate.origin(),
-                        first,
-                        changed,
-                        state.promote_ready(),
-                        owners,
-                    )
-                }
-                ConsensusMessage::Aba(sender, bytes) => {
-                    match bincode::deserialize::<AbaMessage>(&bytes) {
-                        Ok(message) => self.process_aba_message(sender, message, &mut state).await,
-                        Err(error) => warn!("Ignoring malformed ABA message: {}", error),
+            let (observed_round, observed_origin, first_observation, promoted, history_owners) =
+                match message {
+                    ConsensusMessage::RoundAdvanced(_) => unreachable!(),
+                    ConsensusMessage::Observed(header) => {
+                        let round = header.round;
+                        let certificate = Certificate {
+                            header,
+                            votes: Vec::new(),
+                        };
+                        let origin = certificate.origin();
+                        let first = !state.observed.contains_key(&certificate.digest());
+                        let owners = state.observe(certificate);
+                        (round, origin, first, Vec::new(), owners)
                     }
-                    self.flush_aba_outbox(&mut state).await;
-                    continue;
-                }
-                ConsensusMessage::AbaBatch(sender, batch) => {
-                    for bytes in batch {
-                        match bincode::deserialize::<AbaMessage>(&bytes) {
-                            Ok(message) => {
-                                self.process_aba_message(sender, message, &mut state).await
-                            }
-                            Err(error) => warn!("Ignoring malformed ABA message: {}", error),
+                    ConsensusMessage::GradeOne(certificate) => {
+                        debug!("Grade 1 delivered {:?}", certificate);
+                        let round = certificate.round();
+                        let origin = certificate.origin();
+                        let first = !state.observed.contains_key(&certificate.digest());
+                        let owners = state.insert_grade_one(certificate);
+                        (round, origin, first, state.promote_ready(), owners)
+                    }
+                    ConsensusMessage::GradeTwo(certificate) => {
+                        debug!("Grade 2 delivered {:?}", certificate);
+                        let round = certificate.round();
+                        let first = !state.observed.contains_key(&certificate.digest());
+                        let owners = state.observe(certificate.clone());
+                        state.mark_grade_two(certificate.digest());
+                        (
+                            round,
+                            certificate.origin(),
+                            first,
+                            state.promote_ready(),
+                            owners,
+                        )
+                    }
+                    ConsensusMessage::Aba(sender, bytes) => {
+                        self.process_aba_payload(sender, &bytes, &mut state).await;
+                        self.process_dirty_aba_instances(&mut state).await;
+                        self.flush_aba_outbox(&mut state).await;
+                        continue;
+                    }
+                    ConsensusMessage::AbaBatch(sender, batch) => {
+                        for bytes in batch {
+                            self.process_aba_payload(sender, &bytes, &mut state).await;
                         }
+                        self.process_dirty_aba_instances(&mut state).await;
+                        self.flush_aba_outbox(&mut state).await;
+                        continue;
                     }
-                    self.flush_aba_outbox(&mut state).await;
-                    continue;
-                }
-            };
+                };
 
             // Refresh only cached orders affected by newly arrived forced
             // causal history; this avoids rescanning historical leaders.
@@ -844,8 +885,7 @@ impl Consensus {
                 // supporters. Reconcile only that leader's GRBC-derived ABA
                 // support instead of rescanning historical leaders.
                 if observed_origin == self.ordering_leader_authority(observed_round) {
-                    self.evaluate_aba_r_plus_two_input(observed_round, &mut state)
-                        .await;
+                    state.dirty_aba_instances.insert(observed_round);
                 }
             }
 
@@ -864,18 +904,8 @@ impl Consensus {
                 self.evaluate_commit_rule_two(support_round, &mut state, true)
                     .await;
             }
-            let mut aba_rounds = promoted_rounds;
-            if grade_two_changed {
-                aba_rounds.insert(observed_round);
-            }
-            for support_round in aba_rounds {
-                if support_round >= 3 {
-                    self.evaluate_aba_r_plus_two_input(support_round - 2, &mut state)
-                        .await;
-                }
-            }
-
             self.resolve_requested_leaders(&mut state).await;
+            self.process_dirty_aba_instances(&mut state).await;
             self.flush_aba_outbox(&mut state).await;
         }
     }
@@ -884,7 +914,10 @@ impl Consensus {
         if state.aba_outbox.is_empty() {
             return;
         }
-        let batch = std::mem::take(&mut state.aba_outbox);
+        // Serialize one compact vector per ingress batch rather than wrapping
+        // every ABA message in its own independently serialized allocation.
+        let messages = std::mem::take(&mut state.aba_outbox);
+        let batch = vec![bincode::serialize(&messages).expect("Failed to serialize ABA batch")];
         self.tx_primary
             .send(ConsensusCommand::AbaBroadcast(batch))
             .await
@@ -915,6 +948,20 @@ impl Consensus {
             for (sender, message) in buffered {
                 self.process_aba_message(sender, message, state).await;
             }
+        }
+    }
+
+    async fn process_aba_payload(&mut self, sender: PublicKey, bytes: &[u8], state: &mut State) {
+        match bincode::deserialize::<Vec<AbaMessage>>(bytes) {
+            Ok(messages) => {
+                for message in messages {
+                    self.process_aba_message(sender, message, state).await;
+                }
+            }
+            Err(batch_error) => match bincode::deserialize::<AbaMessage>(bytes) {
+                Ok(message) => self.process_aba_message(sender, message, state).await,
+                Err(_) => warn!("Ignoring malformed ABA batch: {}", batch_error),
+            },
         }
     }
 
@@ -975,9 +1022,7 @@ impl Consensus {
         for action in actions {
             match action {
                 AbaAction::Broadcast(message) => {
-                    let bytes =
-                        bincode::serialize(&message).expect("Failed to serialize ABA message");
-                    state.aba_outbox.push(bytes);
+                    state.aba_outbox.push(message);
                 }
                 AbaAction::Decide(value) => {
                     // ABA is the cold-path trigger for an older leader. Before
@@ -1049,23 +1094,19 @@ impl Consensus {
                     state.promote_ready();
                     state.force_observed_history_to_dag(leader.clone(), leader_round);
                     self.queue_leader_commit(leader, aba_rule, state).await;
-                } else if state.missing_leader_requests.insert(leader_round) {
+                } else if !state.missing_leader_requests.contains_key(&leader_round) {
                     state
                         .leader_commit_rules
                         .entry(leader_round)
                         .or_insert(aba_rule);
-                    let authority = self.ordering_leader_authority(leader_round);
-                    self.tx_primary
-                        .send(ConsensusCommand::LeaderRequest(leader_round, authority))
-                        .await
-                        .expect("Failed to request decided leader");
+                    self.request_missing_leader(leader_round, state).await;
                 }
             }
         }
     }
 
     async fn resolve_requested_leaders(&mut self, state: &mut State) {
-        let rounds: Vec<_> = state.missing_leader_requests.iter().cloned().collect();
+        let rounds: Vec<_> = state.missing_leader_requests.keys().cloned().collect();
         for round in rounds {
             if let Some(leader) = self.observed_leader(round, state) {
                 state.missing_leader_requests.remove(&round);
@@ -1079,8 +1120,54 @@ impl Consensus {
         }
     }
 
+    async fn send_leader_request(&mut self, round: Round) {
+        let authority = self.ordering_leader_authority(round);
+        self.tx_primary
+            .send(ConsensusCommand::LeaderRequest(round, authority))
+            .await
+            .expect("Failed to request decided leader");
+    }
+
+    async fn request_missing_leader(&mut self, round: Round, state: &mut State) {
+        if state.skipped_leaders.contains(&round) || self.observed_leader(round, state).is_some() {
+            state.missing_leader_requests.remove(&round);
+            return;
+        }
+        self.send_leader_request(round).await;
+        state
+            .missing_leader_requests
+            .insert(round, Instant::now() + LEADER_RETRY_DELAY);
+    }
+
+    async fn retry_missing_leaders(&mut self, state: &mut State) {
+        let now = Instant::now();
+        let rounds: Vec<_> = state
+            .missing_leader_requests
+            .iter()
+            .filter_map(|(round, deadline)| (*deadline <= now).then_some(*round))
+            .collect();
+        for round in rounds {
+            if state.skipped_leaders.contains(&round)
+                || self.observed_leader(round, state).is_some()
+                || state.aba_decisions.get(&round) != Some(&BinaryValue::One)
+            {
+                state.missing_leader_requests.remove(&round);
+                continue;
+            }
+            debug!(
+                "Retrying request for missing ABA-decided leader round {}",
+                round
+            );
+            self.send_leader_request(round).await;
+            state
+                .missing_leader_requests
+                .insert(round, Instant::now() + LEADER_RETRY_DELAY);
+        }
+    }
+
     async fn evaluate_aba_r_plus_two_input(&mut self, leader_round: Round, state: &mut State) {
         if state.aba_inputs.contains(&leader_round) {
+            state.pending_aba_evidence.remove(&leader_round);
             return;
         }
         let leader = match self.observed_leader(leader_round, state) {
@@ -1091,21 +1178,41 @@ impl Consensus {
         let support_round = leader_round + 2;
         let key = (support_round, digest.clone());
         let mut support = state.aba_support.remove(&key).unwrap_or_default();
-        let blocks: Vec<_> = state
-            .dag
-            .get(&support_round)
-            .into_iter()
-            .flat_map(|x| x.values())
-            .chain(
-                state
-                    .vdag
-                    .get(&support_round)
-                    .into_iter()
-                    .flat_map(|x| x.values()),
-            )
-            .filter(|(block_digest, _)| state.grade_two.contains(block_digest))
-            .map(|(block_digest, block)| (block_digest.clone(), block.clone()))
-            .collect();
+        let pending = state
+            .pending_aba_evidence
+            .remove(&leader_round)
+            .unwrap_or_default();
+        let blocks: Vec<_> = if pending.is_empty() && support.processed_grade_two.is_empty() {
+            // Compatibility path for restored/test state that predates the
+            // event index. Production updates normally use `pending` below.
+            state
+                .dag
+                .get(&support_round)
+                .into_iter()
+                .flat_map(|x| x.values())
+                .chain(
+                    state
+                        .vdag
+                        .get(&support_round)
+                        .into_iter()
+                        .flat_map(|x| x.values()),
+                )
+                .filter(|(block_digest, _)| state.grade_two.contains(block_digest))
+                .map(|(block_digest, block)| (block_digest.clone(), block.clone()))
+                .collect()
+        } else {
+            pending
+                .into_iter()
+                .filter(|block_digest| state.grade_two.contains(block_digest))
+                .filter_map(|block_digest| {
+                    state
+                        .observed
+                        .get(&block_digest)
+                        .cloned()
+                        .map(|block| (block_digest, block))
+                })
+                .collect()
+        };
         let fresh: Vec<_> = blocks
             .into_iter()
             .filter(|(block_digest, _)| support.processed_grade_two.insert(block_digest.clone()))
@@ -1132,6 +1239,18 @@ impl Consensus {
         if any_strong || stake >= self.committee.validity_threshold() {
             self.offer_aba_input(leader_round, BinaryValue::One, state)
                 .await;
+        }
+    }
+
+    async fn process_dirty_aba_instances(&mut self, state: &mut State) {
+        while let Some(leader_round) = state.dirty_aba_instances.iter().next().cloned() {
+            state.dirty_aba_instances.remove(&leader_round);
+            if !state.aba_decisions.contains_key(&leader_round) {
+                self.evaluate_aba_r_plus_two_input(leader_round, state)
+                    .await;
+            } else {
+                state.pending_aba_evidence.remove(&leader_round);
+            }
         }
     }
 
@@ -1436,99 +1555,6 @@ impl Consensus {
         })
     }
 
-    /// Counts exact three-edge virtual paths from `higher` to `lower`:
-    /// higher --parent--> block --parent--> block --virtual--> lower.
-    /// Paths are distinct when either intermediate block differs, so the
-    /// identity of a path is `(first_digest, second_digest)`.
-    #[allow(dead_code)]
-    fn three_edge_virtual_path_stake(
-        &self,
-        higher: &Certificate,
-        lower: &Digest,
-        state: &State,
-    ) -> Stake {
-        let mut paths = HashSet::new();
-        for first_digest in &higher.header.parents {
-            if let Some(first) = Self::observed_certificate(first_digest, state) {
-                for second_digest in &first.header.parents {
-                    if Self::observed_certificate(second_digest, state)
-                        .map_or(false, |second| second.header.virtual_edges.contains(lower))
-                    {
-                        paths.insert((first_digest.clone(), second_digest.clone()));
-                    }
-                }
-            }
-        }
-        paths.len() as Stake
-    }
-
-    /// Commit rule 3 resolves leaders that did not satisfy rules 1 or 2.
-    /// A commit-ready leader at round h observes leaders h-3, h-6, ... .
-    /// Every adjacent pair in that chain must have either a strong path or
-    /// f+1 distinct three-edge virtual paths. The target is
-    /// marked commit-ready when the whole chain succeeds, otherwise skipped.
-    #[allow(dead_code)]
-    async fn evaluate_commit_rule_three(&mut self, state: &mut State) {
-        let observers: Vec<_> = state.pending_leaders.keys().cloned().collect();
-        for observer_round in observers {
-            if observer_round < 4 {
-                continue;
-            }
-
-            let mut target_round = observer_round - 3;
-            loop {
-                if !state.committed_leaders.contains(&target_round)
-                    && !state.skipped_leaders.contains(&target_round)
-                    && !state.pending_leaders.contains_key(&target_round)
-                {
-                    let target = self.observed_leader(target_round, state);
-                    let mut chain_round = observer_round;
-                    let mut chain_valid = target.is_some();
-
-                    while chain_valid && chain_round > target_round {
-                        let lower_round = chain_round - 3;
-                        let higher = self.observed_leader(chain_round, state);
-                        let lower = self.observed_leader(lower_round, state);
-                        chain_valid = match (higher, lower) {
-                            (Some(higher), Some(lower)) => {
-                                let lower_digest = lower.digest();
-                                self.has_strong_path(&higher, &lower_digest, state)
-                                    || self.three_edge_virtual_path_stake(
-                                        &higher,
-                                        &lower_digest,
-                                        state,
-                                    ) >= self.committee.validity_threshold()
-                            }
-                            _ => false,
-                        };
-                        chain_round = lower_round;
-                    }
-
-                    if chain_valid {
-                        let target = target.unwrap();
-                        debug!(
-                            "Leader {:?} marked commit-ready by commit rule 3 through round {}",
-                            target, observer_round
-                        );
-                        self.queue_leader_commit(target, 3, state).await;
-                    } else {
-                        debug!(
-                            "Skipping leader round {} by commit rule 3 observed from round {}",
-                            target_round, observer_round
-                        );
-                        self.mark_rule_skipped(target_round, 3, state);
-                    }
-                    self.drain_ready_leaders(state).await;
-                }
-
-                if target_round < 4 {
-                    break;
-                }
-                target_round -= 3;
-            }
-        }
-    }
-
     fn observed_leader(&self, round: Round, state: &State) -> Option<Certificate> {
         let authority = self.ordering_leader_authority(round);
         state
@@ -1572,31 +1598,21 @@ impl Consensus {
         if state.committed_leaders.contains(&round) {
             return;
         }
+        state.missing_leader_requests.remove(&round);
         state.force_observed_history_to_dag(leader.clone(), round);
-        if let Some(_ready_at) = state.record_rule_ready(round) {
-            #[cfg(feature = "benchmark")]
-            info!(
-                "Leader commit-ready round {} digest {:?} at {}",
-                round,
-                leader.header.digest(),
-                _ready_at
-            );
-        }
+        let _ = state.record_rule_ready(round);
         state.leader_commit_rules.entry(round).or_insert(rule);
         let ordered = self.order_dag(&leader, state);
         #[cfg(feature = "benchmark")]
-        for certificate in &ordered {
-            if certificate.origin() != self.ordering_leader_authority(certificate.round())
-                && state
-                    .logged_rule_order
-                    .insert(certificate.header.digest(), certificate.round())
-                    .is_none()
-            {
-                info!(
-                    "Header rule-ordered round {} digest {:?}",
-                    certificate.round(),
-                    certificate.header.digest()
-                );
+        {
+            let ready_at = state.rule_ready_at_ms[&round];
+            for certificate in &ordered {
+                if certificate.origin() != self.ordering_leader_authority(certificate.round()) {
+                    state
+                        .rule_order_ready_at
+                        .entry(certificate.header.digest())
+                        .or_insert(ready_at);
+                }
             }
         }
         state.pending_order.insert(round, ordered);
@@ -1642,13 +1658,6 @@ impl Consensus {
                     .map_or(true, |round| certificate.round() > *round)
             });
             let commit_rule = state.leader_commit_rules.remove(&ready_round).unwrap_or(3);
-            #[cfg(feature = "benchmark")]
-            info!(
-                "Commit rule stats leader {:?} rule {} outcome commit blocks {}",
-                leader.header.digest(),
-                commit_rule,
-                sequence.len()
-            );
             let _rule_ready_at_ms =
                 state
                     .rule_ready_at_ms
@@ -1663,17 +1672,50 @@ impl Consensus {
                 .duration_since(UNIX_EPOCH)
                 .expect("System clock is before Unix epoch")
                 .as_millis();
+            #[cfg(feature = "benchmark")]
+            {
+                let headers = sequence
+                    .iter()
+                    .map(|certificate| {
+                        let digest = certificate.header.digest();
+                        let is_leader = certificate.origin()
+                            == self.ordering_leader_authority(certificate.round());
+                        let ordered_at = if is_leader {
+                            _rule_ready_at_ms
+                        } else {
+                            state
+                                .rule_order_ready_at
+                                .remove(&digest)
+                                .unwrap_or(_rule_ready_at_ms)
+                        };
+                        format!(
+                            "{:?}@{}@{}",
+                            digest,
+                            ordered_at,
+                            if is_leader { 1 } else { 0 }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                info!(
+                    "Leader outcome round {} digest {:?} rule {} outcome commit blocks {} ready_at {} commit_at {} headers {}",
+                    ready_round,
+                    leader.header.digest(),
+                    commit_rule,
+                    sequence.len(),
+                    _rule_ready_at_ms,
+                    _committed_at_ms,
+                    if headers.is_empty() {
+                        "-"
+                    } else {
+                        headers.as_str()
+                    }
+                );
+            }
             state.update(&sequence, self.gc_depth);
             for certificate in &sequence {
                 #[cfg(not(feature = "benchmark"))]
                 info!("Committed {}", certificate.header);
-                #[cfg(feature = "benchmark")]
-                info!(
-                    "Header committed round {} digest {:?} leader {}",
-                    certificate.round(),
-                    certificate.header.digest(),
-                    certificate.origin() == self.ordering_leader_authority(certificate.round())
-                );
                 #[cfg(feature = "benchmark")]
                 for digest in certificate.header.payload.keys() {
                     info!(

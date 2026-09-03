@@ -6,7 +6,8 @@ use crate::garbage_collector::GarbageCollector;
 use crate::header_waiter::HeaderWaiter;
 use crate::helper::Helper;
 use crate::messages::{
-    Certificate, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GradeOneVote, Header,
+    Certificate, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GradeOneVote,
+    GradeOneVoteBatch as VoteBatch, Header,
 };
 use crate::payload_receiver::PayloadReceiver;
 use crate::proposer::Proposer;
@@ -37,7 +38,7 @@ pub type Round = u64;
 pub enum PrimaryMessage {
     Header(Header),
     GradeOneVote(GradeOneVote),
-    GradeOneVoteBatch(Vec<GradeOneVote>),
+    GradeOneVoteBatch(VoteBatch),
     Certificate(Certificate),
     Consensus(ConsensusNetworkMessage),
     LeaderRequest(Round, PublicKey, /* requestor */ PublicKey),

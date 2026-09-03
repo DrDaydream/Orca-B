@@ -5,7 +5,7 @@ use crypto::{generate_keypair, SecretKey};
 use primary::Header;
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use tokio::sync::mpsc::{channel, Sender};
 
 async fn deliver(tx: &Sender<ConsensusMessage>, certificate: Certificate) {
@@ -423,45 +423,60 @@ fn forced_admission_accepts_observed_leader_and_late_history() {
 }
 
 #[test]
-fn commit_rule_three_counts_exact_three_edge_virtual_paths() {
+fn forced_admission_does_not_follow_virtual_edges() {
     let committee = mock_committee();
-    let consensus = Consensus {
+    let mut state = State::new(Certificate::genesis(&committee));
+    let authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
+    let (virtual_digest, virtual_block) = mock_certificate(authorities[1], 1, BTreeSet::new());
+    state.observe(virtual_block);
+    let (_, mut leader) = mock_certificate(authorities[0], 2, BTreeSet::new());
+    leader.header.virtual_edges.insert(virtual_digest.clone());
+    leader.header.id = leader.header.digest();
+
+    state.force_observed_history_to_dag(leader, 2);
+
+    assert!(!state.dag_digests.contains(&virtual_digest));
+}
+
+#[test]
+fn grade_two_dirties_only_its_r_plus_two_aba_instance() {
+    let committee = mock_committee();
+    let mut state = State::new(Certificate::genesis(&committee));
+    let (digest, block) = mock_certificate(keys()[0].0, 7, BTreeSet::new());
+    state.observe(block);
+
+    state.mark_grade_two(digest.clone());
+
+    let dirty: HashSet<_> = [5].iter().cloned().collect();
+    let evidence: HashSet<_> = [digest].iter().cloned().collect();
+    assert_eq!(state.dirty_aba_instances, dirty);
+    assert_eq!(state.pending_aba_evidence.get(&5), Some(&evidence));
+}
+
+#[tokio::test]
+async fn missing_aba_leader_request_is_retried() {
+    let committee = mock_committee();
+    let (tx_primary, mut rx_primary) = channel(10);
+    let mut consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
-        tx_primary: channel(10).0,
-        tx_output: OutputSender::Individual(channel(10).0),
+        tx_primary,
+        tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
     let mut state = State::new(Certificate::genesis(&committee));
-    let mut authorities: Vec<_> = keys().into_iter().map(|(key, _)| key).collect();
-    authorities.sort();
+    state.aba_decisions.insert(1, BinaryValue::One);
+    state.missing_leader_requests.insert(1, Instant::now());
 
-    let (lower_digest, lower) = mock_certificate(authorities[0], 1, BTreeSet::new());
-    state.promote_to_dag(lower);
+    consensus.retry_missing_leaders(&mut state).await;
 
-    // Two different round-2 blocks virtually reference the lower leader.
-    let mut second_digests = Vec::new();
-    for authority in authorities.iter().take(2) {
-        let (_, mut second) = mock_certificate(*authority, 2, BTreeSet::new());
-        second.header.virtual_edges.insert(lower_digest.clone());
-        second_digests.push(second.digest());
-        state.promote_to_dag(second);
-    }
-
-    // The same round-3 block points to both round-2 blocks. These are two
-    // distinct paths because their second intermediate blocks differ.
-    let second_parents = second_digests.into_iter().collect();
-    let (first_digest, first) = mock_certificate(authorities[0], 3, second_parents);
-    state.promote_to_dag(first);
-    let first_digests = [first_digest].iter().cloned().collect();
-    let (_, higher) = mock_certificate(authorities[3], 4, first_digests);
-
-    assert_eq!(
-        consensus.three_edge_virtual_path_stake(&higher, &lower_digest, &state),
-        committee.validity_threshold()
-    );
+    assert!(matches!(
+        rx_primary.try_recv(),
+        Ok(ConsensusCommand::LeaderRequest(1, _))
+    ));
+    assert!(state.missing_leader_requests[&1] > Instant::now());
 }
 
 #[tokio::test]
