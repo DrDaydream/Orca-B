@@ -106,14 +106,27 @@ class InstanceManager:
         )
 
     def _get_ami(self, client):
-        # The AMI changes with regions.
+        # Select the latest Canonical Ubuntu 24.04 amd64 image available in
+        # this region instead of relying on an expired date-specific AMI
+        # description.
         response = client.describe_images(
-            Filters=[{
-                'Name': 'description',
-                'Values': ['Canonical, Ubuntu, 20.04 LTS, amd64 focal image build on 2020-10-26']
-            }]
+            Owners=['099720109477'],
+            Filters=[
+                {'Name': 'name', 'Values': ['ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*']},
+                {'Name': 'state', 'Values': ['available']},
+                {'Name': 'architecture', 'Values': ['x86_64']},
+                {'Name': 'root-device-type', 'Values': ['ebs']},
+                {'Name': 'virtualization-type', 'Values': ['hvm']},
+            ],
         )
-        return response['Images'][0]['ImageId']
+        images = response.get('Images', [])
+        if not images:
+            region = getattr(client.meta, 'region_name', 'unknown-region')
+            raise BenchError(
+                'No Canonical Ubuntu 24.04 amd64 AMI found',
+                RuntimeError(region),
+            )
+        return max(images, key=lambda image: image.get('CreationDate', ''))['ImageId']
 
     def create_instances(self, instances):
         assert isinstance(instances, int) and instances > 0
