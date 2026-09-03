@@ -76,6 +76,8 @@ class Bench:
             'sudo apt-get install -y clang-14 llvm-14 llvm-14-dev libclang-14-dev',
             'sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-14 140',
             'sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-14 140',
+            'sudo update-alternatives --set clang /usr/bin/clang-14',
+            'sudo update-alternatives --set clang++ /usr/bin/clang++-14',
             # _update() explicitly sources ~/.cargo/env before cargo build.
             # Persist the variables there so non-interactive Fabric shells use
             # the pinned compiler and bindgen can locate libclang 14.
