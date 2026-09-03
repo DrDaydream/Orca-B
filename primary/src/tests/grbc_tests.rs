@@ -1,55 +1,42 @@
-use super::GradeVotesAggregator;
-use crate::common::{certificate, committee, header, keys};
-use crate::messages::{Grade, GradeVote};
-use crypto::{Hash as _, Signature, SignatureService};
-
-#[tokio::test]
-async fn grade_two_requires_a_quorum() {
+use super::GradeOneVotesAggregator;
+use crate::common::{committee, header, votes};
+#[test]
+fn grade_one_votes_form_grade_two_certificate_at_quorum() {
     let committee = committee();
-    let certificate = certificate(&header());
-    let mut aggregator = GradeVotesAggregator::new();
-    let mut proof = None;
+    let header = header();
+    let mut aggregator = GradeOneVotesAggregator::new();
+    let mut certificate = None;
 
-    for (name, secret) in keys() {
-        let mut signature_service = SignatureService::new(secret);
-        let vote = GradeVote::new(&certificate, &name, &mut signature_service).await;
-        proof = aggregator.append(vote, &committee, &certificate).unwrap();
-        if proof.is_some() {
+    for vote in votes(&header) {
+        certificate = aggregator.append(vote, &committee, &header).unwrap();
+        if certificate.is_some() {
             break;
         }
     }
 
-    let proof = proof.expect("a quorum must produce a grade-2 proof");
-    assert_eq!(proof.grade, Grade::Two);
-    assert_eq!(proof.certificate.digest(), certificate.digest());
-    proof.verify(&committee).unwrap();
+    let certificate = certificate.expect("a quorum of grade-1 votes must produce grade 2");
+    assert_eq!(certificate.header.id, header.id);
+    certificate.verify(&committee).unwrap();
 }
 
-#[tokio::test]
-async fn duplicate_grade_votes_are_rejected() {
+#[test]
+fn duplicate_grade_one_votes_are_rejected() {
     let committee = committee();
-    let certificate = certificate(&header());
-    let (name, secret) = keys().pop().unwrap();
-    let mut signature_service = SignatureService::new(secret);
-    let vote = GradeVote::new(&certificate, &name, &mut signature_service).await;
-    let mut aggregator = GradeVotesAggregator::new();
+    let header = header();
+    let vote = votes(&header).pop().unwrap();
+    let mut aggregator = GradeOneVotesAggregator::new();
 
-    assert!(aggregator
-        .append(vote.clone(), &committee, &certificate)
-        .is_ok());
-    assert!(aggregator.append(vote, &committee, &certificate).is_err());
+    assert!(aggregator.append(vote.clone(), &committee, &header).is_ok());
+    assert!(aggregator.append(vote, &committee, &header).is_err());
 }
 
-#[tokio::test]
-async fn grade_vote_is_bound_to_one_certificate() {
+#[test]
+fn grade_one_vote_is_bound_to_one_header() {
     let committee = committee();
-    let certificate = certificate(&header());
-    let (name, secret) = keys().pop().unwrap();
-    let mut signature_service = SignatureService::new(secret);
-    let mut vote = GradeVote::new(&certificate, &name, &mut signature_service).await;
+    let header = header();
+    let mut vote = votes(&header).pop().unwrap();
     vote.id = Default::default();
-    vote.signature = Signature::default();
-    let mut aggregator = GradeVotesAggregator::new();
+    let mut aggregator = GradeOneVotesAggregator::new();
 
-    assert!(aggregator.append(vote, &committee, &certificate).is_err());
+    assert!(aggregator.append(vote, &committee, &header).is_err());
 }

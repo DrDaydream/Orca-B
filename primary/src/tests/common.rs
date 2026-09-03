@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::messages::{Certificate, Header, Vote};
+use crate::messages::{Certificate, GradeOneVote, Header};
 use bytes::Bytes;
 use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
 use crypto::Hash as _;
@@ -19,7 +19,7 @@ impl PartialEq for Header {
     }
 }
 
-impl PartialEq for Vote {
+impl PartialEq for GradeOneVote {
     fn eq(&self, other: &Self) -> bool {
         self.digest() == other.digest()
     }
@@ -139,18 +139,18 @@ pub fn headers() -> Vec<Header> {
 }
 
 // Fixture
-pub fn votes(header: &Header) -> Vec<Vote> {
+pub fn votes(header: &Header) -> Vec<GradeOneVote> {
     keys()
         .into_iter()
         .map(|(author, secret)| {
-            let vote = Vote {
+            let vote = GradeOneVote {
                 id: header.id.clone(),
                 round: header.round,
                 origin: header.author,
                 author,
                 signature: Signature::default(),
             };
-            Vote {
+            GradeOneVote {
                 signature: Signature::new(&vote.digest(), &secret),
                 ..vote
             }

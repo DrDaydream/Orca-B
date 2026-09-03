@@ -46,19 +46,10 @@ pub enum DagError {
     AuthorityReuse(PublicKey),
 
     #[error("Received unexpected vote fo header {0}")]
-    UnexpectedVote(Digest),
+    UnexpectedGradeOneVote(Digest),
 
     #[error("Received certificate without a quorum")]
     CertificateRequiresQuorum,
-
-    #[error("Received grade proof without a quorum")]
-    GradeRequiresQuorum,
-
-    #[error("Invalid graded-delivery level")]
-    InvalidGrade,
-
-    #[error("Received unexpected grade vote for certificate {0}")]
-    UnexpectedGradeVote(Digest),
 
     #[error("Parents of header {0} are not a quorum")]
     HeaderRequiresQuorum(Digest),

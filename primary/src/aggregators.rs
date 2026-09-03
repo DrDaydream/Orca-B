@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
-use crate::messages::{Certificate, Grade, GradeVote, GradedCertificate, Header, Vote};
+use crate::messages::{Certificate, GradeOneVote, Header};
 use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, Signature};
@@ -11,20 +11,13 @@ use std::collections::HashSet;
 pub mod grbc_tests;
 
 /// Aggregates votes for a particular header into a certificate.
-pub struct VotesAggregator {
+pub struct GradeOneVotesAggregator {
     weight: Stake,
     votes: Vec<(PublicKey, Signature)>,
     used: HashSet<PublicKey>,
 }
 
-/// Aggregates signed grade-1 deliveries into a grade-2 proof.
-pub struct GradeVotesAggregator {
-    weight: Stake,
-    votes: Vec<(PublicKey, Signature)>,
-    used: HashSet<PublicKey>,
-}
-
-impl GradeVotesAggregator {
+impl GradeOneVotesAggregator {
     pub fn new() -> Self {
         Self {
             weight: 0,
@@ -35,46 +28,7 @@ impl GradeVotesAggregator {
 
     pub fn append(
         &mut self,
-        vote: GradeVote,
-        committee: &Committee,
-        certificate: &Certificate,
-    ) -> DagResult<Option<GradedCertificate>> {
-        ensure!(
-            vote.id == certificate.digest()
-                && vote.round == certificate.round()
-                && vote.origin == certificate.origin(),
-            DagError::UnexpectedGradeVote(vote.id)
-        );
-        ensure!(
-            self.used.insert(vote.author),
-            DagError::AuthorityReuse(vote.author)
-        );
-        self.weight += committee.stake(&vote.author);
-        self.votes.push((vote.author, vote.signature));
-        if self.weight >= committee.quorum_threshold() {
-            self.weight = 0;
-            return Ok(Some(GradedCertificate {
-                certificate: certificate.clone(),
-                grade: Grade::Two,
-                votes: self.votes.clone(),
-            }));
-        }
-        Ok(None)
-    }
-}
-
-impl VotesAggregator {
-    pub fn new() -> Self {
-        Self {
-            weight: 0,
-            votes: Vec::new(),
-            used: HashSet::new(),
-        }
-    }
-
-    pub fn append(
-        &mut self,
-        vote: Vote,
+        vote: GradeOneVote,
         committee: &Committee,
         header: &Header,
     ) -> DagResult<Option<Certificate>> {
