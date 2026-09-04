@@ -695,16 +695,10 @@ impl Consensus {
             state.leader_commit_rules.insert(round, rule);
             state.missing_leader_requests.remove(&round);
             #[cfg(feature = "benchmark")]
-            {
-                let decided_at = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("System clock is before Unix epoch")
-                    .as_millis();
-                info!(
-                    "Leader outcome round {} digest - rule {} outcome skip blocks 0 ready_at 0 commit_at {} headers -",
-                    round, rule, decided_at
-                );
-            }
+            info!(
+                "Commit rule stats leader round-{} rule {} outcome skip blocks 0",
+                round, rule
+            );
         }
     }
 
@@ -1618,17 +1612,32 @@ impl Consensus {
         }
         state.missing_leader_requests.remove(&round);
         state.force_observed_history_to_dag(leader.clone(), round);
-        let _ = state.record_rule_ready(round);
+        if let Some(_ready_at) = state.record_rule_ready(round) {
+            #[cfg(feature = "benchmark")]
+            info!(
+                "Leader commit-ready round {} digest {:?} at {}",
+                round,
+                leader.header.digest(),
+                _ready_at
+            );
+        }
         let ordered = self.order_dag(&leader, state);
         #[cfg(feature = "benchmark")]
         {
             let ready_at = state.rule_ready_at_ms[&round];
             for certificate in &ordered {
                 if certificate.origin() != self.ordering_leader_authority(certificate.round()) {
-                    state
-                        .rule_order_ready_at
-                        .entry(certificate.header.digest())
-                        .or_insert(ready_at);
+                    let digest = certificate.header.digest();
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        state.rule_order_ready_at.entry(digest)
+                    {
+                        entry.insert(ready_at);
+                        info!(
+                            "Header rule-ordered round {} digest {:?}",
+                            certificate.round(),
+                            certificate.header.digest()
+                        );
+                    }
                 }
             }
         }
@@ -1675,6 +1684,13 @@ impl Consensus {
                     .map_or(true, |round| certificate.round() > *round)
             });
             let commit_rule = state.leader_commit_rules.remove(&ready_round).unwrap_or(3);
+            #[cfg(feature = "benchmark")]
+            info!(
+                "Commit rule stats leader {:?} rule {} outcome commit blocks {}",
+                leader.header.digest(),
+                commit_rule,
+                sequence.len()
+            );
             let _rule_ready_at_ms =
                 state
                     .rule_ready_at_ms
@@ -1689,50 +1705,17 @@ impl Consensus {
                 .duration_since(UNIX_EPOCH)
                 .expect("System clock is before Unix epoch")
                 .as_millis();
-            #[cfg(feature = "benchmark")]
-            {
-                let headers = sequence
-                    .iter()
-                    .map(|certificate| {
-                        let digest = certificate.header.digest();
-                        let is_leader = certificate.origin()
-                            == self.ordering_leader_authority(certificate.round());
-                        let ordered_at = if is_leader {
-                            _rule_ready_at_ms
-                        } else {
-                            state
-                                .rule_order_ready_at
-                                .remove(&digest)
-                                .unwrap_or(_rule_ready_at_ms)
-                        };
-                        format!(
-                            "{:?}@{}@{}",
-                            digest,
-                            ordered_at,
-                            if is_leader { 1 } else { 0 }
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                info!(
-                    "Leader outcome round {} digest {:?} rule {} outcome commit blocks {} ready_at {} commit_at {} headers {}",
-                    ready_round,
-                    leader.header.digest(),
-                    commit_rule,
-                    sequence.len(),
-                    _rule_ready_at_ms,
-                    _committed_at_ms,
-                    if headers.is_empty() {
-                        "-"
-                    } else {
-                        headers.as_str()
-                    }
-                );
-            }
             state.update(&sequence, self.gc_depth);
             for certificate in &sequence {
                 #[cfg(not(feature = "benchmark"))]
                 info!("Committed {}", certificate.header);
+                #[cfg(feature = "benchmark")]
+                info!(
+                    "Header committed round {} digest {:?} leader {}",
+                    certificate.round(),
+                    certificate.header.digest(),
+                    certificate.origin() == self.ordering_leader_authority(certificate.round())
+                );
                 #[cfg(feature = "benchmark")]
                 for digest in certificate.header.payload.keys() {
                     info!(
