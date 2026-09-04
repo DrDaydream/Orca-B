@@ -1,5 +1,6 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from fabric import task
+from invoke.exceptions import Exit
 
 from benchmark.local import LocalBench
 from benchmark.logs import ParseError, LogParser
@@ -88,6 +89,7 @@ def install(ctx):
         Bench(ctx).install()
     except BenchError as e:
         Print.error(e)
+        raise Exit(code=1)
 
 
 @task
