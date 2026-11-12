@@ -24,13 +24,15 @@ async fn mixed_aba_bypasses_a_full_core_queue_and_votes_are_forwarded_once() {
     };
     let batch =
         VoteBatch::from_votes(vec![votes(&proposal().header, GrbcPhase::Ready).remove(0)]).unwrap();
-    let message = PrimaryMessage::GrbcWithAba(
-        batch,
-        ConsensusNetworkMessage {
+    let echo =
+        VoteBatch::from_votes(vec![votes(&proposal().header, GrbcPhase::Echo).remove(0)]).unwrap();
+    let message = PrimaryMessage::Control(ControlFrame {
+        grbc: vec![echo, batch],
+        aba: Some(ConsensusNetworkMessage {
             author: keys()[0].0,
             messages: vec![vec![42]],
-        },
-    );
+        }),
+    });
     let bytes = bincode::serialize(&message).unwrap();
     let task =
         tokio::spawn(async move { handler.route(bincode::deserialize(&bytes).unwrap()).await });
@@ -47,19 +49,21 @@ async fn mixed_aba_bypasses_a_full_core_queue_and_votes_are_forwarded_once() {
     }
     assert!(!task.is_finished());
     core.recv().await.unwrap();
-    let input = timeout(Duration::from_secs(5), core.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    match input.message {
-        PrimaryMessage::GrbcVoteBatch(batch) => {
-            assert_eq!(batch.phase, GrbcPhase::Ready);
-            assert_eq!(batch.votes.len(), 1);
-            batch.into_votes()[0]
-                .verify(&crate::common::committee())
-                .unwrap();
+    for phase in [GrbcPhase::Echo, GrbcPhase::Ready] {
+        let input = timeout(Duration::from_secs(5), core.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match input.message {
+            PrimaryMessage::GrbcVoteBatch(batch) => {
+                assert_eq!(batch.phase, phase);
+                assert_eq!(batch.votes.len(), 1);
+                batch.into_votes()[0]
+                    .verify(&crate::common::committee())
+                    .unwrap();
+            }
+            _ => panic!("Expected GRBC votes after independent ABA delivery"),
         }
-        _ => panic!("Expected GRBC votes after independent ABA delivery"),
     }
     task.await.unwrap();
     assert!(core.try_recv().is_err());

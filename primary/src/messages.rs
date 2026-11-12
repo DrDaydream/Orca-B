@@ -290,6 +290,14 @@ pub struct GrbcVoteBatch {
     pub votes: Vec<(Digest, PublicKey, Signature)>,
 }
 
+/// Transport vector: each batch keeps its own round, phase and vote identities.
+/// A frame is neither a quorum proof nor an atomic protocol transition.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ControlFrame {
+    pub grbc: Vec<GrbcVoteBatch>,
+    pub aba: Option<ConsensusNetworkMessage>,
+}
+
 impl GrbcVoteBatch {
     pub fn from_votes(votes: Vec<GrbcVote>) -> Option<Self> {
         let first = votes.first()?;
