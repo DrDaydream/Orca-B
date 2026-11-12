@@ -56,7 +56,7 @@ async fn propose_payload() {
     let digest = Digest(name.0);
     let worker_id = 0;
     tx_our_digests
-        .send((digest.clone(), worker_id))
+        .send((digest.clone(), worker_id, 100))
         .await
         .unwrap();
 
@@ -107,4 +107,49 @@ async fn propose_grbc_edges() {
     assert!(header.weak_edges.contains(&weak));
     assert!(header.virtual_edges.contains(&virtual_edge));
     assert!(header.verify(&committee()).is_ok());
+}
+
+#[tokio::test]
+async fn payload_budget_keeps_remaining_batches_for_the_next_round() {
+    let (name, secret) = keys().pop().unwrap();
+    let (tx_parents, rx_parents) = channel(10);
+    let (tx_batches, rx_batches) = channel(10);
+    let (tx_headers, mut rx_headers) = channel(10);
+    Proposer::spawn(
+        name,
+        &committee(),
+        SignatureService::new(secret),
+        64,
+        50,
+        rx_parents,
+        rx_batches,
+        tx_headers,
+    );
+    let first = Digest([1; 32]);
+    let second = Digest([2; 32]);
+    tx_batches
+        .send((first.clone(), 0, MAX_PROPOSAL_BYTES / 2 + 1))
+        .await
+        .unwrap();
+    tx_batches
+        .send((second.clone(), 0, MAX_PROPOSAL_BYTES / 2 + 1))
+        .await
+        .unwrap();
+    let one = tokio::time::timeout(Duration::from_secs(2), rx_headers.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(one.payload.len(), 1);
+    assert!(one.payload.contains_key(&first));
+    tx_parents
+        .send((vec![Digest([3; 32])], vec![], vec![], 1))
+        .await
+        .unwrap();
+    let two = tokio::time::timeout(Duration::from_secs(2), rx_headers.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(two.round, 2);
+    assert_eq!(two.payload.len(), 1);
+    assert!(two.payload.contains_key(&second));
 }

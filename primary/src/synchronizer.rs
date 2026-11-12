@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::DagResult;
 use crate::header_waiter::WaiterMessage;
-use crate::messages::{Certificate, Header};
+use crate::messages::{proposal_key, Certificate, Header, Proposal};
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
@@ -88,7 +88,6 @@ impl Synchronizer {
     /// of the header for when we will have all the parents.
     pub async fn get_parents(&mut self, header: &Header) -> DagResult<Vec<Certificate>> {
         let mut missing_required = Vec::new();
-        let mut missing_weak = Vec::new();
         let mut missing_virtual = Vec::new();
         let mut parents = Vec::new();
         for digest in &header.parents {
@@ -108,54 +107,50 @@ impl Synchronizer {
             };
         }
         for digest in &header.weak_edges {
-            if self
+            if let Some((_, genesis)) = self
                 .genesis
                 .iter()
-                .any(|(candidate, _)| candidate == digest)
+                .find(|(candidate, _)| candidate == digest)
             {
+                parents.push(genesis.clone());
                 continue;
             }
             match self.store.read(digest.to_vec()).await? {
                 Some(certificate) => parents.push(bincode::deserialize(&certificate)?),
-                None => missing_weak.push(digest.clone()),
+                None => missing_required.push(digest.clone()),
             }
         }
         for digest in &header.virtual_edges {
-            if self
+            if let Some((_, genesis)) = self
                 .genesis
                 .iter()
-                .any(|(candidate, _)| candidate == digest)
+                .find(|(candidate, _)| candidate == digest)
             {
+                parents.push(genesis.clone());
                 continue;
             }
-            match self.store.read(digest.to_vec()).await? {
-                Some(certificate) => parents.push(bincode::deserialize(&certificate)?),
+            // Validate the target's signed metadata, not its local grade. One
+            // honest node reaching READY does not imply every peer can reach
+            // READY, so requiring a local grade here would block honest proposals.
+            match self.store.read(proposal_key(digest)).await? {
+                Some(proposal) => {
+                    parents.push(bincode::deserialize::<Proposal>(&proposal)?.block())
+                }
                 None => missing_virtual.push(digest.clone()),
             }
         }
-        let mut missing = missing_required.clone();
-        missing.extend(missing_weak);
-        if !missing.is_empty() {
+        if !missing_required.is_empty() || !missing_virtual.is_empty() {
             self.tx_header_waiter
-                .send(WaiterMessage::SyncParents(missing, header.clone()))
-                .await
-                .expect("Failed to send sync parents request");
-        }
-        if !missing_virtual.is_empty() {
-            self.tx_header_waiter
-                .send(WaiterMessage::SyncVirtual(
+                .send(WaiterMessage::SyncParents(
+                    missing_required,
                     missing_virtual,
-                    header.round,
-                    header.author,
+                    header.clone(),
                 ))
                 .await
-                .expect("Failed to send virtual-only sync request");
+                .expect("Failed to send sync parents request");
+            return Ok(Vec::new());
         }
-        if missing_required.is_empty() {
-            Ok(parents)
-        } else {
-            Ok(Vec::new())
-        }
+        Ok(parents)
     }
 
     /// Check whether we have all the ancestors of the certificate. If we don't, send the certificate to

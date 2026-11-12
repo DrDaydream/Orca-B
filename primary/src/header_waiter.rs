@@ -26,8 +26,63 @@ const TIMER_RESOLUTION: u64 = 1_000;
 #[derive(Debug)]
 pub enum WaiterMessage {
     SyncBatches(HashMap<Digest, WorkerId>, Header),
-    SyncParents(Vec<Digest>, Header),
-    SyncVirtual(Vec<Digest>, Round, PublicKey),
+    // Local FINISH records for strong/weak edges, complete proposals for virtual edges.
+    SyncParents(Vec<Digest>, Vec<Digest>, Header),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{committee, header, keys};
+    use crate::messages::proposal_key;
+
+    #[tokio::test]
+    async fn mixed_dependencies_resume_only_after_finish_and_proposal_arrive() {
+        let path = format!(".db_test_grbc_mixed_waiter_{}", std::process::id());
+        let mut store = Store::new(&path).unwrap();
+        let (tx_sync, rx_sync) = channel(10);
+        let (tx_core, mut rx_core) = channel(10);
+        HeaderWaiter::spawn(
+            keys()[0].0,
+            committee(),
+            store.clone(),
+            Arc::new(AtomicU64::new(0)),
+            50,
+            1000,
+            3,
+            rx_sync,
+            tx_core,
+        );
+        let mut h = header();
+        let strong = Digest([81; 32]);
+        let virtual_edge = Digest([82; 32]);
+        h.parents = [strong.clone()].iter().cloned().collect();
+        h.virtual_edges = [virtual_edge.clone()].iter().cloned().collect();
+        tx_sync
+            .send(WaiterMessage::SyncParents(
+                vec![strong.clone()],
+                vec![virtual_edge.clone()],
+                h.clone(),
+            ))
+            .await
+            .unwrap();
+        store.write(strong.to_vec(), vec![1]).await;
+        // A grade record is not the signed proposal needed for metadata checks.
+        store
+            .write(crate::messages::grade_one_key(&virtual_edge), vec![2])
+            .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), rx_core.recv())
+                .await
+                .is_err()
+        );
+        store.write(proposal_key(&virtual_edge), vec![3]).await;
+        let resumed = tokio::time::timeout(Duration::from_secs(2), rx_core.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.id, h.id);
+    }
 }
 
 /// Waits for missing parent certificates and batches' digests.
@@ -166,7 +221,7 @@ impl HeaderWaiter {
                             }
                             for (worker_id, digests) in requires_sync {
                                 let address = self.committee
-                                    .worker(&author, &worker_id)
+                                    .worker(&self.name, &worker_id)
                                     .expect("Author of valid header is not in the committee")
                                     .primary_to_worker;
                                 let message = PrimaryWorkerMessage::Synchronize(digests, author);
@@ -176,7 +231,7 @@ impl HeaderWaiter {
                             }
                         }
 
-                        WaiterMessage::SyncParents(missing, header) => {
+                        WaiterMessage::SyncParents(missing, missing_virtual, header) => {
                             debug!("Synching the parents of {}", header);
                             let header_id = header.id.clone();
                             let round = header.round;
@@ -191,8 +246,9 @@ impl HeaderWaiter {
                             // when all its parents are in the store.
                             let wait_for = missing
                                 .iter()
-                                .cloned()
                                 .map(|x| (x.to_vec(), self.store.clone()))
+                                .chain(missing_virtual.iter().map(|x|
+                                    (crate::messages::proposal_key(x), self.store.clone())))
                                 .collect();
                             let (tx_cancel, rx_cancel) = channel(1);
                             self.pending.insert(header_id, (round, tx_cancel));
@@ -213,24 +269,7 @@ impl HeaderWaiter {
                                     (round, now)
                                 });
                             }
-                            if !requires_sync.is_empty() {
-                                let address = self.committee
-                                    .primary(&author)
-                                    .expect("Author of valid header not in the committee")
-                                    .primary_to_primary;
-                                let message = PrimaryMessage::CertificatesRequest(requires_sync, self.name);
-                                let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                self.network.send(address, Bytes::from(bytes)).await;
-                            }
-                        }
-
-                        WaiterMessage::SyncVirtual(missing, round, author) => {
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .expect("Failed to measure time")
-                                .as_millis();
-                            let mut requires_sync = Vec::new();
-                            for digest in missing {
+                            for digest in missing_virtual {
                                 self.virtual_requests.entry(digest.clone()).or_insert_with(|| {
                                     requires_sync.push(digest);
                                     (round, now)
@@ -243,7 +282,7 @@ impl HeaderWaiter {
                                     .primary_to_primary;
                                 let message = PrimaryMessage::CertificatesRequest(requires_sync, self.name);
                                 let bytes = bincode::serialize(&message)
-                                    .expect("Failed to serialize virtual sync request");
+                                    .expect("Failed to serialize dependency sync request");
                                 self.network.send(address, Bytes::from(bytes)).await;
                             }
                         }
@@ -263,6 +302,7 @@ impl HeaderWaiter {
                             .chain(&header.virtual_edges)
                         {
                             let _ = self.parent_requests.remove(x);
+                            let _ = self.virtual_requests.remove(x);
                         }
                         self.tx_core.send(header).await.expect("Failed to send header");
                     },
@@ -293,7 +333,7 @@ impl HeaderWaiter {
                     }
                     let virtual_digests: Vec<_> = self.virtual_requests.keys().cloned().collect();
                     for digest in virtual_digests {
-                        if self.store.read(digest.to_vec()).await.ok().flatten().is_some() {
+                        if self.store.read(crate::messages::proposal_key(&digest)).await.ok().flatten().is_some() {
                             self.virtual_requests.remove(&digest);
                         } else if self.virtual_requests.get(&digest)
                             .map_or(false, |(_, timestamp)| timestamp + (self.sync_retry_delay as u128) < now)

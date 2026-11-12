@@ -6,8 +6,8 @@ use crate::garbage_collector::GarbageCollector;
 use crate::header_waiter::HeaderWaiter;
 use crate::helper::Helper;
 use crate::messages::{
-    Certificate, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GradeOneVote,
-    GradeOneVoteBatch as VoteBatch, Header,
+    batch_digest, batch_key, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GrbcVote,
+    GrbcVoteBatch as VoteBatch, Proposal, MAX_PROPOSAL_BYTES,
 };
 use crate::payload_receiver::PayloadReceiver;
 use crate::proposer::Proposer;
@@ -36,10 +36,9 @@ pub type Round = u64;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
-    Header(Header),
-    GradeOneVote(GradeOneVote),
-    GradeOneVoteBatch(VoteBatch),
-    Certificate(Certificate),
+    Proposal(Proposal),
+    GrbcVote(GrbcVote),
+    GrbcVoteBatch(VoteBatch),
     Consensus(ConsensusNetworkMessage),
     LeaderRequest(Round, PublicKey, /* requestor */ PublicKey),
     CertificatesRequest(Vec<Digest>, /* requestor */ PublicKey),
@@ -60,7 +59,7 @@ pub enum PrimaryWorkerMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerPrimaryMessage {
     /// The worker indicates it sealed a new batch.
-    OurBatch(Digest, WorkerId),
+    OurBatch(Vec<u8>, WorkerId),
     /// The worker indicates it received a batch's digest from another authority.
     OthersBatch(Digest, WorkerId),
 }
@@ -236,6 +235,7 @@ impl Primary {
             address,
             /* handler */
             WorkerReceiverHandler {
+                store: store.clone(),
                 tx_our_digests,
                 tx_others_digests,
             },
@@ -398,30 +398,36 @@ impl MessageHandler for PrimaryReceiverHandler {
 /// Defines how the network receiver handles incoming workers messages.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
-    tx_our_digests: Sender<(Digest, WorkerId)>,
+    store: Store,
+    tx_our_digests: Sender<(Digest, WorkerId, usize)>,
     tx_others_digests: Sender<(Digest, WorkerId)>,
 }
 
 #[async_trait]
 impl MessageHandler for WorkerReceiverHandler {
-    async fn dispatch(
-        &self,
-        _writer: &mut Writer,
-        serialized: Bytes,
-    ) -> Result<(), Box<dyn Error>> {
-        // Deserialize and parse the message.
+    async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id) => self
-                .tx_our_digests
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests"),
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => self
-                .tx_others_digests
-                .send((digest, worker_id))
-                .await
-                .expect("Failed to send workers' digests"),
+            WorkerPrimaryMessage::OurBatch(batch, worker_id) => {
+                if batch.len() > MAX_PROPOSAL_BYTES {
+                    return Err("batch exceeds complete-proposal payload limit".into());
+                }
+                let digest = batch_digest(&batch);
+                let size = batch.len();
+                let mut store = self.store.clone();
+                store.write(batch_key(&digest), batch).await;
+                self.tx_our_digests
+                    .send((digest, worker_id, size))
+                    .await
+                    .expect("Failed to send local batch");
+            }
+            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => {
+                self.tx_others_digests
+                    .send((digest, worker_id))
+                    .await
+                    .expect("Failed to send worker digest");
+            }
         }
+        let _ = writer.send(Bytes::from("Ack")).await;
         Ok(())
     }
 }

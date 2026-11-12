@@ -1,52 +1,53 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
-use crate::messages::{Certificate, GradeOneVote, Header};
+use crate::messages::{Certificate, GrbcPhase, GrbcVote, Header};
 use config::{Committee, Stake};
 use crypto::Hash as _;
-use crypto::{Digest, PublicKey, Signature};
+use crypto::{Digest, PublicKey};
 use std::collections::HashSet;
 
 #[cfg(test)]
 #[path = "tests/grbc_tests.rs"]
 pub mod grbc_tests;
 
-/// Aggregates votes for a particular header into a certificate.
-pub struct GradeOneVotesAggregator {
-    weight: Stake,
-    votes: Vec<(PublicKey, Signature)>,
-    used: HashSet<PublicKey>,
+/// Counts distinct authenticated senders independently for ECHO and READY.
+pub struct GrbcVotesAggregator {
+    echoes: HashSet<PublicKey>,
+    readies: HashSet<PublicKey>,
+    pub echo_weight: Stake,
+    pub ready_weight: Stake,
 }
 
-impl GradeOneVotesAggregator {
+impl GrbcVotesAggregator {
     pub fn new() -> Self {
         Self {
-            weight: 0,
-            votes: Vec::new(),
-            used: HashSet::new(),
+            echoes: HashSet::new(),
+            readies: HashSet::new(),
+            echo_weight: 0,
+            ready_weight: 0,
         }
     }
 
     pub fn append(
         &mut self,
-        vote: GradeOneVote,
+        vote: &GrbcVote,
         committee: &Committee,
         header: &Header,
-    ) -> DagResult<Option<Certificate>> {
-        let author = vote.author;
-
-        // Ensure it is the first time this authority votes.
-        ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
-
-        self.votes.push((author, vote.signature));
-        self.weight += committee.stake(&author);
-        if self.weight >= committee.quorum_threshold() {
-            self.weight = 0; // Ensures quorum is only reached once.
-            return Ok(Some(Certificate {
-                header: header.clone(),
-                votes: self.votes.clone(),
-            }));
+    ) -> DagResult<bool> {
+        ensure!(
+            vote.id == header.id && vote.round == header.round && vote.origin == header.author,
+            DagError::UnexpectedGradeOneVote(vote.id.clone())
+        );
+        vote.verify(committee)?;
+        let (used, weight) = match vote.phase {
+            GrbcPhase::Echo => (&mut self.echoes, &mut self.echo_weight),
+            GrbcPhase::Ready => (&mut self.readies, &mut self.ready_weight),
+        };
+        if !used.insert(vote.author) {
+            return Ok(false);
         }
-        Ok(None)
+        *weight += committee.stake(&vote.author);
+        Ok(true)
     }
 }
 

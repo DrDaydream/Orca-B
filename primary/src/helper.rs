@@ -1,4 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::messages::{local_votes_key, proposal_key, GrbcVote, Proposal};
 use crate::primary::PrimaryMessage;
 use bytes::Bytes;
 use config::Committee;
@@ -53,14 +54,28 @@ impl Helper {
 
             // Reply to the request (the best we can).
             for digest in digests {
-                match self.store.read(digest.to_vec()).await {
+                match self.store.read(proposal_key(&digest)).await {
                     Ok(Some(data)) => {
-                        // TODO: Remove this deserialization-serialization in the critical path.
-                        let certificate = bincode::deserialize(&data)
-                            .expect("Failed to deserialize our own certificate");
-                        let bytes = bincode::serialize(&PrimaryMessage::Certificate(certificate))
-                            .expect("Failed to serialize our own certificate");
+                        let proposal: Proposal = bincode::deserialize(&data)
+                            .expect("Failed to deserialize stored proposal");
+                        let bytes = bincode::serialize(&PrimaryMessage::Proposal(proposal))
+                            .expect("Failed to serialize proposal response");
                         self.network.send(address, Bytes::from(bytes)).await;
+                        if let Some(data) = self
+                            .store
+                            .read(local_votes_key(&digest))
+                            .await
+                            .ok()
+                            .flatten()
+                        {
+                            let votes: Vec<GrbcVote> = bincode::deserialize(&data)
+                                .expect("Failed to deserialize local votes");
+                            for vote in votes {
+                                let bytes =
+                                    bincode::serialize(&PrimaryMessage::GrbcVote(vote)).unwrap();
+                                self.network.send(address, Bytes::from(bytes)).await;
+                            }
+                        }
                     }
                     Ok(None) => (),
                     Err(e) => error!("{}", e),

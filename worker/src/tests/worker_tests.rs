@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
-use crate::common::{batch_digest, committee_with_base_port, keys, listener, transaction};
+use crate::common::{batch, committee_with_base_port, keys, listener, transaction};
 use network::SimpleSender;
 use primary::WorkerPrimaryMessage;
 use std::fs;
@@ -25,14 +25,14 @@ async fn handle_clients_transactions() {
 
     // Spawn a network listener to receive our batch's digest.
     let primary_address = committee.primary(&name).unwrap().worker_to_primary;
-    let expected = bincode::serialize(&WorkerPrimaryMessage::OurBatch(batch_digest(), id)).unwrap();
+    let expected = bincode::serialize(&WorkerPrimaryMessage::OurBatch(
+        bincode::serialize(&WorkerMessage::Batch(batch())).unwrap(),
+        id,
+    ))
+    .unwrap();
     let handle = listener(primary_address, Some(Bytes::from(expected)));
 
-    // Spawn enough workers' listeners to acknowledge our batches.
-    for (_, addresses) in committee.others_workers(&name, &id) {
-        let address = addresses.worker_to_worker;
-        let _ = listener(address, /* expected */ None);
-    }
+    // No peer workers are running: local batching must not wait for their ACKs.
 
     // Send enough transactions to create a batch.
     let mut network = SimpleSender::new();

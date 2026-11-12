@@ -19,7 +19,7 @@ mod synchronizer;
 mod common;
 
 pub use crate::messages::{
-    Certificate, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GradeOneVote,
-    GradeOneVoteBatch, Header,
+    Certificate, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GrbcPhase, GrbcVote,
+    GrbcVoteBatch, Header, Proposal, MAX_PROPOSAL_BYTES,
 };
 pub use crate::primary::{Primary, PrimaryWorkerMessage, Round, WorkerPrimaryMessage};
