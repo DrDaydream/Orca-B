@@ -54,7 +54,7 @@ impl Hash for ConsensusNetworkMessage {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Default, Eq, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Header {
     pub author: PublicKey,
     pub round: Round,

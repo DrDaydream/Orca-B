@@ -1,7 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
-use crate::messages::{Certificate, GrbcPhase, Header};
-use crate::verified_vote::VerifiedGrbcVote;
+use crate::messages::{Certificate, GrbcPhase, GrbcVote, Header};
 use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
@@ -31,7 +30,7 @@ impl GrbcVotesAggregator {
 
     pub fn append(
         &mut self,
-        vote: &VerifiedGrbcVote,
+        vote: &GrbcVote,
         committee: &Committee,
         header: &Header,
     ) -> DagResult<bool> {
@@ -39,6 +38,7 @@ impl GrbcVotesAggregator {
             vote.id == header.id && vote.round == header.round && vote.origin == header.author,
             DagError::UnexpectedGradeOneVote(vote.id.clone())
         );
+        vote.verify(committee)?;
         let (used, weight) = match vote.phase {
             GrbcPhase::Echo => (&mut self.echoes, &mut self.echo_weight),
             GrbcPhase::Ready => (&mut self.readies, &mut self.ready_weight),

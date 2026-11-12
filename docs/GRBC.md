@@ -11,8 +11,7 @@ primary vote/certificate dissemination with one complete-proposal protocol.
    does not broadcast to peer workers or spawn `QuorumWaiter`.
 2. **Proposer primary:** selects batches, fixes the author, round, payload
    digest/worker-id map, strong parents, weak edges and virtual edges, and
-   signs that header. A dedicated proposal task loads the bytes, validates and
-   stores the complete proposal, then broadcasts `Proposal`. This
+   signs that header. Core loads all bytes and broadcasts `Proposal`. This
    is the first cross-authority data transmission.
 3. **Every primary:** verifies the signed header and the exact payload digest
    map, retains the complete data, and checks the required DAG dependencies.
@@ -75,41 +74,6 @@ are unchanged. Legacy `orca-proposal-v2/` records are not migrated; run with fre
 experiment stores (`fab local` already resets them). This change does not by
 itself establish a measured throughput or latency improvement.
 
-### Validation reuse and independent vote transport
-
-Each incoming complete proposal passes header authentication, size/shape checks
-and all batch digest checks once in a dedicated proposal processor. Core receives
-an opaque stored-header result only after successful validation and atomic
-storage. Local proposals use the same validation path, without looping back
-through a second full verification. New network arrivals are still validated;
-matching an existing header ID never authenticates new payload bytes.
-
-Incoming votes are verified once and wrapped in an immutable authenticated type.
-The buffer and aggregator accept this type, so releasing buffered votes does not
-repeat signature verification. Locally signed votes enter directly. Counting
-still checks header ID, round, origin and distinct sender/phase. Duplicate votes
-do not rerun grade evaluation. Local FINISH records must match the entire cached
-authenticated header, including its body and signature, and satisfy the local
-dependency and READY-quorum checks; they no longer repeat header verification.
-
-ECHO and READY use a dedicated bounded queue, sender task and TCP connection per
-peer, separate from complete proposals and repair payloads. Both phases share
-the small-message transport; they are separate from bulk data, not separate
-from each other. READY is enqueued immediately after local grade-1 delivery.
-The sender coalesces only already queued votes from the same sender, round and
-phase, without a batching delay or waiting for another Core iteration. Repair
-votes use this sender too; Helper queues them before assembling the payload.
-Reliable send handles are retained until ACK or round GC.
-
-Receive-side proposal queues are separate from the vote/control queue. Local
-and remote proposal processing use separate consumers; expensive validation,
-hashing and serialization run outside Core on blocking tasks, with at most one
-validation job per consumer. Large network frames are also decoded outside the
-async runtime threads. Leader repair now delegates bulk data work to Helper.
-No listening ports, wire message formats or `fab local` settings are added.
-CPU, disk and physical network bandwidth remain shared, so this removes queue
-and connection contention with payloads without guaranteeing latency or TPS.
-
 The worker and primary remain separate executables. Their cross-authority
 dissemination responsibilities are combined into the primary's GRBC path;
 this change does not combine their processes. Legacy worker sync/helper and
@@ -166,7 +130,7 @@ recovery, missing causal history, and the separate GRBC voting gates.
 ## Reproduce validation
 
 ```sh
-cargo test -p crypto -p store -p primary -p worker -p consensus -- --test-threads=1
+cargo test -p store -p primary -p worker -p consensus -- --test-threads=1
 cargo build -p node --features benchmark
 python3 scripts/grbc_smoke.py --scenario all
 python3 scripts/grbc_smoke.py --scenario silent
@@ -194,14 +158,3 @@ feature. Real-process checks pass for all nodes online (706 common blocks),
 one absent node (538 common blocks), and a late node (1047 common blocks,
 7 rounds behind at shutdown with sustained progress). These functional checks
 do not measure performance or establish adversarial safety.
-
-The validation/transport optimization passes 82 unit tests: crypto 7, primary
-35, store 5, worker 9 and consensus 26, plus doctest checks. New regressions
-cover forged votes before proposal arrival, changed payload bytes carrying a
-known header, and ECHO/READY delivery while a 512 KiB proposal is blocked on a
-full bulk queue. Recovery checks require data and votes on separate connections.
-The benchmark-feature node builds. Real-process checks pass with 709 common
-blocks for all nodes online, 547 with one absent node, and 1166 with a node
-starting three seconds late (20-second run, all nodes at round 321 at shutdown).
-These checks use the same Windows/Rust/RocksDB environment described above;
-Ubuntu 24.04 throughput and latency remain unmeasured.

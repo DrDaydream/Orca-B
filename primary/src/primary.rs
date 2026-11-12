@@ -10,10 +10,8 @@ use crate::messages::{
     GrbcVoteBatch as VoteBatch, Proposal, MAX_PROPOSAL_BYTES,
 };
 use crate::payload_receiver::PayloadReceiver;
-use crate::proposal_processor::spawn_proposal_processors;
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
-use crate::vote_sender::spawn_vote_sender;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, KeyPair, Parameters, WorkerId};
@@ -32,10 +30,6 @@ use tokio::time::{sleep, Duration};
 
 /// The default channel capacity for each channel of the primary.
 pub const CHANNEL_CAPACITY: usize = 1_000;
-
-#[cfg(test)]
-#[path = "tests/vote_transport_tests.rs"]
-mod vote_transport_tests;
 
 /// The round number.
 pub type Round = u64;
@@ -126,10 +120,6 @@ impl Primary {
         let (tx_headers_loopback, rx_headers_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_certificates_loopback, rx_certificates_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
-        // Bound resident bulk data independently from the small control messages.
-        let (tx_remote_proposals, rx_remote_proposals) = channel(32);
-        let (tx_stored_proposals, rx_stored_proposals) = channel(CHANNEL_CAPACITY);
-        let (tx_votes, rx_votes) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_consensus_commands, rx_consensus_commands) = channel(CHANNEL_CAPACITY);
         let (tx_aba_broadcast, rx_aba_broadcast) = channel(CHANNEL_CAPACITY);
@@ -212,8 +202,7 @@ impl Primary {
             /* handler */
             PrimaryReceiverHandler {
                 tx_primary_messages,
-                tx_remote_proposals,
-                tx_cert_requests: tx_cert_requests.clone(),
+                tx_cert_requests,
             },
         );
         info!(
@@ -274,25 +263,7 @@ impl Primary {
             rx_aba_broadcast,
         );
 
-        spawn_vote_sender(
-            name,
-            committee.clone(),
-            consensus_round.clone(),
-            parameters.gc_depth,
-            rx_votes,
-        );
-        spawn_proposal_processors(
-            name,
-            committee.clone(),
-            store.clone(),
-            consensus_round.clone(),
-            parameters.gc_depth,
-            rx_remote_proposals,
-            rx_headers,
-            tx_stored_proposals,
-        );
-
-        // Core handles compact validated headers and GRBC votes.
+        // The `Core` receives and handles headers, votes, and certificates from the other primaries.
         Core::spawn(
             name,
             committee.clone(),
@@ -304,9 +275,7 @@ impl Primary {
             /* rx_primaries */ rx_primary_messages,
             /* rx_header_waiter */ rx_headers_loopback,
             /* rx_certificate_waiter */ rx_certificates_loopback,
-            rx_stored_proposals,
-            tx_votes.clone(),
-            tx_cert_requests,
+            /* rx_proposer */ rx_headers,
             tx_consensus,
             /* tx_proposer */ tx_parents,
             rx_consensus_commands,
@@ -355,7 +324,7 @@ impl Primary {
         );
 
         // The `Helper` is dedicated to reply to certificates requests from other primaries.
-        Helper::spawn(committee.clone(), store, rx_cert_requests, tx_votes);
+        Helper::spawn(committee.clone(), store, rx_cert_requests);
 
         // NOTE: This log entry is used to compute performance.
         info!(
@@ -374,7 +343,6 @@ impl Primary {
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
-    tx_remote_proposals: Sender<Proposal>,
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
 }
 
@@ -410,20 +378,8 @@ impl MessageHandler for PrimaryReceiverHandler {
         // Reply with an ACK.
         let _ = writer.send(Bytes::from("Ack")).await;
 
-        // Large frames decode away from runtime threads. Independent TCP
-        // connections and queues let votes bypass a full bulk proposal queue.
-        let message = if serialized.len() > 64 * 1024 {
-            tokio::task::spawn_blocking(move || bincode::deserialize::<PrimaryMessage>(&serialized))
-                .await??
-        } else {
-            bincode::deserialize(&serialized).map_err(DagError::SerializationError)?
-        };
-        match message {
-            PrimaryMessage::Proposal(proposal) => self
-                .tx_remote_proposals
-                .send(proposal)
-                .await
-                .expect("Failed to enqueue remote proposal"),
+        // Deserialize and parse the message.
+        match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
             PrimaryMessage::CertificatesRequest(missing, requestor) => self
                 .tx_cert_requests
                 .send((missing, requestor))

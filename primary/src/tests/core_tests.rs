@@ -1,15 +1,12 @@
 use super::*;
 use crate::common::{committee, keys, proposal, votes};
-use crate::messages::{batch_key, proposal_header_key, GrbcVoteBatch};
+use crate::messages::{batch_key, proposal_header_key};
 use crypto::Signature;
-use std::collections::BTreeMap;
 use tokio::sync::mpsc::channel;
 
 struct Harness {
     core: Core,
     events: Receiver<ConsensusMessage>,
-    outgoing: Receiver<VoteDispatch>,
-    _repairs: Receiver<(Vec<Digest>, PublicKey)>,
     _parents: Receiver<ProposerMessage>,
     _headers: Receiver<crate::header_waiter::WaiterMessage>,
     _certs: Receiver<Certificate>,
@@ -26,8 +23,6 @@ impl Harness {
         let sync = Synchronizer::new(name, &c, store.clone(), tx_headers, tx_certs);
         let (tx_events, events) = channel(100);
         let (tx_parents, parents) = channel(100);
-        let (tx_votes, outgoing) = channel(100);
-        let (tx_repairs, repairs) = channel(100);
         Self {
             core: Core {
                 name,
@@ -40,15 +35,14 @@ impl Harness {
                 rx_primaries: channel(1).1,
                 rx_header_waiter: channel(1).1,
                 rx_certificate_waiter: channel(1).1,
-                rx_proposals: channel(1).1,
-                tx_votes,
-                tx_cert_requests: tx_repairs,
+                rx_proposer: channel(1).1,
                 tx_consensus: tx_events,
                 tx_proposer: tx_parents,
                 rx_consensus: channel(1).1,
                 gc_round: 0,
                 last_voted: HashMap::new(),
                 processing: HashMap::new(),
+                current_header: Header::default(),
                 votes_aggregators: HashMap::new(),
                 observed_headers: HashMap::new(),
                 proposal_headers: HashMap::new(),
@@ -57,6 +51,7 @@ impl Harness {
                 local_votes: HashMap::new(),
                 missing_proposals: HashMap::new(),
                 pending_votes: HashMap::new(),
+                vote_outbox: Vec::new(),
                 certificates_aggregators: HashMap::new(),
                 grade_one_certificates: HashMap::new(),
                 grbc_certificates: HashMap::new(),
@@ -67,20 +62,10 @@ impl Harness {
                 cancel_handlers: HashMap::new(),
             },
             events,
-            outgoing,
-            _repairs: repairs,
             _parents: parents,
             _headers: headers,
             _certs: certs,
         }
-    }
-
-    fn outgoing(&mut self) -> Vec<GrbcVote> {
-        let mut votes = Vec::new();
-        while let Ok(dispatch) = self.outgoing.try_recv() {
-            votes.extend(dispatch.votes);
-        }
-        votes
     }
 
     fn grades(&mut self) -> Vec<u8> {
@@ -116,7 +101,8 @@ async fn echo_quorum_delivers_ready_but_never_finish() {
     assert_eq!(h.grades(), vec![1]);
     assert!(h.core.grade_two.is_empty());
     assert_eq!(
-        h.outgoing()
+        h.core
+            .vote_outbox
             .iter()
             .filter(|v| v.phase == GrbcPhase::Ready)
             .count(),
@@ -205,9 +191,8 @@ async fn equivocation_does_not_produce_two_honest_echoes() {
     other.header.signature = Signature::new(&other.header.id, &keys().pop().unwrap().1);
     h.core.process_proposal(p.clone()).await.unwrap();
     h.core.process_proposal(other).await.unwrap();
-    let outgoing = h.outgoing();
-    assert_eq!(outgoing.len(), 1);
-    assert_eq!(outgoing[0].id, p.header.id);
+    assert_eq!(h.core.vote_outbox.len(), 1);
+    assert_eq!(h.core.vote_outbox[0].id, p.header.id);
     assert!(h.grades().is_empty());
 }
 
@@ -219,7 +204,7 @@ async fn malformed_or_missing_data_cannot_trigger_echo() {
     p.header.id = p.header.digest();
     p.header.signature = Signature::new(&p.header.id, &keys().pop().unwrap().1);
     assert!(h.core.process_proposal(p).await.is_err());
-    assert!(h.outgoing().is_empty());
+    assert!(h.core.vote_outbox.is_empty());
     assert!(h.grades().is_empty());
 }
 
@@ -243,7 +228,7 @@ async fn honest_nodes_finish_when_proposer_stops_after_propose() {
     for _ in 0..3 {
         let mut messages = Vec::new();
         for node in &mut nodes {
-            messages.extend(node.outgoing());
+            messages.extend(std::mem::take(&mut node.core.vote_outbox));
         }
         for vote in messages.into_iter().rev() {
             for node in &mut nodes {
@@ -297,7 +282,7 @@ async fn complete_payloads_progress_across_rounds_using_local_finish_parents() {
             let mut messages = Vec::new();
             for node in &mut nodes {
                 let mut grouped = BTreeMap::<GrbcPhase, Vec<GrbcVote>>::new();
-                for vote in node.outgoing() {
+                for vote in std::mem::take(&mut node.core.vote_outbox) {
                     grouped.entry(vote.phase).or_default().push(vote);
                 }
                 for votes in grouped.into_values() {
@@ -376,7 +361,7 @@ async fn invalid_parent_quorum_cannot_trigger_echo() {
         h.events.try_recv().unwrap(),
         ConsensusMessage::Observed(_)
     ));
-    assert!(h.outgoing().is_empty());
+    assert!(h.core.vote_outbox.is_empty());
 }
 
 #[tokio::test]
@@ -392,7 +377,7 @@ async fn genesis_weak_edge_cannot_skip_round_validation() {
         h.events.try_recv().unwrap(),
         ConsensusMessage::Observed(_)
     ));
-    assert!(h.outgoing().is_empty());
+    assert!(h.core.vote_outbox.is_empty());
 }
 
 #[tokio::test]
@@ -408,7 +393,7 @@ async fn delayed_weak_edge_is_checked_before_echo() {
         h.events.try_recv().unwrap(),
         ConsensusMessage::Observed(_)
     ));
-    assert!(h.outgoing().is_empty());
+    assert!(h.core.vote_outbox.is_empty());
     h.core
         .store
         .write(
@@ -418,7 +403,7 @@ async fn delayed_weak_edge_is_checked_before_echo() {
         .await;
     assert!(h.core.process_header(&p.header).await.is_err());
     assert!(h.events.try_recv().is_err());
-    assert!(h.outgoing().is_empty());
+    assert!(h.core.vote_outbox.is_empty());
 }
 
 #[tokio::test]
@@ -434,7 +419,7 @@ async fn delayed_virtual_edge_is_checked_before_echo() {
         h.events.try_recv().unwrap(),
         ConsensusMessage::Observed(_)
     ));
-    assert!(h.outgoing().is_empty());
+    assert!(h.core.vote_outbox.is_empty());
     h.core
         .store
         .write(
@@ -444,7 +429,7 @@ async fn delayed_virtual_edge_is_checked_before_echo() {
         .await;
     assert!(h.core.process_header(&p.header).await.is_err());
     assert!(h.events.try_recv().is_err());
-    assert!(h.outgoing().is_empty());
+    assert!(h.core.vote_outbox.is_empty());
 }
 
 #[tokio::test]
@@ -460,24 +445,6 @@ async fn local_completion_cannot_replace_a_validated_header_body() {
     forged.header.round += 1;
     assert!(h.core.process_certificate(forged).await.is_err());
     assert!(h.events.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn forged_vote_cannot_poison_the_authenticated_vote_buffer() {
-    let mut h = Harness::new("forged_buffer", 0);
-    let p = proposal();
-    let vote = votes(&p.header, GrbcPhase::Ready).remove(1);
-    let mut forged = vote.clone();
-    forged.signature = Signature::default();
-    assert!(h.core.process_grbc_vote(forged).await.is_err());
-    assert!(h.core.pending_votes.is_empty());
-    assert!(h.core.missing_proposals.is_empty());
-    h.core.process_grbc_vote(vote.clone()).await.unwrap();
-    h.core.process_grbc_vote(vote).await.unwrap();
-    assert_eq!(h.core.pending_votes[&p.header.id].len(), 1);
-    h.core.process_proposal(p.clone()).await.unwrap();
-    assert_eq!(h.core.votes_aggregators[&p.header.id].ready_weight, 1);
-    assert!(h.grades().is_empty());
 }
 
 #[tokio::test]
@@ -517,7 +484,7 @@ async fn virtual_metadata_recovers_without_requiring_a_local_ready_grade() {
         h.events.try_recv().unwrap(),
         ConsensusMessage::Observed(_)
     ));
-    assert!(h.outgoing().is_empty());
+    assert!(h.core.vote_outbox.is_empty());
     for vote in votes(&p.header, GrbcPhase::Ready).into_iter().skip(1) {
         h.core.process_grbc_vote(vote).await.unwrap();
     }
