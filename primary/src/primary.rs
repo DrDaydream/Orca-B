@@ -74,7 +74,7 @@ impl Primary {
         store: Store,
         tx_consensus: Sender<ConsensusMessage>,
         mut rx_consensus: Receiver<ConsensusCommand>,
-    ) {
+    ) -> Sender<ControlMessage> {
         let (tx_others_digests, rx_others_digests) = channel(CHANNEL_CAPACITY);
         let (tx_our_digests, rx_our_digests) = channel(CHANNEL_CAPACITY);
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
@@ -88,7 +88,6 @@ impl Primary {
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_consensus_commands, rx_consensus_commands) = channel(CHANNEL_CAPACITY);
         let (tx_control, rx_control) = channel(CHANNEL_CAPACITY);
-        let tx_aba = tx_control.clone();
         let name = keypair.name;
         let (tx_cleanup, rx_cleanup) = channel(CHANNEL_CAPACITY);
 
@@ -107,13 +106,6 @@ impl Primary {
                                 .expect("Failed to send cleanup batch");
                         }
                     }
-                    ConsensusCommand::AbaBroadcast(messages) => tx_aba
-                        .send(ControlMessage::Aba(ConsensusNetworkMessage {
-                            author: name,
-                            messages,
-                        }))
-                        .await
-                        .expect("Failed to send ABA batch"),
                     command => tx_consensus_commands
                         .send(command)
                         .await
@@ -223,7 +215,7 @@ impl Primary {
             tx_consensus,
             /* tx_proposer */ tx_parents,
             rx_consensus_commands,
-            tx_control,
+            tx_control.clone(),
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
@@ -281,6 +273,8 @@ impl Primary {
                 .primary_to_primary
                 .ip()
         );
+        // Bypass cleanup/repair feedback when consensus emits ABA messages.
+        tx_control
     }
 }
 

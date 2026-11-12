@@ -3,7 +3,9 @@ use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{debug, info, log_enabled, warn};
-use primary::{Certificate, ConsensusCommand, ConsensusMessage, Round};
+use primary::{
+    Certificate, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, ControlMessage, Round,
+};
 use std::cmp::max;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -104,8 +106,6 @@ struct State {
     dirty_aba_instances: HashSet<Round>,
     /// Newly delivered grade-2 support indexed by the leader it can affect.
     pending_aba_evidence: HashMap<Round, HashSet<Digest>>,
-    /// ABA broadcasts accumulated during one consensus ingress batch.
-    aba_outbox: Vec<AbaMessage>,
     /// Missing decided leaders and their next rate-limited retry deadline.
     missing_leader_requests: HashMap<Round, Instant>,
     /// Leaders made commit-ready directly by rules 1 or 2. ABA can help
@@ -199,7 +199,6 @@ impl State {
             buffered_aba: HashMap::new(),
             dirty_aba_instances: HashSet::new(),
             pending_aba_evidence: HashMap::new(),
-            aba_outbox: Vec::new(),
             missing_leader_requests: HashMap::new(),
             direct_commit_ready: HashSet::new(),
             zero_input_checked_through: 0,
@@ -638,6 +637,8 @@ pub struct Consensus {
     rx_primary: Receiver<ConsensusMessage>,
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
     tx_primary: Sender<ConsensusCommand>,
+    /// Direct input to the shared GRBC/ABA sender, independent of cleanup.
+    tx_control: Sender<ControlMessage>,
     /// Outputs the sequence of ordered certificates to the application layer.
     tx_output: OutputSender,
 
@@ -714,6 +715,7 @@ impl Consensus {
         gc_depth: Round,
         rx_primary: Receiver<ConsensusMessage>,
         tx_primary: Sender<ConsensusCommand>,
+        tx_control: Sender<ControlMessage>,
         tx_output: Sender<Certificate>,
     ) {
         tokio::spawn(async move {
@@ -723,6 +725,7 @@ impl Consensus {
                 gc_depth,
                 rx_primary,
                 tx_primary,
+                tx_control,
                 tx_output: OutputSender::Individual(tx_output),
                 genesis: Certificate::genesis(&committee),
             }
@@ -740,6 +743,7 @@ impl Consensus {
         gc_depth: Round,
         rx_primary: Receiver<ConsensusMessage>,
         tx_primary: Sender<ConsensusCommand>,
+        tx_control: Sender<ControlMessage>,
         tx_output: Sender<Vec<Certificate>>,
     ) {
         tokio::spawn(async move {
@@ -749,6 +753,7 @@ impl Consensus {
                 gc_depth,
                 rx_primary,
                 tx_primary,
+                tx_control,
                 tx_output: OutputSender::Batch(tx_output),
                 genesis: Certificate::genesis(&committee),
             }
@@ -815,7 +820,6 @@ impl Consensus {
                 if round > state.highest_entered_round {
                     state.highest_entered_round = round;
                     self.input_zero_at_round_end(round, &mut state).await;
-                    self.flush_aba_outbox(&mut state).await;
                 }
                 continue;
             }
@@ -858,7 +862,6 @@ impl Consensus {
                     ConsensusMessage::Aba(sender, bytes) => {
                         self.process_aba_payload(sender, &bytes, &mut state).await;
                         self.process_dirty_aba_instances(&mut state).await;
-                        self.flush_aba_outbox(&mut state).await;
                         continue;
                     }
                     ConsensusMessage::AbaBatch(sender, batch) => {
@@ -866,7 +869,6 @@ impl Consensus {
                             self.process_aba_payload(sender, &bytes, &mut state).await;
                         }
                         self.process_dirty_aba_instances(&mut state).await;
-                        self.flush_aba_outbox(&mut state).await;
                         continue;
                     }
                 };
@@ -914,22 +916,7 @@ impl Consensus {
             }
             self.resolve_requested_leaders(&mut state).await;
             self.process_dirty_aba_instances(&mut state).await;
-            self.flush_aba_outbox(&mut state).await;
         }
-    }
-
-    async fn flush_aba_outbox(&mut self, state: &mut State) {
-        if state.aba_outbox.is_empty() {
-            return;
-        }
-        // Serialize one compact vector per ingress batch rather than wrapping
-        // every ABA message in its own independently serialized allocation.
-        let messages = std::mem::take(&mut state.aba_outbox);
-        let batch = vec![bincode::serialize(&messages).expect("Failed to serialize ABA batch")];
-        self.tx_primary
-            .send(ConsensusCommand::AbaBroadcast(batch))
-            .await
-            .expect("Failed to send ABA batch to primary");
     }
 
     async fn ensure_aba_instance(&mut self, leader_round: Round, state: &mut State) {
@@ -1027,30 +1014,46 @@ impl Consensus {
         actions: Vec<AbaAction>,
         state: &mut State,
     ) {
+        let mut broadcasts = Vec::with_capacity(actions.len());
+        // A transition can report this instance's first decision at most once.
+        let mut decision = None;
         for action in actions {
             match action {
-                AbaAction::Broadcast(message) => {
-                    state.aba_outbox.push(message);
+                AbaAction::Broadcast(message) => broadcasts.push(message),
+                AbaAction::Decide(value) => decision = Some(value),
+            }
+        }
+        if !broadcasts.is_empty() {
+            // Send the whole transition once, including DECIDE and any next-round
+            // BVAL, before local rule checks, history recovery or commit output.
+            // The existing control sender coalesces other ready transitions.
+            let messages =
+                vec![bincode::serialize(&broadcasts).expect("Failed to serialize ABA batch")];
+            self.tx_control
+                .send(ControlMessage::Aba(ConsensusNetworkMessage {
+                    author: self.name,
+                    messages,
+                }))
+                .await
+                .expect("Failed to send ABA batch to control sender");
+        }
+        if let Some(value) = decision {
+            // ABA is the cold-path trigger for an older leader. Before
+            // applying its output, perform one final targeted scan of
+            // that leader's rule-1 and rule-2 support rounds. A direct
+            // rule result retains precedence over ABA 0.
+            Box::pin(self.evaluate_commit_rule_one(leader_round + 1, state, false)).await;
+            Box::pin(self.evaluate_commit_rule_two(leader_round + 2, state, false)).await;
+            if state.aba_decisions.insert(leader_round, value).is_none() {
+                if let Some(started_at) = state.aba_started_at.remove(&leader_round) {
+                    #[cfg(feature = "benchmark")]
+                    info!(
+                        "ABA duration round {} ms {}",
+                        leader_round,
+                        started_at.elapsed().as_millis()
+                    );
                 }
-                AbaAction::Decide(value) => {
-                    // ABA is the cold-path trigger for an older leader. Before
-                    // applying its output, perform one final targeted scan of
-                    // that leader's rule-1 and rule-2 support rounds. A direct
-                    // rule result retains precedence over ABA 0.
-                    Box::pin(self.evaluate_commit_rule_one(leader_round + 1, state, false)).await;
-                    Box::pin(self.evaluate_commit_rule_two(leader_round + 2, state, false)).await;
-                    if state.aba_decisions.insert(leader_round, value).is_none() {
-                        if let Some(started_at) = state.aba_started_at.remove(&leader_round) {
-                            #[cfg(feature = "benchmark")]
-                            info!(
-                                "ABA duration round {} ms {}",
-                                leader_round,
-                                started_at.elapsed().as_millis()
-                            );
-                        }
-                        self.apply_aba_decision(leader_round, value, state).await;
-                    }
-                }
+                self.apply_aba_decision(leader_round, value, state).await;
             }
         }
         // DECIDE collects f+1 distinct senders (trusted by the experimental

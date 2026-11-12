@@ -22,6 +22,7 @@ mod verified_vote;
 #[path = "tests/common.rs"]
 mod common;
 
+pub use crate::control_broadcaster::ControlMessage;
 pub use crate::messages::{
     Certificate, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GrbcPhase, GrbcVote,
     GrbcVoteBatch, Header, Proposal, MAX_PROPOSAL_BYTES,

@@ -238,9 +238,6 @@ impl Core {
     async fn process_consensus_command(&mut self, command: ConsensusCommand) -> DagResult<()> {
         match command {
             ConsensusCommand::Cleanup(_) | ConsensusCommand::CleanupBatch(_) => unreachable!(),
-            ConsensusCommand::AbaBroadcast(_) => {
-                unreachable!("ABA broadcasts use the dedicated broadcaster")
-            }
             ConsensusCommand::LeaderRequest(round, leader) => {
                 let addresses = self
                     .committee
@@ -576,6 +573,9 @@ impl Core {
     }
 
     async fn flush_grbc_outboxes(&mut self) {
+        if self.vote_outbox.is_empty() {
+            return;
+        }
         let mut grouped = BTreeMap::<(Round, GrbcPhase), Vec<GrbcVote>>::new();
         for vote in std::mem::take(&mut self.vote_outbox) {
             grouped
@@ -583,16 +583,14 @@ impl Core {
                 .or_default()
                 .push(vote);
         }
-        if !grouped.is_empty() {
-            let batches = grouped
-                .into_values()
-                .map(|votes| GrbcVoteBatch::from_votes(votes).expect("Mixed local GRBC votes"))
-                .collect();
-            self.tx_control
-                .send(ControlMessage::Votes(batches))
-                .await
-                .expect("Failed to send GRBC batches");
-        }
+        let batches = grouped
+            .into_values()
+            .map(|votes| GrbcVoteBatch::from_votes(votes).expect("Mixed local GRBC votes"))
+            .collect();
+        self.tx_control
+            .send(ControlMessage::Votes(batches))
+            .await
+            .expect("Failed to send GRBC batches");
     }
 
     async fn broadcast_grbc_batch(&mut self, message: PrimaryMessage, round: Round) {
@@ -703,7 +701,12 @@ impl Core {
 
     async fn process_primary_message(&mut self, message: PrimaryMessage) -> DagResult<()> {
         match message {
-            PrimaryMessage::Proposal(proposal) => self.process_proposal(proposal).await,
+            PrimaryMessage::Proposal(proposal) => {
+                // A hot ingress burst may mix votes with large proposals. Send
+                // accumulated votes before verifying/storing the next payload.
+                self.flush_grbc_outboxes().await;
+                self.process_proposal(proposal).await
+            }
             PrimaryMessage::GrbcVote(vote) => self.process_grbc_vote(vote).await,
             PrimaryMessage::GrbcVoteBatch(batch) => {
                 for vote in batch.into_votes() {
