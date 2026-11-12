@@ -20,6 +20,7 @@ pub struct Helper {
     rx_primaries: Receiver<(Vec<Digest>, PublicKey)>,
     /// A network sender to reply to the sync requests.
     network: SimpleSender,
+    vote_network: SimpleSender,
 }
 
 impl Helper {
@@ -34,6 +35,7 @@ impl Helper {
                 store,
                 rx_primaries,
                 network: SimpleSender::new(),
+                vote_network: SimpleSender::new(),
             }
             .run()
             .await;
@@ -55,26 +57,25 @@ impl Helper {
 
             // Reply to the request (the best we can).
             for digest in digests {
+                if let Some(data) = self
+                    .store
+                    .read(local_votes_key(&digest))
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    let votes: Vec<GrbcVote> =
+                        bincode::deserialize(&data).expect("Failed to deserialize local votes");
+                    for vote in votes {
+                        let bytes = bincode::serialize(&PrimaryMessage::GrbcVote(vote)).unwrap();
+                        self.vote_network.send(address, Bytes::from(bytes)).await;
+                    }
+                }
                 match load_proposal(&mut self.store, &digest).await {
                     Ok(Some(proposal)) => {
                         let bytes = bincode::serialize(&PrimaryMessage::Proposal(proposal))
                             .expect("Failed to serialize proposal response");
                         self.network.send(address, Bytes::from(bytes)).await;
-                        if let Some(data) = self
-                            .store
-                            .read(local_votes_key(&digest))
-                            .await
-                            .ok()
-                            .flatten()
-                        {
-                            let votes: Vec<GrbcVote> = bincode::deserialize(&data)
-                                .expect("Failed to deserialize local votes");
-                            for vote in votes {
-                                let bytes =
-                                    bincode::serialize(&PrimaryMessage::GrbcVote(vote)).unwrap();
-                                self.network.send(address, Bytes::from(bytes)).await;
-                            }
-                        }
                     }
                     Ok(None) => (),
                     Err(e) => error!("{}", e),

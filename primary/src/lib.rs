@@ -11,9 +11,11 @@ mod helper;
 mod messages;
 mod payload_receiver;
 mod primary;
+mod proposal_repair;
 mod proposal_store;
 mod proposer;
 mod synchronizer;
+mod verified_vote;
 
 #[cfg(test)]
 #[path = "tests/common.rs"]

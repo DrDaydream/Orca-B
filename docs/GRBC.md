@@ -39,8 +39,8 @@ Each honest process sends at most one ECHO and one READY per instance.
   delivery record. Production grade records have an empty `votes` vector.
 - Recovery returns a complete proposal plus the responding node's own votes.
   The requester must assemble its own local counts; it cannot import a
-  remote FINISH assertion. Votes received before data are buffered and cause
-  proposal requests, with retries.
+  remote FINISH assertion. Votes received before data are buffered; missing-data
+  requests use a short arrival-order grace and bounded retries as described below.
 - Grade-1 records use `orca-ready-v2/`; payloads and local votes also have
   separate `v2` key prefixes. Strong/weak dependency checks
   before ECHO require local FINISH records. Virtual targets require their
@@ -73,6 +73,47 @@ store remains separate. Network Proposal/ECHO/READY formats and quorum threshold
 are unchanged. Legacy `orca-proposal-v2/` records are not migrated; run with fresh
 experiment stores (`fab local` already resets them). This change does not by
 itself establish a measured throughput or latency improvement.
+
+### Batched votes and bounded proposal repair
+
+The previous task-per-message transport optimization was reverted before this
+revision. The implementation again uses Core's original bounded input bursts
+(up to 32 messages) and outbox grouping by round/phase. There is no added
+per-vote sender task, per-proposal processing queue or blocking-pool handoff.
+Separate persistent sender instances keep complete proposals and small votes
+on different TCP connections to the existing primary port. Helper also uses
+separate data and vote connections. Independent transport does not isolate CPU
+work: proposal validation and voting still share the Core execution loop.
+
+For local proposals, Core assembles and verifies the full data once, enqueues
+the serialized proposal for broadcast, then awaits the local atomic storage
+operation. Transmission can overlap that write. Local ECHO still requires the
+complete data to be stored and DAG dependencies to pass. Serialization borrows
+the proposal wrapper instead of cloning all batch buffers.
+
+A vote that overtakes data no longer triggers an immediate committee-wide
+request. It creates one pending repair with a 50 ms initial grace. This grace
+delays only a missing-data request, never delivery or voting for available data.
+Decoded proposals are marked before entering Core's queue; a guard removes the
+marker on completion, invalid data, or a dropped queue item. Queued/processing
+data can defer repair, but not beyond a one-second bound from the first missing
+vote. Repeated arrivals and votes cannot renew the bound indefinitely. Partial
+network frames have no decoded header ID, so they are covered by the initial
+grace rather than this marker.
+
+If data is still absent, the first request goes to the authenticated voter that
+announced it. After one second without data, retries fan out to the committee.
+Receiving a valid full proposal cancels the pending repair. These timers are
+recovery scheduling only; they do not weaken data validation or quorum gates.
+This avoids normal arrival-order differences provoking many full-payload replies,
+while retaining recovery when data is truly missing or the first peer is silent.
+
+Validation reuse is retained without the extra tasks: incoming proposals and
+votes are authenticated once per processing path; buffered votes keep an opaque
+authenticated type. The aggregator still checks instance metadata and distinct
+senders. FINISH compares the entire cached verified header and requires the
+local READY quorum. New network payloads never bypass validation based only on
+an existing header ID. ABA=1's early observed-proposal path is unchanged.
 
 The worker and primary remain separate executables. Their cross-authority
 dissemination responsibilities are combined into the primary's GRBC path;
@@ -130,18 +171,20 @@ recovery, missing causal history, and the separate GRBC voting gates.
 ## Reproduce validation
 
 ```sh
-cargo test -p store -p primary -p worker -p consensus -- --test-threads=1
+cargo test -p crypto -p store -p primary -p worker -p consensus -- --test-threads=1
 cargo build -p node --features benchmark
 python3 scripts/grbc_smoke.py --scenario all
 python3 scripts/grbc_smoke.py --scenario silent
 python3 scripts/grbc_smoke.py --scenario late
+python3 scripts/grbc_smoke.py --nodes 10 --scenario all
 ```
 
 `grbc_smoke.py` launches real primary/worker processes with fresh RocksDB
 stores and nonempty client transactions. It verifies sustained payload
 commits, recent progress and identical commit prefixes, keeps its logs, and stops only its
-own child processes. `silent` omits one of four authorities; `late` starts
-the fourth authority after three seconds. These are functional checks, not
+own child processes. The committee defaults to four nodes and supports
+`--nodes 10`; `silent` omits the last authority and `late` starts it after
+three seconds. These are functional checks, not
 throughput/latency benchmarks or exhaustive asynchronous fault simulation.
 
 Validation on 2026-11-12 used Rust 1.85.0, MSVC and the real RocksDB backend
@@ -158,3 +201,18 @@ feature. Real-process checks pass for all nodes online (706 common blocks),
 one absent node (538 common blocks), and a late node (1047 common blocks,
 7 rounds behind at shutdown with sustained progress). These functional checks
 do not measure performance or establish adversarial safety.
+
+After the transport rollback and revision, 87 unit tests pass: primary 40,
+crypto 7, store 5, worker 9 and consensus 26, plus doctest checks. Regressions
+cover queued data suppressing repair, failed or repeated proposals not blocking
+repair indefinitely, single-peer recovery followed by committee retry, and
+forged votes. A full 512 KiB proposal reaches a peer before its local header
+marker/ECHO; four votes per phase travel as two batched frames on a connection
+separate from an unread data connection. The benchmark-feature node builds.
+
+Real-process checks pass for four nodes online (703 common blocks), ten nodes
+online (901 common blocks, maximum two rounds of lag at shutdown), one of four
+nodes absent (547 common blocks), and one of four nodes three seconds late
+(1182 common blocks, all at round 328 at shutdown). These are functional checks
+in the Windows environment above, not measurements of Ubuntu 24.04 latency
+or throughput at the user's 50,000 tx/s workload.

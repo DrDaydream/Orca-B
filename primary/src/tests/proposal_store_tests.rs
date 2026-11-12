@@ -157,31 +157,43 @@ async fn helper_recovers_complete_proposal_before_local_ready() {
         .primary
         .primary_to_primary = listener.local_addr().unwrap();
     let receiver = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
-        let proposal = stream.next().await.unwrap().unwrap();
-        stream.send(Bytes::from_static(b"Ack")).await.unwrap();
-        let vote = stream.next().await.unwrap().unwrap();
-        stream.send(Bytes::from_static(b"Ack")).await.unwrap();
-        (proposal, vote)
+        let mut frames = Vec::new();
+        let mut streams = Vec::new();
+        for _ in 0..2 {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
+            frames.push(stream.next().await.unwrap().unwrap());
+            stream.send(Bytes::from_static(b"Ack")).await.unwrap();
+            streams.push(stream);
+        }
+        frames
     });
     let (tx, rx) = channel(10);
     crate::helper::Helper::spawn(c, store, rx);
     tx.send((vec![digest], requestor)).await.unwrap();
-    let (bytes, vote_bytes) = tokio::time::timeout(std::time::Duration::from_secs(5), receiver)
+    let frames = tokio::time::timeout(std::time::Duration::from_secs(5), receiver)
         .await
         .unwrap()
         .unwrap();
-    match bincode::deserialize::<PrimaryMessage>(&bytes).unwrap() {
-        PrimaryMessage::Proposal(rebuilt) => {
-            rebuilt.verify(&committee()).unwrap();
-            assert_eq!(rebuilt.header.id, p.header.id);
-            assert_eq!(rebuilt.batches, p.batches);
+    let (mut saw_proposal, mut saw_vote) = (false, false);
+    for bytes in frames {
+        match bincode::deserialize::<PrimaryMessage>(&bytes).unwrap() {
+            PrimaryMessage::Proposal(rebuilt) => {
+                rebuilt.verify(&committee()).unwrap();
+                assert_eq!(rebuilt.header, p.header);
+                assert_eq!(rebuilt.batches, p.batches);
+                saw_proposal = true;
+            }
+            PrimaryMessage::GrbcVote(recovered) => {
+                recovered.verify(&committee()).unwrap();
+                assert_eq!(
+                    bincode::serialize(&recovered).unwrap(),
+                    bincode::serialize(&vote).unwrap()
+                );
+                saw_vote = true;
+            }
+            _ => panic!("Unexpected recovery response"),
         }
-        _ => panic!("Expected a full proposal recovery reply"),
     }
-    assert_eq!(
-        vote_bytes.as_ref(),
-        bincode::serialize(&PrimaryMessage::GrbcVote(vote)).unwrap()
-    );
+    assert!(saw_proposal && saw_vote);
 }

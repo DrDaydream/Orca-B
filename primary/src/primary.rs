@@ -10,6 +10,7 @@ use crate::messages::{
     GrbcVoteBatch as VoteBatch, Proposal, MAX_PROPOSAL_BYTES,
 };
 use crate::payload_receiver::PayloadReceiver;
+use crate::proposal_repair::{PrimaryInput, ProposalTracker};
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
@@ -120,6 +121,7 @@ impl Primary {
         let (tx_headers_loopback, rx_headers_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_certificates_loopback, rx_certificates_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
+        let proposal_tracker = ProposalTracker::default();
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_consensus_commands, rx_consensus_commands) = channel(CHANNEL_CAPACITY);
         let (tx_aba_broadcast, rx_aba_broadcast) = channel(CHANNEL_CAPACITY);
@@ -202,6 +204,7 @@ impl Primary {
             /* handler */
             PrimaryReceiverHandler {
                 tx_primary_messages,
+                proposal_tracker: proposal_tracker.clone(),
                 tx_cert_requests,
             },
         );
@@ -273,6 +276,7 @@ impl Primary {
             consensus_round.clone(),
             parameters.gc_depth,
             /* rx_primaries */ rx_primary_messages,
+            proposal_tracker,
             /* rx_header_waiter */ rx_headers_loopback,
             /* rx_certificate_waiter */ rx_certificates_loopback,
             /* rx_proposer */ rx_headers,
@@ -342,7 +346,8 @@ impl Primary {
 /// Defines how the network receiver handles incoming primary messages.
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
-    tx_primary_messages: Sender<PrimaryMessage>,
+    tx_primary_messages: Sender<PrimaryInput>,
+    proposal_tracker: ProposalTracker,
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
 }
 
@@ -387,7 +392,7 @@ impl MessageHandler for PrimaryReceiverHandler {
                 .expect("Failed to send primary message"),
             request => self
                 .tx_primary_messages
-                .send(request)
+                .send(PrimaryInput::new(request, &self.proposal_tracker))
                 .await
                 .expect("Failed to send certificate"),
         }
