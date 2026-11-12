@@ -39,6 +39,9 @@ pub enum DagError {
     #[error("Malformed header {0}")]
     MalformedHeader(Digest),
 
+    #[error("Missing stored batch {0}")]
+    MissingBatch(Digest),
+
     #[error("Received message from unknown authority {0}")]
     UnknownAuthority(PublicKey),
 

@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::DagResult;
 use crate::header_waiter::WaiterMessage;
-use crate::messages::{proposal_key, Certificate, Header, Proposal};
+use crate::messages::{proposal_header_key, Certificate, Header};
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
@@ -132,10 +132,11 @@ impl Synchronizer {
             // Validate the target's signed metadata, not its local grade. One
             // honest node reaching READY does not imply every peer can reach
             // READY, so requiring a local grade here would block honest proposals.
-            match self.store.read(proposal_key(digest)).await? {
-                Some(proposal) => {
-                    parents.push(bincode::deserialize::<Proposal>(&proposal)?.block())
-                }
+            match self.store.read(proposal_header_key(digest)).await? {
+                Some(bytes) => parents.push(Certificate {
+                    header: bincode::deserialize(&bytes)?,
+                    votes: Vec::new(),
+                }),
                 None => missing_virtual.push(digest.clone()),
             }
         }

@@ -41,11 +41,38 @@ Each honest process sends at most one ECHO and one READY per instance.
   The requester must assemble its own local counts; it cannot import a
   remote FINISH assertion. Votes received before data are buffered and cause
   proposal requests, with retries.
-- Grade-1 records use `orca-ready-v2/`; complete proposals, payloads and local
-  votes also have separate `v2` key prefixes. Strong/weak dependency checks
+- Grade-1 records use `orca-ready-v2/`; payloads and local votes also have
+  separate `v2` key prefixes. Strong/weak dependency checks
   before ECHO require local FINISH records. Virtual targets require their
-  complete signed proposals to check rounds, not a local READY grade: another
+  complete-proposal signed header markers to check rounds, not a local READY grade: another
   node's READY does not guarantee this node can immediately reach READY.
+
+### Content-addressed proposal storage
+
+The primary stores each batch once under its digest. It stores only the signed
+header under `orca-proposal-header-v3/<block digest>`; it no longer persists a
+second copy of the batches inside a serialized proposal. Core retains headers,
+rather than full proposal payloads, in its recent-proposal index.
+
+After full proposal verification, missing batch entries and the header marker
+are inserted in one RocksDB WriteBatch. Existing entries are not overwritten,
+including batches already handed off by the local worker. The store serializes
+existence checks and writes, reports write errors, and notifies waiters only
+after the entire write succeeds. It uses the existing default RocksDB durability
+options, without adding an fsync. A header marker means complete authenticated
+data was retained; it does not imply DAG validation, READY, or FINISH.
+
+Virtual-edge dependency checks and waiters read only this small header record.
+Strong/weak dependencies continue to read the small local FINISH records. Both
+ordinary repair replies and leader recovery reconstruct the full wire Proposal
+from its header and batch keys; missing data produces an error instead of a
+partial reply. Recovery still includes only the responder's own votes.
+
+This deduplication is within each primary's store. The local worker's batching
+store remains separate. Network Proposal/ECHO/READY formats and quorum thresholds
+are unchanged. Legacy `orca-proposal-v2/` records are not migrated; run with fresh
+experiment stores (`fab local` already resets them). This change does not by
+itself establish a measured throughput or latency improvement.
 
 The worker and primary remain separate executables. Their cross-authority
 dissemination responsibilities are combined into the primary's GRBC path;
@@ -103,7 +130,7 @@ recovery, missing causal history, and the separate GRBC voting gates.
 ## Reproduce validation
 
 ```sh
-cargo test -p primary -p worker -p consensus -- --test-threads=1
+cargo test -p store -p primary -p worker -p consensus -- --test-threads=1
 cargo build -p node --features benchmark
 python3 scripts/grbc_smoke.py --scenario all
 python3 scripts/grbc_smoke.py --scenario silent
@@ -123,7 +150,11 @@ on Windows. The repository's Linux-only forced compiler settings in
 Ubuntu execution has not been performed in this session. Existing warnings
 about deprecated dependencies and unused legacy code remain.
 
-The final second-audit run passes 63 unit tests: primary 28, worker 9,
-consensus 26, plus the doctest checks. Real-process results are supplied in
-the accompanying validation archive; these do not measure performance or
-establish adversarial safety.
+The storage optimization run passes 72 unit tests: primary 32, store 5,
+worker 9, consensus 26, plus the doctest checks. Tests cover shared batches,
+atomic header publication, metadata-only dependency reads, and full proposal
+plus individual-vote recovery before READY. The node builds with the benchmark
+feature. Real-process checks pass for all nodes online (706 common blocks),
+one absent node (538 common blocks), and a late node (1047 common blocks,
+7 rounds behind at shutdown with sustained progress). These functional checks
+do not measure performance or establish adversarial safety.

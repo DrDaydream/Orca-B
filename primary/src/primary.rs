@@ -414,7 +414,9 @@ impl MessageHandler for WorkerReceiverHandler {
                 let digest = batch_digest(&batch);
                 let size = batch.len();
                 let mut store = self.store.clone();
-                store.write(batch_key(&digest), batch).await;
+                store
+                    .write_batch_if_absent(std::iter::once((batch_key(&digest), batch)).collect())
+                    .await?;
                 self.tx_our_digests
                     .send((digest, worker_id, size))
                     .await

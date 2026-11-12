@@ -191,8 +191,10 @@ pub fn grade_one_key(digest: &Digest) -> Vec<u8> {
     [b"orca-ready-v2/".as_ref(), digest.as_ref()].concat()
 }
 
-pub fn proposal_key(digest: &Digest) -> Vec<u8> {
-    [b"orca-proposal-v2/".as_ref(), digest.as_ref()].concat()
+/// A signed Header published only after its complete payload is retained.
+/// A distinct prefix avoids interpreting legacy full proposals as headers.
+pub fn proposal_header_key(digest: &Digest) -> Vec<u8> {
+    [b"orca-proposal-header-v3/".as_ref(), digest.as_ref()].concat()
 }
 
 pub fn local_votes_key(digest: &Digest) -> Vec<u8> {

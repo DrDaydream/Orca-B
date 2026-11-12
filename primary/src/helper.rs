@@ -1,6 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::messages::{local_votes_key, proposal_key, GrbcVote, Proposal};
+use crate::messages::{local_votes_key, GrbcVote};
 use crate::primary::PrimaryMessage;
+use crate::proposal_store::load_proposal;
 use bytes::Bytes;
 use config::Committee;
 use crypto::{Digest, PublicKey};
@@ -54,10 +55,8 @@ impl Helper {
 
             // Reply to the request (the best we can).
             for digest in digests {
-                match self.store.read(proposal_key(&digest)).await {
-                    Ok(Some(data)) => {
-                        let proposal: Proposal = bincode::deserialize(&data)
-                            .expect("Failed to deserialize stored proposal");
+                match load_proposal(&mut self.store, &digest).await {
+                    Ok(Some(proposal)) => {
                         let bytes = bincode::serialize(&PrimaryMessage::Proposal(proposal))
                             .expect("Failed to serialize proposal response");
                         self.network.send(address, Bytes::from(bytes)).await;

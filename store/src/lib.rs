@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
 
@@ -15,6 +15,7 @@ type Value = Vec<u8>;
 
 pub enum StoreCommand {
     Write(Key, Value),
+    WriteBatchIfAbsent(BTreeMap<Key, Value>, oneshot::Sender<StoreResult<usize>>),
     Read(Key, oneshot::Sender<StoreResult<Option<Value>>>),
     NotifyRead(Key, oneshot::Sender<StoreResult<Value>>),
 }
@@ -37,6 +38,43 @@ impl Store {
                         if let Some(mut senders) = obligations.remove(&key) {
                             while let Some(s) = senders.pop_front() {
                                 let _ = s.send(Ok(value.clone()));
+                            }
+                        }
+                    }
+                    StoreCommand::WriteBatchIfAbsent(entries, sender) => {
+                        // This actor owns every write, so the existence check and
+                        // atomic batch cannot race with another writer.
+                        let result = (|| -> StoreResult<BTreeMap<Key, Value>> {
+                            let mut batch = rocksdb::WriteBatch::default();
+                            let mut inserted = BTreeMap::new();
+                            for (key, value) in entries {
+                                // A pinned read avoids copying an existing payload.
+                                if db.get_pinned(&key)?.is_none() {
+                                    batch.put(&key, &value);
+                                    inserted.insert(key, value);
+                                }
+                            }
+                            if !inserted.is_empty() {
+                                db.write(batch)?;
+                            }
+                            Ok(inserted)
+                        })();
+                        match result {
+                            Ok(inserted) => {
+                                let count = inserted.len();
+                                // Publish notifications only after the entire
+                                // batch succeeds, including its metadata marker.
+                                for (key, value) in inserted {
+                                    if let Some(senders) = obligations.remove(&key) {
+                                        for waiter in senders {
+                                            let _ = waiter.send(Ok(value.clone()));
+                                        }
+                                    }
+                                }
+                                let _ = sender.send(Ok(count));
+                            }
+                            Err(error) => {
+                                let _ = sender.send(Err(error));
                             }
                         }
                     }
@@ -76,6 +114,23 @@ impl Store {
         receiver
             .await
             .expect("Failed to receive reply to Read command from store")
+    }
+
+    /// Atomically insert missing immutable values and return the number inserted.
+    /// Existing values are neither copied out nor rewritten. Success acknowledges
+    /// RocksDB's write, using its default durability options (not an fsync).
+    pub async fn write_batch_if_absent(
+        &mut self,
+        entries: BTreeMap<Key, Value>,
+    ) -> StoreResult<usize> {
+        let (sender, receiver) = oneshot::channel();
+        self.channel
+            .send(StoreCommand::WriteBatchIfAbsent(entries, sender))
+            .await
+            .expect("Failed to send immutable batch to store");
+        receiver
+            .await
+            .expect("Failed to receive immutable write result")
     }
 
     pub async fn notify_read(&mut self, key: Key) -> StoreResult<Value> {
