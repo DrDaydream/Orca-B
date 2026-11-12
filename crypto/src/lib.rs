@@ -175,7 +175,7 @@ where
 }
 
 /// Represents an ed25519 signature.
-#[derive(Serialize, Deserialize, Clone, Default, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Signature {
     part1: [u8; 32],
     part2: [u8; 32],

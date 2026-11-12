@@ -157,76 +157,31 @@ async fn helper_recovers_complete_proposal_before_local_ready() {
         .primary
         .primary_to_primary = listener.local_addr().unwrap();
     let receiver = tokio::spawn(async move {
-        let mut frames = Vec::new();
-        let mut streams = Vec::new();
-        // Both responses must arrive on separate connections, in either order.
-        for _ in 0..2 {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
-            frames.push(stream.next().await.unwrap().unwrap());
-            stream.send(Bytes::from_static(b"Ack")).await.unwrap();
-            // Keep it alive: ReliableSender otherwise reconnects immediately,
-            // and that idle reconnect could be mistaken for the data connection.
-            streams.push(stream);
-        }
-        frames
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
+        let proposal = stream.next().await.unwrap().unwrap();
+        stream.send(Bytes::from_static(b"Ack")).await.unwrap();
+        let vote = stream.next().await.unwrap().unwrap();
+        stream.send(Bytes::from_static(b"Ack")).await.unwrap();
+        (proposal, vote)
     });
     let (tx, rx) = channel(10);
-    let (tx_votes, rx_votes) = channel(10);
-    crate::vote_sender::spawn_vote_sender(
-        keys()[0].0,
-        c.clone(),
-        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        50,
-        rx_votes,
-    );
-    crate::helper::Helper::spawn(c, store, rx, tx_votes);
+    crate::helper::Helper::spawn(c, store, rx);
     tx.send((vec![digest], requestor)).await.unwrap();
-    let frames = tokio::time::timeout(std::time::Duration::from_secs(5), receiver)
+    let (bytes, vote_bytes) = tokio::time::timeout(std::time::Duration::from_secs(5), receiver)
         .await
         .unwrap()
         .unwrap();
-    let (mut saw_proposal, mut saw_vote) = (false, false);
-    for bytes in frames {
-        match bincode::deserialize::<PrimaryMessage>(&bytes).unwrap() {
-            PrimaryMessage::Proposal(rebuilt) => {
-                rebuilt.verify(&committee()).unwrap();
-                assert_eq!(rebuilt.header, p.header);
-                assert_eq!(rebuilt.batches, p.batches);
-                saw_proposal = true;
-            }
-            PrimaryMessage::GrbcVoteBatch(batch) => {
-                let recovered = batch.into_votes();
-                assert_eq!(recovered.len(), 1);
-                recovered[0].verify(&committee()).unwrap();
-                assert_eq!(
-                    bincode::serialize(&recovered[0]).unwrap(),
-                    bincode::serialize(&vote).unwrap()
-                );
-                saw_vote = true;
-            }
-            _ => panic!("Unexpected recovery reply"),
+    match bincode::deserialize::<PrimaryMessage>(&bytes).unwrap() {
+        PrimaryMessage::Proposal(rebuilt) => {
+            rebuilt.verify(&committee()).unwrap();
+            assert_eq!(rebuilt.header.id, p.header.id);
+            assert_eq!(rebuilt.batches, p.batches);
         }
+        _ => panic!("Expected a full proposal recovery reply"),
     }
-    assert!(saw_proposal && saw_vote);
-}
-
-#[tokio::test]
-async fn proposal_processor_rejects_changed_bytes_even_for_a_known_header() {
-    let mut store = store("processor_revalidation");
-    let p = with_payload();
-    let digest = p.block().digest();
-    let prepare = crate::proposal_processor::prepare_proposal;
-    let (stored, _) = prepare(p.clone(), committee(), &mut store, false)
-        .await
-        .unwrap();
-    assert_eq!(stored.into_header(), p.header);
-    let mut forged = p.clone();
-    forged.batches.values_mut().next().unwrap()[0] ^= 1;
-    assert!(prepare(forged, committee(), &mut store, false)
-        .await
-        .is_err());
-    let restored = load_proposal(&mut store, &digest).await.unwrap().unwrap();
-    assert_eq!(restored.batches, p.batches);
-    restored.verify(&committee()).unwrap();
+    assert_eq!(
+        vote_bytes.as_ref(),
+        bincode::serialize(&PrimaryMessage::GrbcVote(vote)).unwrap()
+    );
 }

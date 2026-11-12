@@ -1,7 +1,6 @@
 use super::GrbcVotesAggregator;
 use crate::common::{committee, header, keys, proposal, votes};
 use crate::messages::{batch_digest, GrbcPhase, GrbcVoteBatch};
-use crate::verified_vote::VerifiedGrbcVote;
 use crypto::{Hash as _, Signature};
 
 #[test]
@@ -10,19 +9,13 @@ fn echo_and_ready_are_independent_and_duplicates_do_not_add_weight() {
     let c = committee();
     let mut state = GrbcVotesAggregator::new();
     for v in votes(&h, GrbcPhase::Echo).into_iter().take(3) {
-        assert!(state
-            .append(&VerifiedGrbcVote::verify(v.clone(), &c).unwrap(), &c, &h)
-            .unwrap());
-        assert!(!state
-            .append(&VerifiedGrbcVote::verify(v.clone(), &c).unwrap(), &c, &h)
-            .unwrap());
+        assert!(state.append(&v, &c, &h).unwrap());
+        assert!(!state.append(&v, &c, &h).unwrap());
     }
     assert_eq!(state.echo_weight, 3);
     assert_eq!(state.ready_weight, 0);
     for v in votes(&h, GrbcPhase::Ready).into_iter().take(3) {
-        state
-            .append(&VerifiedGrbcVote::verify(v.clone(), &c).unwrap(), &c, &h)
-            .unwrap();
+        state.append(&v, &c, &h).unwrap();
     }
     assert_eq!(state.ready_weight, 3);
 }
@@ -45,11 +38,7 @@ fn signatures_bind_phase_sender_instance_and_header() {
     let mut other_header = h.clone();
     other_header.round += 1;
     assert!(GrbcVotesAggregator::new()
-        .append(
-            &VerifiedGrbcVote::verify(vote, &committee()).unwrap(),
-            &committee(),
-            &other_header
-        )
+        .append(&vote, &committee(), &other_header)
         .is_err());
 }
 
