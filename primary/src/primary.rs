@@ -7,8 +7,8 @@ use crate::garbage_collector::GarbageCollector;
 use crate::header_waiter::HeaderWaiter;
 use crate::helper::Helper;
 use crate::messages::{
-    batch_digest, batch_key, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GrbcVote,
-    GrbcVoteBatch as VoteBatch, Proposal, MAX_PROPOSAL_BYTES,
+    batch_digest, batch_key, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage,
+    ControlFrame, GrbcVote, GrbcVoteBatch as VoteBatch, Proposal, MAX_PROPOSAL_BYTES,
 };
 use crate::payload_receiver::PayloadReceiver;
 use crate::proposal_repair::{PrimaryInput, ProposalTracker};
@@ -41,7 +41,7 @@ pub enum PrimaryMessage {
     GrbcVoteBatch(VoteBatch),
     LeaderRequest(Round, PublicKey, /* requestor */ PublicKey),
     CertificatesRequest(Vec<Digest>, /* requestor */ PublicKey),
-    GrbcWithAba(VoteBatch, ConsensusNetworkMessage),
+    Control(ControlFrame),
 }
 
 /// The messages sent by the primary to its workers.
@@ -327,30 +327,34 @@ impl MessageHandler for PrimaryReceiverHandler {
 
 impl PrimaryReceiverHandler {
     async fn route(&self, message: PrimaryMessage) {
-        let message = match message {
-            PrimaryMessage::GrbcWithAba(votes, aba) => {
+        match message {
+            PrimaryMessage::Control(frame) => {
                 // Deliver ABA first, without waiting for proposal processing or
                 // a free Core slot. Core independently verifies every GRBC vote.
-                self.tx_consensus
-                    .send(ConsensusMessage::AbaBatch(aba.author, aba.messages))
-                    .await
-                    .expect("Failed to deliver piggybacked ABA");
-                PrimaryMessage::GrbcVoteBatch(votes)
+                if let Some(aba) = frame.aba {
+                    self.tx_consensus
+                        .send(ConsensusMessage::AbaBatch(aba.author, aba.messages))
+                        .await
+                        .expect("Failed to deliver piggybacked ABA");
+                }
+                for votes in frame.grbc {
+                    self.forward(PrimaryMessage::GrbcVoteBatch(votes)).await;
+                }
             }
-            message => message,
-        };
-        match message {
             PrimaryMessage::CertificatesRequest(missing, requestor) => self
                 .tx_cert_requests
                 .send((missing, requestor))
                 .await
                 .expect("Failed to send primary message"),
-            request => self
-                .tx_primary_messages
-                .send(PrimaryInput::new(request, &self.proposal_tracker))
-                .await
-                .expect("Failed to send certificate"),
+            request => self.forward(request).await,
         }
+    }
+
+    async fn forward(&self, message: PrimaryMessage) {
+        self.tx_primary_messages
+            .send(PrimaryInput::new(message, &self.proposal_tracker))
+            .await
+            .expect("Failed to send primary message");
     }
 }
 

@@ -124,21 +124,35 @@ replicas. An application that fetches executed batches from worker replicas
 must adapt its data retrieval path. The repository's sample node only logs
 consensus output.
 
-### Opportunistic ABA piggybacking (unsigned experiment)
+### Cross-instance control vectors and unsigned experimental ABA
 
 Core still groups ECHO/READY votes by round and phase. It hands each complete
 outbox burst to the former ABA broadcaster, now a shared small-message sender.
-On each wake, that task drains at most 32 already-queued inputs. It packs a
-ready ABA batch alongside a vote batch when their combined frame fits 64 KiB;
-otherwise it sends each independently. Multiple already-queued ABA batches
-from the same sender can also share one envelope. There is no new task per
-vote, signing task, or wait for a future ECHO/READY. The old 1 ms ABA coalescing
-delay is removed; consensus still batches its own generated ABA actions.
+On each wake, that task drains at most 32 already-queued inputs. It packs
+multiple batches across rounds and phases into one `ControlFrame`, optionally
+with an already-ready ABA batch. The serialized primary message, including
+its enum tag and vector/option metadata, fits 64 KiB. A larger GRBC batch is
+split into prefixes preserving its metadata, signatures and entry order;
+entries move out of an iterator without repeatedly copying the remaining
+suffix. A large ABA batch retains its independent path. Multiple queued ABA
+batches from the same sender can also share one envelope.
+
+Any nonempty queue is sufficient to send, even one late ECHO/READY after a
+previous vector for that phase was sent. Remaining split frames are sent
+without waiting for new input. There is no first-vector quorum, wait to fill
+a vector, per-phase send limit, or dependency on a later DAG round. Empty
+queues send nothing. These rules avoid circular waits where late ECHOs need
+a READY carrier, or late READYs need a next-round proposal that they themselves
+enable. The existing queues serve as the late-message buffer; no separate
+late-evidence state machine or transport rounds are added. There is no new
+task per vote or signing task. The old 1 ms ABA coalescing delay remains
+removed; consensus still batches its own generated ABA actions.
 
 Vote-only and mixed frames use a control connection to the primary port.
 Standalone ABA uses the existing ABA port. Complete Proposal bytes never
 enter this sender. The primary receiver extracts mixed-frame ABA directly
-into consensus before enqueueing votes in Core. GRBC signature verification,
+into consensus before enqueueing each original vote batch in Core. One missing,
+duplicate, invalid or stale vote does not gate unrelated valid votes. GRBC signature verification,
 phase counts and data/dependency gates stay in Core. ABA instance/round/type,
 sender deduplication, quorum rules and input conditions are unchanged.
 
@@ -149,10 +163,16 @@ impersonate other authorities; this configuration does not implement Byzantine
 sender authentication. Header and ECHO/READY signatures remain enabled. Rebuild
 all nodes together because the wire encoding changed.
 
-Vote-only retries retain round-based GC. Mixed frames retain the ABA retry
+Vote-only retries use the maximum round in the vector, so old-round GC cannot
+cancel delivery of newer votes in the same frame. Mixed frames retain the ABA retry
 lifetime until ACK, even if their vote round has been collected: the carried
 ABA may belong to a different unfinished instance. Transport coalescing does
 not replace BVAL/AUX/DECIDE with ECHO/READY or remove logical ABA rounds.
+
+This is transport batching of individually counted votes, not a quorum
+certificate. It reduces frames when votes are ready together; it does not
+guarantee quadratic per-DAG-round message complexity under arbitrary arrival
+orders, or reduce the number of logical vote entries transmitted.
 
 ## Bounds and compatibility
 
@@ -270,3 +290,18 @@ ten nodes (997), one of four absent (547), and one of four three seconds late
 frames and 10,485 standalone ABA frames across these runs. Coalescing is
 opportunistic, so most ABA messages can still travel independently. These
 12-second Windows functional runs do not measure Ubuntu latency/TPS gains.
+
+The cross-instance vector revision passes 74 relevant unit tests (primary 48,
+consensus 26), including the doctest checks, and builds the benchmark node.
+Coverage includes cross-round/phase packing, a single late vote without any
+subsequent carrier, complete draining of split 1,500-entry batches, exact
+64 KiB boundaries, and retransmission when only the oldest round has expired.
+The four-authority staggered-arrival regression gives A/B/C different initial
+proposal sets while D proposes but never votes; independent late vectors let
+all three correct nodes FINISH the proposals and obtain next-round parents.
+
+Real-process runs pass for four nodes online (710 common committed blocks),
+ten online (1,018), one of four absent (550), and one of four three seconds late
+(644), all with zero round lag at shutdown. Debug logs record 3,115 multi-batch
+frames among 15,820 GRBC vector frames across these runs. These remain short
+Windows functional checks, not Ubuntu throughput or latency measurements.
