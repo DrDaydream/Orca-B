@@ -22,6 +22,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, default=Path('target/debug/node.exe' if os.name == 'nt' else 'target/debug/node'))
     parser.add_argument('--scenario', choices=['all', 'silent', 'late'], default='all')
+    parser.add_argument('--nodes', type=int, choices=[4, 10], default=4)
     parser.add_argument('--duration', type=float, default=12)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
@@ -40,7 +41,7 @@ def main():
         return f'127.0.0.1:{sock.getsockname()[1]}'
 
     authorities, names = {}, []
-    for node in range(4):
+    for node in range(args.nodes):
         key = root / f'key-{node}.json'
         subprocess.run([str(binary), 'generate_keys', '--filename', str(key)], check=True, creationflags=flags)
         name = json.loads(key.read_text())['name']
@@ -74,13 +75,13 @@ def main():
 
     sent = 0
     try:
-        for node in range(4 if args.scenario == 'all' else 3):
+        for node in range(args.nodes if args.scenario == 'all' else args.nodes - 1):
             start(node)
         begin = time.monotonic()
         while time.monotonic() - begin < args.duration:
             elapsed = time.monotonic() - begin
-            if args.scenario == 'late' and elapsed > 3 and 3 not in started:
-                start(3)
+            if args.scenario == 'late' and elapsed > 3 and args.nodes - 1 not in started:
+                start(args.nodes - 1)
             assert all(child.poll() is None for child in children), f'Node exited; see {root}'
             for node in started:
                 if node not in sockets:
@@ -125,7 +126,7 @@ def main():
         records.append({'node': node, 'committed_blocks': len(sequence), 'payload_commits': len(payloads), 'last_round': int(sequence[-1][0]), 'last_commit_age_seconds': round(progress_age, 3)})
     shared = min(map(len, sequences))
     assert all(sequence[:shared] == sequences[0][:shared] for sequence in sequences), f'Commit order differs; see {root}'
-    result = {'scenario': args.scenario, 'duration_seconds': args.duration, 'sent_transactions': sent, 'common_commit_prefix': shared,
+    result = {'scenario': args.scenario, 'committee_size': args.nodes, 'duration_seconds': args.duration, 'sent_transactions': sent, 'common_commit_prefix': shared,
               'max_round_lag': max(record['last_round'] for record in records) - min(record['last_round'] for record in records),
               'nodes': records, 'logs': str(root), 'passed': True}
     (root / 'result.json').write_text(json.dumps(result, indent=2))

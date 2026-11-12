@@ -2,7 +2,10 @@ use super::*;
 use crate::common::{committee, keys, proposal, votes};
 use crate::messages::{batch_key, proposal_header_key};
 use crypto::Signature;
+use futures::{SinkExt, StreamExt};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc::channel;
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 struct Harness {
     core: Core,
@@ -50,6 +53,7 @@ impl Harness {
                 last_ready: HashMap::new(),
                 local_votes: HashMap::new(),
                 missing_proposals: HashMap::new(),
+                proposal_tracker: ProposalTracker::default(),
                 pending_votes: HashMap::new(),
                 vote_outbox: Vec::new(),
                 certificates_aggregators: HashMap::new(),
@@ -59,6 +63,7 @@ impl Harness {
                 round_advance_pending: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
                 network: ReliableSender::new(),
+                proposal_network: ReliableSender::new(),
                 cancel_handlers: HashMap::new(),
             },
             events,
@@ -445,6 +450,211 @@ async fn local_completion_cannot_replace_a_validated_header_body() {
     forged.header.round += 1;
     assert!(h.core.process_certificate(forged).await.is_err());
     assert!(h.events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn queued_proposal_does_not_trigger_repair_when_a_vote_overtakes_it() {
+    let mut h = Harness::new("queued_proposal", 0);
+    let p = proposal();
+    let input = PrimaryInput::new(
+        PrimaryMessage::Proposal(p.clone()),
+        &h.core.proposal_tracker,
+    );
+    h.core
+        .process_grbc_vote(votes(&p.header, GrbcPhase::Echo).remove(1))
+        .await
+        .unwrap();
+    let digest = p.block().digest();
+    let deadline = h.core.missing_proposals[&digest].deadline;
+    h.core.repair_missing_proposals(deadline).await.unwrap();
+    assert!(
+        h.core.cancel_handlers.is_empty(),
+        "queued data must suppress a repair request"
+    );
+    h.core.process_input(input).await.unwrap();
+    h.core
+        .repair_missing_proposals(deadline + Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(h.core.missing_proposals.is_empty());
+    assert!(h.core.cancel_handlers.is_empty());
+}
+
+#[tokio::test]
+async fn missing_data_uses_grace_then_one_voter_then_committee_retry() {
+    let mut h = Harness::new("repair_fallback", 0);
+    let p = proposal();
+    let vote = votes(&p.header, GrbcPhase::Echo).remove(1);
+    h.core.process_grbc_vote(vote.clone()).await.unwrap();
+    let digest = p.block().digest();
+    let deadline = h.core.missing_proposals[&digest].deadline;
+    h.core.process_grbc_vote(vote).await.unwrap();
+    assert_eq!(h.core.missing_proposals[&digest].deadline, deadline);
+    h.core
+        .repair_missing_proposals(deadline - Duration::from_millis(1))
+        .await
+        .unwrap();
+    assert!(h.core.cancel_handlers.is_empty());
+    h.core.repair_missing_proposals(deadline).await.unwrap();
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), 1);
+    let retry = h.core.missing_proposals[&digest].deadline;
+    h.core.repair_missing_proposals(retry).await.unwrap();
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), 4);
+    assert!(h.grades().is_empty());
+    assert!(h.core.vote_outbox.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_queued_proposal_cannot_disable_repair() {
+    let mut h = Harness::new("invalid_queued_proposal", 0);
+    let mut p = proposal();
+    let digest = p.block().digest();
+    let vote = votes(&p.header, GrbcPhase::Echo).remove(1);
+    p.header.signature = Signature::default();
+    let input = PrimaryInput::new(
+        PrimaryMessage::Proposal(p.clone()),
+        &h.core.proposal_tracker,
+    );
+    h.core.process_grbc_vote(vote).await.unwrap();
+    assert!(h.core.process_input(input).await.is_err());
+    let deadline = h.core.missing_proposals[&digest].deadline;
+    h.core.repair_missing_proposals(deadline).await.unwrap();
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), 1);
+    assert!(!h.core.proposal_headers.contains_key(&p.header.id));
+}
+
+#[tokio::test]
+async fn forged_vote_cannot_poison_the_authenticated_vote_buffer() {
+    let mut h = Harness::new("forged_vote_buffer", 0);
+    let p = proposal();
+    let vote = votes(&p.header, GrbcPhase::Ready).remove(1);
+    let mut forged = vote.clone();
+    forged.signature = Signature::default();
+    assert!(h.core.process_grbc_vote(forged).await.is_err());
+    assert!(h.core.pending_votes.is_empty());
+    assert!(h.core.missing_proposals.is_empty());
+    h.core.process_grbc_vote(vote.clone()).await.unwrap();
+    h.core.process_grbc_vote(vote).await.unwrap();
+    h.core.process_proposal(p.clone()).await.unwrap();
+    assert_eq!(h.core.votes_aggregators[&p.header.id].ready_weight, 1);
+    assert!(h.grades().is_empty());
+}
+
+#[tokio::test]
+async fn local_proposal_broadcast_precedes_its_storage_marker_and_echo() {
+    let mut h = Harness::new("broadcast_before_store", 3);
+    let mut p = proposal();
+    let bytes = vec![42; 512 * 1024];
+    let digest = crate::messages::batch_digest(&bytes);
+    p.header.payload.insert(digest.clone(), 0);
+    p.batches.insert(digest.clone(), bytes.clone());
+    resign(&mut p);
+    h.core
+        .store
+        .write_batch_if_absent(std::iter::once((batch_key(&digest), bytes)).collect())
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    h.core
+        .committee
+        .authorities
+        .get_mut(&keys()[1].0)
+        .unwrap()
+        .primary
+        .primary_to_primary = listener.local_addr().unwrap();
+    let receiver = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
+        let data = stream.next().await.unwrap().unwrap();
+        stream.send(Bytes::from_static(b"Ack")).await.unwrap();
+        data
+    });
+    let verified = h.core.broadcast_own_header(p.header.clone()).await.unwrap();
+    let data = tokio::time::timeout(Duration::from_secs(5), receiver)
+        .await
+        .unwrap()
+        .unwrap();
+    match bincode::deserialize::<PrimaryMessage>(&data).unwrap() {
+        PrimaryMessage::Proposal(sent) => {
+            sent.verify(&committee()).unwrap();
+            assert_eq!(sent.batches, p.batches);
+        }
+        _ => panic!("Expected complete proposal"),
+    }
+    assert!(h
+        .core
+        .store
+        .read(proposal_header_key(&p.block().digest()))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(h.core.vote_outbox.is_empty());
+    h.core.process_verified_proposal(verified).await.unwrap();
+    assert!(h
+        .core
+        .store
+        .read(proposal_header_key(&p.block().digest()))
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(h.core.vote_outbox.len(), 1);
+}
+
+#[tokio::test]
+async fn vote_bursts_stay_batched_and_use_a_separate_data_connection() {
+    let mut h = Harness::new("batched_vote_connections", 0);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    h.core
+        .committee
+        .authorities
+        .get_mut(&keys()[1].0)
+        .unwrap()
+        .primary
+        .primary_to_primary = listener.local_addr().unwrap();
+    h.core
+        .broadcast_grbc_batch(PrimaryMessage::Proposal(proposal()), 1)
+        .await;
+    // Keep the data connection open without reading or acknowledging its frame.
+    let (_blocked_data_socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    for header in crate::common::headers() {
+        for phase in [GrbcPhase::Echo, GrbcPhase::Ready] {
+            h.core.vote_outbox.push(votes(&header, phase).remove(0));
+        }
+    }
+    h.core.flush_grbc_outboxes().await;
+    let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
+    let mut phases = Vec::new();
+    for _ in 0..2 {
+        let data = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        stream.send(Bytes::from_static(b"Ack")).await.unwrap();
+        match bincode::deserialize::<PrimaryMessage>(&data).unwrap() {
+            PrimaryMessage::GrbcVoteBatch(batch) => {
+                assert_eq!(
+                    batch.votes.len(),
+                    4,
+                    "one frame must carry the whole phase burst"
+                );
+                phases.push(batch.phase);
+                for vote in batch.into_votes() {
+                    vote.verify(&committee()).unwrap();
+                }
+            }
+            _ => panic!("Expected batched votes on the independent connection"),
+        }
+    }
+    assert_eq!(phases, vec![GrbcPhase::Echo, GrbcPhase::Ready]);
+    assert!(h.core.vote_outbox.is_empty());
 }
 
 #[tokio::test]
