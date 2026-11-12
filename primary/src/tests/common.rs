@@ -13,12 +13,6 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-impl PartialEq for Header {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
 impl PartialEq for GrbcVote {
     fn eq(&self, other: &Self) -> bool {
         self.digest() == other.digest()
