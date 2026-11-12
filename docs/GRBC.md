@@ -170,6 +170,18 @@ recovery, missing causal history, and the separate GRBC voting gates.
 
 ## Reproduce validation
 
+Run `fab local` from the outer `benchmark` directory containing `fabfile.py`.
+LocalBench also anchors build, cleanup and output paths there if Fabric loads
+the task from another directory. It checks `node/Cargo.toml` before cleanup
+and restores the caller's directory on success or failure. This prevents a
+nested `benchmark/benchmark` launch from using the generated `benchmark/node`
+binary link as a source directory. Three Python regressions cover directory
+selection, missing sources and build errors, with subprocesses mocked:
+
+```sh
+python3 -B -m unittest discover -s benchmark/tests -v
+```
+
 ```sh
 cargo test -p crypto -p store -p primary -p worker -p consensus -- --test-threads=1
 cargo build -p node --features benchmark
