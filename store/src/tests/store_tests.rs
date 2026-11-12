@@ -72,3 +72,24 @@ async fn read_notify() {
     store.write(key, value).await;
     assert!(handle.await.is_ok());
 }
+
+#[tokio::test]
+async fn immutable_batch_inserts_only_missing_values() {
+    let path = format!(".db_test_immutable_batch_{}", std::process::id());
+    let mut store = Store::new(&path).unwrap();
+    let entries = [(vec![1], vec![10]), (vec![2], vec![20])]
+        .iter()
+        .cloned()
+        .collect();
+    assert_eq!(store.write_batch_if_absent(entries).await.unwrap(), 2);
+    let overlap = [(vec![1], vec![99]), (vec![3], vec![30])]
+        .iter()
+        .cloned()
+        .collect();
+    assert_eq!(store.write_batch_if_absent(overlap).await.unwrap(), 1);
+    assert_eq!(store.read(vec![1]).await.unwrap(), Some(vec![10]));
+    assert_eq!(store.read(vec![2]).await.unwrap(), Some(vec![20]));
+    assert_eq!(store.read(vec![3]).await.unwrap(), Some(vec![30]));
+    let duplicate = [(vec![1], vec![99])].iter().cloned().collect();
+    assert_eq!(store.write_batch_if_absent(duplicate).await.unwrap(), 0);
+}

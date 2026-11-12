@@ -11,6 +11,7 @@ mod helper;
 mod messages;
 mod payload_receiver;
 mod primary;
+mod proposal_store;
 mod proposer;
 mod synchronizer;
 

@@ -2,10 +2,11 @@
 use crate::aggregators::{CertificatesAggregator, GrbcVotesAggregator};
 use crate::error::{DagError, DagResult};
 use crate::messages::{
-    batch_key, local_votes_key, proposal_key, Certificate, ConsensusCommand, ConsensusMessage,
-    GrbcPhase, GrbcVote, GrbcVoteBatch, Header, Proposal,
+    local_votes_key, Certificate, ConsensusCommand, ConsensusMessage, GrbcPhase, GrbcVote,
+    GrbcVoteBatch, Header, Proposal,
 };
 use crate::primary::{PrimaryMessage, Round};
+use crate::proposal_store::{assemble_proposal, store_verified_proposal};
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
 use async_recursion::async_recursion;
@@ -65,7 +66,8 @@ pub struct Core {
     current_header: Header,
     votes_aggregators: HashMap<Digest, GrbcVotesAggregator>,
     observed_headers: HashMap<Digest, Header>,
-    proposals: HashMap<Digest, Proposal>,
+    /// Metadata of complete proposals; payload bytes live only in batch storage.
+    proposal_headers: HashMap<Digest, Header>,
     validated: HashSet<Digest>,
     last_ready: HashMap<Round, HashSet<PublicKey>>,
     local_votes: HashMap<Digest, Vec<GrbcVote>>,
@@ -129,7 +131,7 @@ impl Core {
                 current_header: Header::default(),
                 votes_aggregators: HashMap::new(),
                 observed_headers: HashMap::new(),
-                proposals: HashMap::new(),
+                proposal_headers: HashMap::new(),
                 validated: HashSet::new(),
                 last_ready: HashMap::new(),
                 local_votes: HashMap::new(),
@@ -169,15 +171,12 @@ impl Core {
         let header = proposal.header.clone();
         let digest = proposal.block().digest();
         self.missing_proposals.remove(&digest);
-        if !self.proposals.contains_key(&header.id) {
-            // Complete data is retained before any ECHO or READY is emitted.
-            for (digest, data) in &proposal.batches {
-                self.store.write(batch_key(digest), data.clone()).await;
-            }
-            self.store
-                .write(proposal_key(&digest), bincode::serialize(&proposal)?)
-                .await;
-            self.proposals.insert(header.id.clone(), proposal);
+        if !self.proposal_headers.contains_key(&header.id) {
+            // Atomically retain missing bytes and their compact header marker.
+            // Existing local-worker batches are not written a second time.
+            let stored_header = store_verified_proposal(&mut self.store, proposal).await?;
+            self.proposal_headers
+                .insert(header.id.clone(), stored_header);
         }
         // Consensus may traverse complete, authenticated data before local
         // GRBC delivery. This experimental early path assumes no equivocation;
@@ -254,7 +253,8 @@ impl Core {
             Ok(address) => address.primary_to_primary,
             Err(_) => return Ok(()),
         };
-        for proposal in self.leader_proposals(round, leader) {
+        for header in self.leader_headers(round, leader) {
+            let proposal = assemble_proposal(&mut self.store, header).await?;
             let digest = proposal.block().digest();
             let message = PrimaryMessage::Proposal(proposal);
             let bytes = bincode::serialize(&message)?;
@@ -269,14 +269,14 @@ impl Core {
         Ok(())
     }
 
-    fn leader_proposals(&self, round: Round, leader: PublicKey) -> Vec<Proposal> {
+    fn leader_headers(&self, round: Round, leader: PublicKey) -> Vec<Header> {
         if let Some(block) = self
             .grade_one_certificates
             .values()
             .find(|block| block.round() == round && block.origin() == leader)
         {
             return self
-                .proposals
+                .proposal_headers
                 .get(&block.header.id)
                 .cloned()
                 .into_iter()
@@ -284,25 +284,16 @@ impl Core {
         }
         // Before READY, return every known variant instead of an arbitrary
         // HashMap entry. Peers still have to collect their own signed votes.
-        self.proposals
+        self.proposal_headers
             .values()
-            .filter(|p| p.header.round == round && p.header.author == leader)
+            .filter(|h| h.round == round && h.author == leader)
             .cloned()
             .collect()
     }
 
     async fn process_own_header(&mut self, header: Header) -> DagResult<()> {
         self.current_header = header.clone();
-        let mut batches = BTreeMap::new();
-        for digest in header.payload.keys() {
-            let data = self
-                .store
-                .read(batch_key(digest))
-                .await?
-                .ok_or_else(|| DagError::MalformedHeader(header.id.clone()))?;
-            batches.insert(digest.clone(), data);
-        }
-        let proposal = Proposal { header, batches };
+        let proposal = assemble_proposal(&mut self.store, header).await?;
         proposal.verify(&self.committee)?;
         self.broadcast_grbc_batch(
             PrimaryMessage::Proposal(proposal.clone()),
@@ -315,7 +306,7 @@ impl Core {
     #[async_recursion]
     async fn process_header(&mut self, header: &Header) -> DagResult<()> {
         debug!("Processing {:?}", header);
-        if !self.proposals.contains_key(&header.id) {
+        if !self.proposal_headers.contains_key(&header.id) {
             return Ok(());
         }
         if self.validated.contains(&header.id) {
@@ -413,7 +404,7 @@ impl Core {
             DagError::TooOld(vote.id.clone(), vote.round)
         );
         vote.verify(&self.committee)?;
-        let header = match self.proposals.get(&vote.id).map(|p| p.header.clone()) {
+        let header = match self.proposal_headers.get(&vote.id).cloned() {
             Some(header) => header,
             None => {
                 let digest = vote.block_digest();
@@ -748,9 +739,10 @@ impl Core {
                 let gc_round = round - self.gc_depth;
                 self.last_voted.retain(|k, _| k >= &gc_round);
                 self.last_ready.retain(|k, _| k >= &gc_round);
-                self.proposals.retain(|_, p| p.header.round >= gc_round);
-                let proposals = &self.proposals;
-                self.validated.retain(|id| proposals.contains_key(id));
+                self.proposal_headers.retain(|_, h| h.round >= gc_round);
+                let proposal_headers = &self.proposal_headers;
+                self.validated
+                    .retain(|id| proposal_headers.contains_key(id));
                 self.missing_proposals.retain(|_, round| *round >= gc_round);
                 self.local_votes
                     .retain(|_, votes| votes.first().map_or(false, |v| v.round >= gc_round));

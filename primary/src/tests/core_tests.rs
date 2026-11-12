@@ -1,5 +1,6 @@
 use super::*;
 use crate::common::{committee, keys, proposal, votes};
+use crate::messages::{batch_key, proposal_header_key};
 use crypto::Signature;
 use tokio::sync::mpsc::channel;
 
@@ -44,7 +45,7 @@ impl Harness {
                 current_header: Header::default(),
                 votes_aggregators: HashMap::new(),
                 observed_headers: HashMap::new(),
-                proposals: HashMap::new(),
+                proposal_headers: HashMap::new(),
                 validated: HashSet::new(),
                 last_ready: HashMap::new(),
                 local_votes: HashMap::new(),
@@ -162,9 +163,7 @@ async fn leader_repair_prefers_the_ready_proposal_over_an_equivocation() {
     h.core.process_proposal(other.clone()).await.unwrap();
     h.core.process_proposal(p.clone()).await.unwrap();
     assert_eq!(
-        h.core
-            .leader_proposals(p.header.round, p.header.author)
-            .len(),
+        h.core.leader_headers(p.header.round, p.header.author).len(),
         2
     );
     for vote in votes(&p.header, GrbcPhase::Ready)
@@ -174,10 +173,10 @@ async fn leader_repair_prefers_the_ready_proposal_over_an_equivocation() {
     {
         h.core.process_grbc_vote(vote).await.unwrap();
     }
-    let replies = h.core.leader_proposals(p.header.round, p.header.author);
+    let replies = h.core.leader_headers(p.header.round, p.header.author);
     assert_eq!(replies.len(), 1);
-    assert_eq!(replies[0].header.id, p.header.id);
-    assert_ne!(replies[0].header.id, other.header.id);
+    assert_eq!(replies[0].id, p.header.id);
+    assert_ne!(replies[0].id, other.header.id);
     assert_eq!(h.grades(), vec![1, 2]);
 }
 
@@ -424,8 +423,8 @@ async fn delayed_virtual_edge_is_checked_before_echo() {
     h.core
         .store
         .write(
-            proposal_key(&dependency.block().digest()),
-            bincode::serialize(&dependency).unwrap(),
+            proposal_header_key(&dependency.block().digest()),
+            bincode::serialize(&dependency.header).unwrap(),
         )
         .await;
     assert!(h.core.process_header(&p.header).await.is_err());
@@ -497,8 +496,8 @@ async fn virtual_metadata_recovers_without_requiring_a_local_ready_grade() {
     h.core
         .store
         .write(
-            proposal_key(&dependency.block().digest()),
-            bincode::serialize(&dependency).unwrap(),
+            proposal_header_key(&dependency.block().digest()),
+            bincode::serialize(&dependency.header).unwrap(),
         )
         .await;
     assert!(h

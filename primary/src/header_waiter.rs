@@ -26,7 +26,7 @@ const TIMER_RESOLUTION: u64 = 1_000;
 #[derive(Debug)]
 pub enum WaiterMessage {
     SyncBatches(HashMap<Digest, WorkerId>, Header),
-    // Local FINISH records for strong/weak edges, complete proposals for virtual edges.
+    // Local FINISH records for strong/weak edges, complete-proposal header markers for virtual edges.
     SyncParents(Vec<Digest>, Vec<Digest>, Header),
 }
 
@@ -34,7 +34,7 @@ pub enum WaiterMessage {
 mod tests {
     use super::*;
     use crate::common::{committee, header, keys};
-    use crate::messages::proposal_key;
+    use crate::messages::proposal_header_key;
 
     #[tokio::test]
     async fn mixed_dependencies_resume_only_after_finish_and_proposal_arrive() {
@@ -76,7 +76,9 @@ mod tests {
                 .await
                 .is_err()
         );
-        store.write(proposal_key(&virtual_edge), vec![3]).await;
+        store
+            .write(proposal_header_key(&virtual_edge), vec![3])
+            .await;
         let resumed = tokio::time::timeout(Duration::from_secs(2), rx_core.recv())
             .await
             .unwrap()
@@ -248,7 +250,7 @@ impl HeaderWaiter {
                                 .iter()
                                 .map(|x| (x.to_vec(), self.store.clone()))
                                 .chain(missing_virtual.iter().map(|x|
-                                    (crate::messages::proposal_key(x), self.store.clone())))
+                                    (crate::messages::proposal_header_key(x), self.store.clone())))
                                 .collect();
                             let (tx_cancel, rx_cancel) = channel(1);
                             self.pending.insert(header_id, (round, tx_cancel));
@@ -333,7 +335,7 @@ impl HeaderWaiter {
                     }
                     let virtual_digests: Vec<_> = self.virtual_requests.keys().cloned().collect();
                     for digest in virtual_digests {
-                        if self.store.read(crate::messages::proposal_key(&digest)).await.ok().flatten().is_some() {
+                        if self.store.read(crate::messages::proposal_header_key(&digest)).await.ok().flatten().is_some() {
                             self.virtual_requests.remove(&digest);
                         } else if self.virtual_requests.get(&digest)
                             .map_or(false, |(_, timestamp)| timestamp + (self.sync_retry_delay as u128) < now)
