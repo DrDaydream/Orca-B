@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::aggregators::{CertificatesAggregator, GrbcVotesAggregator};
+use crate::control_broadcaster::ControlMessage;
 use crate::error::{DagError, DagResult};
 use crate::messages::{
     local_votes_key, Certificate, ConsensusCommand, ConsensusMessage, GrbcPhase, GrbcVote,
@@ -78,6 +79,7 @@ pub struct Core {
     proposal_tracker: ProposalTracker,
     pending_votes: HashMap<Digest, Vec<VerifiedGrbcVote>>,
     vote_outbox: Vec<GrbcVote>,
+    tx_control: Sender<ControlMessage>,
     /// Aggregates certificates to use as parents for new headers.
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>,
     /// Local records delivered after the ECHO quorum or READY relay threshold.
@@ -114,6 +116,7 @@ impl Core {
         tx_consensus: Sender<ConsensusMessage>,
         tx_proposer: Sender<ProposerMessage>,
         rx_consensus: Receiver<ConsensusCommand>,
+        tx_control: Sender<ControlMessage>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -145,6 +148,7 @@ impl Core {
                 missing_proposals: HashMap::new(),
                 pending_votes: HashMap::new(),
                 vote_outbox: Vec::new(),
+                tx_control,
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 grade_one_certificates: HashMap::new(),
                 grbc_certificates: HashMap::new(),
@@ -579,10 +583,15 @@ impl Core {
                 .or_default()
                 .push(vote);
         }
-        for ((round, _), votes) in grouped {
-            let batch = GrbcVoteBatch::from_votes(votes).expect("Mixed local GRBC votes");
-            self.broadcast_grbc_batch(PrimaryMessage::GrbcVoteBatch(batch), round)
-                .await;
+        if !grouped.is_empty() {
+            let batches = grouped
+                .into_values()
+                .map(|votes| GrbcVoteBatch::from_votes(votes).expect("Mixed local GRBC votes"))
+                .collect();
+            self.tx_control
+                .send(ControlMessage::Votes(batches))
+                .await
+                .expect("Failed to send GRBC batches");
         }
     }
 
@@ -705,16 +714,6 @@ impl Core {
                         }
                     }
                 }
-                Ok(())
-            }
-            PrimaryMessage::Consensus(message) => {
-                message.verify(&self.committee)?;
-                let batch = bincode::deserialize::<Vec<Vec<u8>>>(&message.payload)
-                    .map_err(DagError::SerializationError)?;
-                self.tx_consensus
-                    .send(ConsensusMessage::AbaBatch(message.author, batch))
-                    .await
-                    .expect("Failed to deliver ABA batch");
                 Ok(())
             }
             PrimaryMessage::LeaderRequest(round, leader, requestor) => {

@@ -4,6 +4,9 @@
 //! broadcasts every [`AbaAction::Broadcast`] and supplies the authenticated
 //! sender to [`Aba::handle_message`]. The local broadcast is already counted
 //! by the state machine and must not be looped back into it.
+//! This branch's experimental transport trusts the declared sender without
+//! signatures. Authentication is therefore an experiment assumption, not an
+//! implemented guarantee of the network layer.
 
 use config::{Committee, Stake};
 use crypto::PublicKey;

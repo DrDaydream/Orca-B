@@ -13,6 +13,7 @@ struct Harness {
     _parents: Receiver<ProposerMessage>,
     _headers: Receiver<crate::header_waiter::WaiterMessage>,
     _certs: Receiver<Certificate>,
+    _control: Receiver<ControlMessage>,
 }
 
 impl Harness {
@@ -26,6 +27,7 @@ impl Harness {
         let sync = Synchronizer::new(name, &c, store.clone(), tx_headers, tx_certs);
         let (tx_events, events) = channel(100);
         let (tx_parents, parents) = channel(100);
+        let (tx_control, control) = channel(100);
         Self {
             core: Core {
                 name,
@@ -56,6 +58,7 @@ impl Harness {
                 proposal_tracker: ProposalTracker::default(),
                 pending_votes: HashMap::new(),
                 vote_outbox: Vec::new(),
+                tx_control,
                 certificates_aggregators: HashMap::new(),
                 grade_one_certificates: HashMap::new(),
                 grbc_certificates: HashMap::new(),
@@ -70,6 +73,7 @@ impl Harness {
             _parents: parents,
             _headers: headers,
             _certs: certs,
+            _control: control,
         }
     }
 
@@ -611,6 +615,15 @@ async fn vote_bursts_stay_batched_and_use_a_separate_data_connection() {
         .unwrap()
         .primary
         .primary_to_primary = listener.local_addr().unwrap();
+    let (tx_control, rx_control) = channel(100);
+    h.core.tx_control = tx_control;
+    let sender = crate::control_broadcaster::spawn_control_broadcaster(
+        h.core.name,
+        h.core.committee.clone(),
+        h.core.consensus_round.clone(),
+        h.core.gc_depth,
+        rx_control,
+    );
     h.core
         .broadcast_grbc_batch(PrimaryMessage::Proposal(proposal()), 1)
         .await;
@@ -655,6 +668,7 @@ async fn vote_bursts_stay_batched_and_use_a_separate_data_connection() {
     }
     assert_eq!(phases, vec![GrbcPhase::Echo, GrbcPhase::Ready]);
     assert!(h.core.vote_outbox.is_empty());
+    sender.abort();
 }
 
 #[tokio::test]

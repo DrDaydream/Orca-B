@@ -124,6 +124,36 @@ replicas. An application that fetches executed batches from worker replicas
 must adapt its data retrieval path. The repository's sample node only logs
 consensus output.
 
+### Opportunistic ABA piggybacking (unsigned experiment)
+
+Core still groups ECHO/READY votes by round and phase. It hands each complete
+outbox burst to the former ABA broadcaster, now a shared small-message sender.
+On each wake, that task drains at most 32 already-queued inputs. It packs a
+ready ABA batch alongside a vote batch when their combined frame fits 64 KiB;
+otherwise it sends each independently. Multiple already-queued ABA batches
+from the same sender can also share one envelope. There is no new task per
+vote, signing task, or wait for a future ECHO/READY. The old 1 ms ABA coalescing
+delay is removed; consensus still batches its own generated ABA actions.
+
+Vote-only and mixed frames use a control connection to the primary port.
+Standalone ABA uses the existing ABA port. Complete Proposal bytes never
+enter this sender. The primary receiver extracts mixed-frame ABA directly
+into consensus before enqueueing votes in Core. GRBC signature verification,
+phase counts and data/dependency gates stay in Core. ABA instance/round/type,
+sender deduplication, quorum rules and input conditions are unchanged.
+
+For controlled experiments, the ABA envelope now contains only the declared
+author and message batches. Its signature generation, hashing, verification,
+and nested payload serialization are removed. ABA assumes senders do not
+impersonate other authorities; this configuration does not implement Byzantine
+sender authentication. Header and ECHO/READY signatures remain enabled. Rebuild
+all nodes together because the wire encoding changed.
+
+Vote-only retries retain round-based GC. Mixed frames retain the ABA retry
+lifetime until ACK, even if their vote round has been collected: the carried
+ABA may belong to a different unfinished instance. Transport coalescing does
+not replace BVAL/AUX/DECIDE with ECHO/READY or remove logical ABA rounds.
+
 ## Bounds and compatibility
 
 - Serialized batch data per proposal is limited to 4 MiB. The complete
@@ -228,3 +258,15 @@ nodes absent (547 common blocks), and one of four nodes three seconds late
 (1182 common blocks, all at round 328 at shutdown). These are functional checks
 in the Windows environment above, not measurements of Ubuntu 24.04 latency
 or throughput at the user's 50,000 tx/s workload.
+
+The opportunistic/unsigned ABA revision passes 71 relevant unit tests
+(primary 45, consensus 26), their doctest checks and the benchmark-feature
+node build. New regressions cover immediate standalone sending, piggybacking
+in either queue-arrival order, intact phase batches, oversized ABA fallback,
+mixed-frame retransmission after vote-round GC, and ABA delivery with a full
+Core queue. Four real-process scenarios pass: four nodes (698 common blocks),
+ten nodes (997), one of four absent (547), and one of four three seconds late
+(659); each has zero round lag at shutdown. Debug logs observe 235 combined
+frames and 10,485 standalone ABA frames across these runs. Coalescing is
+opportunistic, so most ABA messages can still travel independently. These
+12-second Windows functional runs do not measure Ubuntu latency/TPS gains.
