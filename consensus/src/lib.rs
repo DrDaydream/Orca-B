@@ -1053,7 +1053,8 @@ impl Consensus {
                 }
             }
         }
-        // A certified DECIDE contains f+1 authenticated votes, so reliable
+        // DECIDE collects f+1 distinct senders (trusted by the experimental
+        // unsigned transport), so under that assumption reliable
         // dissemination no longer depends on this instance retaining all of
         // its BVAL/AUX round state.
         let certified = state

@@ -10,48 +10,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
 use std::fmt;
 
+/// Unsigned ABA envelope for controlled experiments. `author` is claimed,
+/// not authenticated; GRBC header/vote authentication is separate.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConsensusNetworkMessage {
     pub author: PublicKey,
-    pub payload: Vec<u8>,
-    pub signature: Signature,
-}
-
-impl ConsensusNetworkMessage {
-    pub async fn new(
-        payload: Vec<u8>,
-        author: PublicKey,
-        signature_service: &mut SignatureService,
-    ) -> Self {
-        let mut message = Self {
-            author,
-            payload,
-            signature: Signature::default(),
-        };
-        message.signature = signature_service.request_signature(message.digest()).await;
-        message
-    }
-
-    pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        ensure!(
-            committee.stake(&self.author) > 0,
-            DagError::UnknownAuthority(self.author)
-        );
-        self.signature
-            .verify(&self.digest(), &self.author)
-            .map_err(DagError::from)
-    }
-}
-
-impl Hash for ConsensusNetworkMessage {
-    fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(b"orca-consensus-network-v1");
-        hasher.update(&self.author);
-        hasher.update((self.payload.len() as u64).to_le_bytes());
-        hasher.update(&self.payload);
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
-    }
+    pub messages: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default, Eq, PartialEq)]
