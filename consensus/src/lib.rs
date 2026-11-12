@@ -332,12 +332,18 @@ impl State {
                 .iter()
                 .chain(&certificate.header.weak_edges)
             {
-                if self.dag_digests.contains(dependency) {
-                    continue;
-                }
                 if let Some(ancestor) = self.observed.get(dependency).cloned() {
-                    pending.push(ancestor);
-                } else {
+                    // Forced admission may put a block in Dag before its own
+                    // history arrives. Follow it for this owner as well; Dag
+                    // membership alone does not prove complete causal history.
+                    if self
+                        .last_committed
+                        .get(&ancestor.origin())
+                        .map_or(true, |round| ancestor.round() > *round)
+                    {
+                        pending.push(ancestor);
+                    }
+                } else if !self.dag_digests.contains(dependency) {
                     self.forced_history_waiters
                         .entry(dependency.clone())
                         .or_default()
@@ -1090,6 +1096,9 @@ impl Consensus {
                 if state.direct_commit_ready.contains(&leader_round) {
                     return;
                 }
+                // Experimental path: complete observed data is sufficient;
+                // local READY is not a prerequisite. Causal history is checked
+                // by the traversal/commit queue, with no equivocation detector.
                 if let Some(leader) = self.observed_leader(leader_round, state) {
                     let digest = leader.digest();
                     state.mark_grade_two(digest);
@@ -1663,6 +1672,10 @@ impl Consensus {
                 .map_or(false, |leader| {
                     state.predecessor_resolved(ready_round)
                         && state.dag_digests.contains(&leader.digest())
+                        && !state
+                            .forced_history_waiters
+                            .values()
+                            .any(|owners| owners.contains(&ready_round))
                 });
             if !leader_ready {
                 continue;

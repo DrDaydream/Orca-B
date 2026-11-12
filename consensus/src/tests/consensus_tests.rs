@@ -438,6 +438,55 @@ fn forced_admission_does_not_follow_virtual_edges() {
     assert!(!state.dag_digests.contains(&virtual_digest));
 }
 
+#[tokio::test]
+async fn commit_waits_for_missing_history_even_through_an_already_forced_parent() {
+    let committee = mock_committee();
+    let (tx_primary, _rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
+    let mut consensus = Consensus {
+        name: keys()[0].0,
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let (late_digest, late) = mock_certificate(keys()[1].0, 1, BTreeSet::new());
+    let (middle_digest, middle) = mock_certificate(
+        keys()[2].0,
+        2,
+        [late_digest.clone()].iter().cloned().collect(),
+    );
+    state.observe(middle.clone());
+    state.force_observed_history_to_dag(middle, 2);
+    assert!(state.dag_digests.contains(&middle_digest));
+    let (_, leader) = mock_certificate(keys()[0].0, 3, [middle_digest].iter().cloned().collect());
+    state.mark_skipped(1);
+    state.mark_skipped(2);
+    consensus.queue_leader_commit(leader, 1, &mut state).await;
+    assert!(rx_output.try_recv().is_err());
+    assert!(!state.committed_leaders.contains(&3));
+    assert!(state.forced_history_waiters[&late_digest].contains(&3));
+
+    let owners = state.observe(late);
+    for owner in owners {
+        if let Some(leader) = state.pending_leaders.get(&owner) {
+            let ordered = consensus.order_dag(leader, &state);
+            state.pending_order.insert(owner, ordered);
+            state.wake_pending(owner);
+        }
+    }
+    consensus.drain_ready_leaders(&mut state).await;
+    assert!(state.committed_leaders.contains(&3));
+    let mut rounds = Vec::new();
+    while let Ok(block) = rx_output.try_recv() {
+        rounds.push(block.round());
+    }
+    assert_eq!(rounds, vec![1, 2, 3]);
+}
+
 #[test]
 fn grade_two_dirties_only_its_r_plus_two_aba_instance() {
     let committee = mock_committee();
@@ -477,6 +526,85 @@ async fn missing_aba_leader_request_is_retried() {
         Ok(ConsensusCommand::LeaderRequest(1, _))
     ));
     assert!(state.missing_leader_requests[&1] > Instant::now());
+}
+
+#[tokio::test]
+async fn aba_one_accepts_complete_observed_leader_before_local_ready() {
+    let committee = mock_committee();
+    let (tx_primary, mut rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
+    let mut consensus = Consensus {
+        name: keys()[0].0,
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let (_, leader) = mock_certificate(consensus.ordering_leader_authority(1), 1, BTreeSet::new());
+    state.observe(leader.clone());
+    assert!(!state.vdag.contains_key(&1));
+    assert!(!state.grade_two.contains(&leader.digest()));
+    state.aba_decisions.insert(1, BinaryValue::One);
+    consensus
+        .apply_aba_decision(1, BinaryValue::One, &mut state)
+        .await;
+    assert_eq!(rx_output.try_recv().unwrap().digest(), leader.digest());
+    assert!(rx_output.try_recv().is_err());
+    while let Ok(command) = rx_primary.try_recv() {
+        assert!(!matches!(command, ConsensusCommand::LeaderRequest(_, _)));
+    }
+    assert!(state.committed_leaders.contains(&1));
+}
+
+#[tokio::test]
+async fn aba_one_recovers_ungraded_leader_and_waits_only_for_missing_history() {
+    let committee = mock_committee();
+    let (tx_primary, mut rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
+    let mut consensus = Consensus {
+        name: keys()[0].0,
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    state.mark_skipped(1);
+    state.aba_decisions.insert(2, BinaryValue::One);
+    consensus
+        .apply_aba_decision(2, BinaryValue::One, &mut state)
+        .await;
+    assert!(matches!(
+        rx_primary.try_recv(),
+        Ok(ConsensusCommand::LeaderRequest(2, _))
+    ));
+    let (parent_digest, parent) = mock_certificate(keys()[1].0, 1, BTreeSet::new());
+    let (_, leader) = mock_certificate(
+        consensus.ordering_leader_authority(2),
+        2,
+        [parent_digest.clone()].iter().cloned().collect(),
+    );
+    state.observe(leader.clone());
+    assert!(!state.vdag.contains_key(&2));
+    consensus.resolve_requested_leaders(&mut state).await;
+    assert!(state.pending_leaders.contains_key(&2));
+    assert!(!state.missing_leader_requests.contains_key(&2));
+    assert!(rx_output.try_recv().is_err());
+    let owners = state.observe(parent);
+    for owner in owners {
+        let ordered = consensus.order_dag(&state.pending_leaders[&owner], &state);
+        state.pending_order.insert(owner, ordered);
+        state.wake_pending(owner);
+    }
+    consensus.drain_ready_leaders(&mut state).await;
+    assert_eq!(rx_output.try_recv().unwrap().digest(), parent_digest);
+    assert_eq!(rx_output.try_recv().unwrap().digest(), leader.digest());
+    assert!(rx_output.try_recv().is_err());
 }
 
 #[tokio::test]

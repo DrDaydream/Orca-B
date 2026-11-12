@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::adversary;
-use crate::messages::{Certificate, Header};
+use crate::messages::{Certificate, Header, MAX_PROPOSAL_BYTES, MAX_PROPOSAL_WIRE_BYTES};
 use crate::primary::{PrimaryWorkerMessage, Round};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
@@ -10,6 +10,7 @@ use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::{CancelHandler, ReliableSender};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
@@ -48,7 +49,7 @@ pub struct Proposer {
     /// Receives the parents to include in the next header (along with their round number).
     rx_core: Receiver<ProposerMessage>,
     /// Receives the batches' digests from our workers.
-    rx_workers: Receiver<(Digest, WorkerId)>,
+    rx_workers: Receiver<(Digest, WorkerId, usize)>,
     /// Sends newly created headers to the `Core`.
     tx_core: Sender<Header>,
 
@@ -59,7 +60,7 @@ pub struct Proposer {
     last_weak_edges: Vec<Digest>,
     last_virtual_edges: Vec<Digest>,
     /// Holds the batches' digests waiting to be included in the next header.
-    digests: Vec<(Digest, WorkerId)>,
+    digests: VecDeque<(Digest, WorkerId, usize)>,
     /// Keeps track of the size (in bytes) of batches' digests that we received so far.
     payload_size: usize,
 }
@@ -73,7 +74,7 @@ impl Proposer {
         header_size: usize,
         max_header_delay: u64,
         rx_core: Receiver<ProposerMessage>,
-        rx_workers: Receiver<(Digest, WorkerId)>,
+        rx_workers: Receiver<(Digest, WorkerId, usize)>,
         tx_core: Sender<Header>,
     ) {
         let mut leader_schedule: Vec<_> = committee.authorities.keys().cloned().collect();
@@ -117,7 +118,7 @@ impl Proposer {
                 last_parents: genesis,
                 last_weak_edges: Vec::new(),
                 last_virtual_edges: Vec::new(),
-                digests: Vec::with_capacity(2 * header_size),
+                digests: VecDeque::with_capacity(2 * header_size),
                 payload_size: 0,
             }
             .run()
@@ -164,14 +165,42 @@ impl Proposer {
     }
 
     async fn make_header(&mut self) {
-        // Make a new header.
+        let mut payload = std::collections::BTreeMap::new();
+        let mut bytes = 0;
+        let parents = self.last_parents.drain(..).collect();
+        let weak_edges = self.last_weak_edges.drain(..).collect();
+        let virtual_edges = self.last_virtual_edges.drain(..).collect();
+        let skeleton = Header {
+            author: self.name,
+            round: self.round,
+            parents,
+            weak_edges,
+            virtual_edges,
+            ..Header::default()
+        };
+        // Empty batches map adds its u64 count. Each entry then contributes
+        // 36 bytes to the header and 40 bytes plus data to the batches map.
+        let mut wire_bytes = bincode::serialized_size(&skeleton).unwrap() + 8;
+        while let Some((_, _, size)) = self.digests.front() {
+            if bytes + size > MAX_PROPOSAL_BYTES
+                || wire_bytes + *size as u64 + 76 > MAX_PROPOSAL_WIRE_BYTES
+            {
+                break;
+            }
+            let (digest, worker, size) = self.digests.pop_front().unwrap();
+            self.payload_size -= digest.size();
+            bytes += size;
+            wire_bytes += size as u64 + 76;
+            payload.insert(digest, worker);
+        }
+        // Freeze every edge and payload digest before the first network message.
         let header = Header::new(
             self.name,
             self.round,
-            self.digests.drain(..).collect(),
-            self.last_parents.drain(..).collect(),
-            self.last_weak_edges.drain(..).collect(),
-            self.last_virtual_edges.drain(..).collect(),
+            payload,
+            skeleton.parents,
+            skeleton.weak_edges,
+            skeleton.virtual_edges,
             &mut self.signature_service,
         )
         .await;
@@ -224,7 +253,6 @@ impl Proposer {
                 } else {
                     // Make a new header.
                     self.make_header().await;
-                    self.payload_size = 0;
                 }
 
                 // Reschedule the timer.
@@ -247,11 +275,11 @@ impl Proposer {
                     self.last_weak_edges = weak_edges;
                     self.last_virtual_edges = virtual_edges;
                 }
-                Some((digest, worker_id)) = self.rx_workers.recv() => {
+                Some((digest, worker_id, size)) = self.rx_workers.recv() => {
                     self.payload_size += digest.size();
-                    self.digests.push((digest, worker_id));
+                    self.digests.push_back((digest, worker_id, size));
                 }
-                () = &mut timer => {
+                () = &mut timer, if !timer_expired => {
                     // Nothing to do.
                 }
             }

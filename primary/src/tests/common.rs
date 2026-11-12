@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::messages::{Certificate, GradeOneVote, Header};
+use crate::messages::{Certificate, GrbcPhase, GrbcVote, Header, Proposal};
 use bytes::Bytes;
 use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
 use crypto::Hash as _;
@@ -19,7 +19,7 @@ impl PartialEq for Header {
     }
 }
 
-impl PartialEq for GradeOneVote {
+impl PartialEq for GrbcVote {
     fn eq(&self, other: &Self) -> bool {
         self.digest() == other.digest()
     }
@@ -139,18 +139,19 @@ pub fn headers() -> Vec<Header> {
 }
 
 // Fixture
-pub fn votes(header: &Header) -> Vec<GradeOneVote> {
+pub fn votes(header: &Header, phase: GrbcPhase) -> Vec<GrbcVote> {
     keys()
         .into_iter()
         .map(|(author, secret)| {
-            let vote = GradeOneVote {
+            let vote = GrbcVote {
                 id: header.id.clone(),
                 round: header.round,
                 origin: header.author,
+                phase,
                 author,
                 signature: Signature::default(),
             };
-            GradeOneVote {
+            GrbcVote {
                 signature: Signature::new(&vote.digest(), &secret),
                 ..vote
             }
@@ -162,7 +163,7 @@ pub fn votes(header: &Header) -> Vec<GradeOneVote> {
 pub fn certificate(header: &Header) -> Certificate {
     Certificate {
         header: header.clone(),
-        votes: votes(&header)
+        votes: votes(&header, GrbcPhase::Ready)
             .into_iter()
             .map(|x| (x.author, x.signature))
             .collect(),
@@ -184,4 +185,11 @@ pub fn listener(address: SocketAddr) -> JoinHandle<Bytes> {
             _ => panic!("Failed to receive network message"),
         }
     })
+}
+
+pub fn proposal() -> Proposal {
+    Proposal {
+        header: header(),
+        batches: Default::default(),
+    }
 }
