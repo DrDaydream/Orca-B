@@ -138,18 +138,6 @@ impl Primary {
         tokio::spawn(async move {
             while let Some(command) = rx_consensus.recv().await {
                 match command {
-                    ConsensusCommand::Cleanup(certificate) => tx_cleanup
-                        .send(certificate)
-                        .await
-                        .expect("Failed to send cleanup"),
-                    ConsensusCommand::CleanupBatch(certificates) => {
-                        for certificate in certificates {
-                            tx_cleanup
-                                .send(certificate)
-                                .await
-                                .expect("Failed to send cleanup batch");
-                        }
-                    }
                     ConsensusCommand::AbaBroadcast(mut messages) => {
                         // Coalesce bursts from independent ABA instances. The
                         // Core signs the resulting batch once.
@@ -161,14 +149,6 @@ impl Primary {
                                 next = rx_consensus.recv() => match next {
                                     Some(ConsensusCommand::AbaBroadcast(mut more)) => {
                                         messages.append(&mut more);
-                                    }
-                                    Some(ConsensusCommand::Cleanup(certificate)) => {
-                                        tx_cleanup.send(certificate).await.expect("Failed to send cleanup");
-                                    }
-                                    Some(ConsensusCommand::CleanupBatch(certificates)) => {
-                                        for certificate in certificates {
-                                            tx_cleanup.send(certificate).await.expect("Failed to send cleanup batch");
-                                        }
                                     }
                                     Some(command) => {
                                         tx_consensus_commands.send(command).await.expect("Failed to send consensus command");
@@ -314,6 +294,7 @@ impl Primary {
             tx_consensus,
             /* tx_proposer */ tx_parents,
             rx_consensus_commands,
+            tx_cleanup,
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
