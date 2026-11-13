@@ -31,6 +31,86 @@ fn with_payload() -> Proposal {
     p
 }
 
+#[test]
+fn complete_proposal_decoding_reads_payloads_in_bulk() {
+    struct CountingReader<'a> {
+        bytes: &'a [u8],
+        calls: usize,
+    }
+    impl std::io::Read for CountingReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            std::io::Read::read(&mut self.bytes, buffer)
+        }
+    }
+    let p = with_payload();
+    let wire = bincode::serialize(&p).unwrap();
+    let mut reader = CountingReader {
+        bytes: &wire,
+        calls: 0,
+    };
+    let decoded: Proposal = bincode::deserialize_from(&mut reader).unwrap();
+    assert_eq!(decoded.header, p.header);
+    assert_eq!(decoded.batches, p.batches);
+    assert!(reader.bytes.is_empty());
+    assert!(
+        reader.calls < 1024,
+        "Payload decoding must not perform one read per byte; used {} reads",
+        reader.calls
+    );
+}
+
+#[test]
+fn complete_proposal_codec_preserves_legacy_bytes_and_rejects_truncation() {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct LegacyProposal {
+        header: Header,
+        batches: std::collections::BTreeMap<Digest, Vec<u8>>,
+    }
+    for p in [proposal(), with_payload()] {
+        let legacy = LegacyProposal {
+            header: p.header.clone(),
+            batches: p.batches.clone(),
+        };
+        let wire = bincode::serialize(&legacy).unwrap();
+        assert_eq!(bincode::serialize(&p).unwrap(), wire);
+        assert_eq!(bincode::serialized_size(&p).unwrap(), wire.len() as u64);
+        let decoded: Proposal = bincode::deserialize(&wire).unwrap();
+        assert_eq!(decoded.header, p.header);
+        assert_eq!(decoded.batches, p.batches);
+        let restored: LegacyProposal =
+            bincode::deserialize(&bincode::serialize(&p).unwrap()).unwrap();
+        assert_eq!(restored.header, p.header);
+        assert_eq!(restored.batches, p.batches);
+        assert!(bincode::deserialize::<Proposal>(&wire[..wire.len() - 1]).is_err());
+    }
+}
+
+#[test]
+fn complete_proposal_codec_preserves_duplicate_key_resolution() {
+    // A malformed map can repeat a digest: retain BTreeMap's last-value behavior.
+    let mut wire = bincode::serialize(&Header::default()).unwrap();
+    wire.extend_from_slice(&2u64.to_le_bytes());
+    let digest = Digest([7; 32]);
+    for bytes in [vec![1u8; 16], vec![2u8; 32]] {
+        wire.extend_from_slice(&bincode::serialize(&(digest.clone(), bytes)).unwrap());
+    }
+    let decoded: Proposal = bincode::deserialize(&wire).unwrap();
+    assert_eq!(decoded.batches.len(), 1);
+    assert_eq!(decoded.batches[&digest], vec![2u8; 32]);
+}
+
+#[test]
+fn complete_proposal_slice_decoder_rejects_an_impossible_payload_length() {
+    // Construct the existing layout up to the first batch length. The frame
+    // contains no payload bytes; decoding must fail before allocating the claim.
+    let mut wire = bincode::serialize(&Header::default()).unwrap();
+    wire.extend_from_slice(&1u64.to_le_bytes());
+    wire.extend_from_slice(&bincode::serialize(&Digest([0; 32])).unwrap());
+    wire.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert!(bincode::deserialize::<Proposal>(&wire).is_err());
+}
+
 #[tokio::test]
 async fn compact_header_and_shared_batches_reconstruct_complete_wire_proposal() {
     let mut store = store("roundtrip");

@@ -205,6 +205,7 @@ pub fn local_votes_key(digest: &Digest) -> Vec<u8> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proposal {
     pub header: Header,
+    #[serde(with = "crate::batch_bytes")]
     pub batches: BTreeMap<Digest, Vec<u8>>,
 }
 
