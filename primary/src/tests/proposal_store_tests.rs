@@ -112,14 +112,7 @@ async fn virtual_dependency_uses_header_without_loading_batch_bytes() {
         .await;
     let c = committee();
     let (tx_headers, _headers) = channel(10);
-    let (tx_certs, _certs) = channel(10);
-    let mut sync = crate::synchronizer::Synchronizer::new(
-        keys()[0].0,
-        &c,
-        store.clone(),
-        tx_headers,
-        tx_certs,
-    );
+    let mut sync = crate::synchronizer::Synchronizer::new(&c, store.clone(), tx_headers);
     let mut child = proposal().header;
     child.virtual_edges.insert(digest.clone());
     let parents = sync.get_parents(&child).await.unwrap();

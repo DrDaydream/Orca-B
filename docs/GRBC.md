@@ -46,8 +46,9 @@ Each honest process sends at most one ECHO and one READY per instance.
   actually committed the block; it cannot import a remote FINISH assertion.
   Votes received before data are buffered; missing
   proposals are requested with retries, subject to the in-flight grace below.
-- Grade-1 records use `orca-ready-v2/`; payloads and local votes also have
-  separate `v2` key prefixes. Strong/weak dependency checks
+- Grade-1 state is kept in memory; the unused `orca-ready-v2/` record and
+  raw header-ID copy are no longer written. Payloads and local votes retain
+  their separate `v2` key prefixes. Strong/weak dependency checks
   before ECHO require local completion, from FINISH or actual commit. Virtual targets require their
   complete-proposal signed header markers to check rounds, not a local READY grade: another
   node's READY does not guarantee this node can immediately reach READY.
@@ -222,7 +223,7 @@ Queue capacities, outgoing vote batching and GRBC thresholds are unchanged.
 The smaller budget returns control to the input selector more often, including
 when a vote vector is larger than one burst.
 
-The 32-item setting passes all 46 primary unit tests with all features, doctest
+The initial 32-item change passed all 46 primary unit tests with all features, doctest
 checks and the benchmark-feature node build on Windows. The process results
 below were recorded with the earlier 256-item setting; performance with 32
 items remains to be measured.
@@ -280,6 +281,37 @@ three seconds late; all three end with zero round lag. Ten nodes retain a
 792-block common prefix and recent progress at every node, but still have a
 30-round maximum lag. These functional runs do not establish Ubuntu latency or
 throughput improvements, and the ten-node lag remains unresolved.
+
+## Simplified processing
+
+Rules 1 and 2 no longer pre-admit causal history before offering their ABA
+input. The common commit entry traverses known strong/weak history once, and
+the existing commit queue still waits for missing ancestors and preceding
+leaders. ABA commit and late-leader recovery use the same entry. Rule thresholds,
+grade-2 promotion for rule 2's third condition, and distinct-author counting
+remain intact.
+
+Rule 2 counts borrowed Dag entries using the existing strong-support index and
+two-hop virtual check. Path classification no longer clones a whole Dag round,
+allocates a result vector, or creates temporary OS threads. Leader selection
+uses the committee's already ordered keys. Unused legacy traversal and
+CertificateWaiter code, channels, and old worker-payload checks are removed.
+
+Core uses its complete-proposal index for first-observation notification and
+GC, eliminating three redundant state tables. Round retries run when completion
+records become available. Core and HeaderWaiter collect state only when the GC
+boundary advances; late commits still publish old dependency records without
+reviving old voting state. The 32-item burst services pending commands and
+stored proposals once at its start. All 101 workspace unit tests with all
+features and doctest checks pass, as does the benchmark-feature node build on
+Windows. Regressions include late commits after GC, retired record writes, and
+combined strong/virtual support counted once.
+
+Windows debug process checks retain identical commit prefixes: 689 blocks for
+four nodes online, 541 with one absent authority, and 1176 with a late node;
+these runs end with zero round lag. Ten nodes retain a 1063-block common prefix
+and recent progress at every node, with a four-round maximum lag at shutdown.
+These are functional checks; Ubuntu throughput and latency remain unmeasured.
 
 ## Reproduce validation
 

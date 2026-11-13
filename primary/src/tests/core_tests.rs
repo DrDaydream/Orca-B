@@ -12,7 +12,6 @@ struct Harness {
     _repairs: Receiver<(Vec<Digest>, PublicKey)>,
     _parents: Receiver<ProposerMessage>,
     _headers: Receiver<crate::header_waiter::WaiterMessage>,
-    _certs: Receiver<Certificate>,
     cleanup: Receiver<Vec<Certificate>>,
 }
 
@@ -26,8 +25,7 @@ impl Harness {
         let path = format!(".db_test_grbc_{}_{}_{}", label, node, std::process::id());
         let store = Store::new(&path).unwrap();
         let (tx_headers, headers) = channel(100);
-        let (tx_certs, certs) = channel(100);
-        let sync = Synchronizer::new(name, &c, store.clone(), tx_headers, tx_certs);
+        let sync = Synchronizer::new(&c, store.clone(), tx_headers);
         let (tx_events, events) = channel(100);
         let (tx_parents, parents) = channel(100);
         let (tx_votes, outgoing) = channel(100);
@@ -46,7 +44,6 @@ impl Harness {
                 gc_depth: 50,
                 rx_primaries: channel(1).1,
                 rx_header_waiter: channel(1).1,
-                rx_certificate_waiter: channel(1).1,
                 rx_proposals: channel(1).1,
                 in_flight: ProposalTracker::default(),
                 vote_batch: Vec::new().into_iter(),
@@ -58,9 +55,7 @@ impl Harness {
                 tx_cleanup,
                 gc_round: 0,
                 last_voted: HashMap::new(),
-                processing: HashMap::new(),
                 votes_aggregators: HashMap::new(),
-                observed_headers: HashMap::new(),
                 proposal_headers: HashMap::new(),
                 validated: HashSet::new(),
                 last_ready: HashMap::new(),
@@ -69,7 +64,6 @@ impl Harness {
                 pending_votes: HashMap::new(),
                 certificates_aggregators: HashMap::new(),
                 grade_one_certificates: HashMap::new(),
-                completed_certificates: HashMap::new(),
                 completed: HashSet::new(),
                 round_advance_pending: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
@@ -81,7 +75,6 @@ impl Harness {
             _repairs: repairs,
             _parents: parents,
             _headers: headers,
-            _certs: certs,
             cleanup,
         }
     }
@@ -126,6 +119,20 @@ async fn echo_quorum_delivers_ready_but_never_finish() {
     h.core.process_grbc_vote(echoes[2].clone()).await.unwrap();
     assert_eq!(h.grades(), vec![1]);
     assert!(h.core.completed.is_empty());
+    assert!(h
+        .core
+        .store
+        .read(p.header.id.to_vec())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(h
+        .core
+        .store
+        .read(crate::messages::grade_one_key(&p.block().digest()))
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(
         h.outgoing()
             .iter()
@@ -727,6 +734,49 @@ async fn committed_parent_batch_unlocks_dependencies_and_counts_with_grbc_once()
         "Repeated commit must not count parents twice"
     );
     assert!(h.outgoing().is_empty());
+}
+
+#[tokio::test]
+async fn late_commit_after_gc_releases_dependencies_without_reviving_old_state() {
+    let mut h = Harness::new("late_commit_gc", 0);
+    let p = proposal();
+    h.core.process_proposal(p.clone()).await.unwrap();
+    h.grades();
+    h.outgoing();
+    h.core
+        .consensus_round
+        .store(h.core.gc_depth + p.header.round + 1, Ordering::Relaxed);
+    h.core.cleanup();
+    assert!(h.core.proposal_headers.is_empty());
+    assert!(h.core.votes_aggregators.is_empty());
+    // A late commit can still publish the completion record for older history.
+    // No newer cleanup event will arrive to remove accidentally revived state.
+    h.core.process_committed(vec![p.block()]).await.unwrap();
+    assert!(h
+        .core
+        .store
+        .read(p.block().digest().to_vec())
+        .await
+        .unwrap()
+        .is_some());
+    assert!(h.core.proposal_headers.is_empty());
+    assert!(h.core.completed.is_empty());
+    assert!(h.core.last_voted.is_empty());
+    assert!(h.core.last_ready.is_empty());
+    assert!(h.core.weak_edge_candidates.is_empty());
+    assert!(h.core.round_advance_pending.is_empty());
+    assert!(h._parents.try_recv().is_err());
+    assert!(h._headers.try_recv().is_ok());
+    // Repeated data and votes below that boundary cannot restart broadcasting.
+    assert!(h.core.process_proposal(p.clone()).await.is_err());
+    assert!(h
+        .core
+        .process_grbc_vote(votes(&p.header, GrbcPhase::Ready).remove(1))
+        .await
+        .is_err());
+    h.core.cleanup();
+    assert!(h.outgoing().is_empty());
+    assert!(h.events.try_recv().is_err());
 }
 
 #[tokio::test]

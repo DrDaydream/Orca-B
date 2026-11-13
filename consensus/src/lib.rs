@@ -1103,7 +1103,6 @@ impl Consensus {
                     let digest = leader.digest();
                     state.mark_grade_two(digest);
                     state.promote_ready();
-                    state.force_observed_history_to_dag(leader.clone(), leader_round);
                     self.queue_leader_commit(leader, aba_rule, state).await;
                 } else if !state.missing_leader_requests.contains_key(&leader_round) {
                     state
@@ -1124,7 +1123,6 @@ impl Consensus {
                 let digest = leader.digest();
                 state.mark_grade_two(digest);
                 state.promote_ready();
-                state.force_observed_history_to_dag(leader.clone(), round);
                 let rule = state.leader_commit_rules.get(&round).copied().unwrap_or(3);
                 self.queue_leader_commit(leader, rule, state).await;
             }
@@ -1229,10 +1227,10 @@ impl Consensus {
             .filter(|(block_digest, _)| support.processed_grade_two.insert(block_digest.clone()))
             .map(|(_, block)| block)
             .collect();
-        let classified = self.classify_paths_parallel(&fresh, &digest, state);
-        // Worker threads only read immutable indexes. All protocol state is
-        // merged here, in the single ordered consensus task.
-        for (origin, strong, strong_or_virtual) in classified {
+        for block in &fresh {
+            let origin = block.origin();
+            let strong = self.has_strong_path(block, &digest, state);
+            let strong_or_virtual = strong || self.has_two_hop_virtual_path(block, &digest, state);
             if strong {
                 support.strong.insert(origin);
             }
@@ -1276,28 +1274,15 @@ impl Consensus {
         state.zero_input_checked_through = state.zero_input_checked_through.max(deadline);
     }
 
-    /// Returns the certificate (and the certificate's digest) originated by the leader of the
-    /// specified round (if any).
-    fn leader<'a>(&self, round: Round, dag: &'a Dag) -> Option<&'a (Digest, Certificate)> {
-        // TODO: We should elect the leader of round r-2 using the common coin revealed at round r.
-        // At this stage, we are guaranteed to have 2f+1 certificates from round r (which is enough to
-        // compute the coin). We currently just use round-robin.
-        let leader = self.ordering_leader_authority(round);
-
-        // Return its certificate and the certificate's digest.
-        dag.get(&round).map(|x| x.get(&leader)).flatten()
-    }
-
     /// Deterministically designates one authority as leader for every round.
-    /// Keeping this separate from `leader` means a round has a designated
-    /// leader even when that authority's certificate has not arrived yet.
+    /// A round has a designated leader even before its proposal arrives.
     fn leader_authority(&self, round: Round) -> PublicKey {
-        let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
-        keys.sort();
-
-        let coin = round;
-
-        keys[coin as usize % self.committee.size()]
+        *self
+            .committee
+            .authorities
+            .keys()
+            .nth(round as usize % self.committee.size())
+            .expect("Committee is empty")
     }
 
     /// Returns `(observed_stake, dag_stake)` for round-`round` blocks that
@@ -1370,7 +1355,6 @@ impl Consensus {
             leader, observed_stake, dag_stake
         );
         state.direct_commit_ready.insert(leader.round());
-        state.force_observed_history_to_dag(leader.clone(), leader_round);
         if propagate_aba_input {
             self.offer_aba_input(leader.round(), BinaryValue::One, state)
                 .await;
@@ -1428,7 +1412,6 @@ impl Consensus {
             leader, observed_strong, dag_strong, dag_strong_or_virtual
         );
         state.direct_commit_ready.insert(leader.round());
-        state.force_observed_history_to_dag(leader.clone(), leader_round);
         if propagate_aba_input {
             self.offer_aba_input(leader.round(), BinaryValue::One, state)
                 .await;
@@ -1448,21 +1431,18 @@ impl Consensus {
             .dag_strong_support
             .get(&(q, leader_digest.clone()))
             .unwrap_or(&empty);
-        let mut dag_strong_or_virtual = HashSet::new();
-        let dag_blocks: Vec<_> = state
+        // Dag already has one block per authority; count borrowed entries directly.
+        let dag_strong_or_virtual: Stake = state
             .dag
             .get(&q)
             .into_iter()
             .flat_map(|round| round.values())
-            .map(|(_, block)| block.clone())
-            .collect();
-        for (origin, _, strong_or_virtual) in
-            self.classify_paths_parallel(&dag_blocks, leader_digest, state)
-        {
-            if strong_or_virtual {
-                dag_strong_or_virtual.insert(origin);
-            }
-        }
+            .filter(|(_, block)| {
+                dag_strong.contains(&block.origin())
+                    || self.has_two_hop_virtual_path(block, leader_digest, state)
+            })
+            .map(|(_, block)| self.committee.stake(&block.origin()))
+            .sum();
         let observed_strong = state
             .observed_strong_support
             .get(&(q, leader_digest.clone()))
@@ -1474,61 +1454,11 @@ impl Consensus {
                 .map(|authority| self.committee.stake(authority))
                 .sum()
         };
-        let result = (
+        (
             stake(observed_strong),
             stake(dag_strong),
-            stake(&dag_strong_or_virtual),
-        );
-        result
-    }
-
-    /// Evaluate independent reachability queries in parallel and return only
-    /// immutable results. The caller performs the deterministic state update.
-    fn classify_paths_parallel(
-        &self,
-        blocks: &[Certificate],
-        target: &Digest,
-        state: &State,
-    ) -> Vec<(PublicKey, bool, bool)> {
-        if blocks.len() < 8 {
-            return blocks
-                .iter()
-                .map(|block| {
-                    let strong = self.has_strong_path(block, target, state);
-                    let virtual_path =
-                        strong || self.has_two_hop_virtual_path(block, target, state);
-                    (block.origin(), strong, virtual_path)
-                })
-                .collect();
-        }
-        let workers = std::thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(1)
-            .min(4)
-            .min(blocks.len());
-        let chunk_size = (blocks.len() + workers - 1) / workers;
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = blocks
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    scope.spawn(move || {
-                        chunk
-                            .iter()
-                            .map(|block| {
-                                let strong = self.has_strong_path(block, target, state);
-                                let virtual_path =
-                                    strong || self.has_two_hop_virtual_path(block, target, state);
-                                (block.origin(), strong, virtual_path)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|handle| handle.join().expect("path worker panicked"))
-                .collect()
-        })
+            dag_strong_or_virtual,
+        )
     }
 
     /// Strong-path reachability over blocks observed in Dag union VDag.
@@ -1774,108 +1704,17 @@ impl Consensus {
     fn ordering_leader_authority(&self, _round: Round) -> PublicKey {
         #[cfg(test)]
         {
-            let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
-            keys.sort();
-            keys[0]
+            *self
+                .committee
+                .authorities
+                .keys()
+                .next()
+                .expect("Committee is empty")
         }
         #[cfg(not(test))]
         {
             self.leader_authority(_round)
         }
-    }
-
-    /// Order the past leaders that we didn't already commit.
-    #[allow(dead_code)]
-    fn order_leaders(&self, leader: &Certificate, state: &State) -> Vec<Certificate> {
-        let mut to_commit = vec![leader.clone()];
-        let mut leader = leader;
-        for r in (state.last_committed_round + 2..leader.round())
-            .rev()
-            .step_by(2)
-        {
-            // Get the certificate proposed by the previous leader.
-            let (_, prev_leader) = match self.leader(r, &state.dag) {
-                Some(x) => x,
-                None => continue,
-            };
-
-            // Check whether there is a path between the last two leaders.
-            if self.linked(leader, prev_leader, &state.dag) {
-                to_commit.push(prev_leader.clone());
-                leader = prev_leader;
-            }
-        }
-        to_commit
-    }
-
-    /// Checks if there is a path between two leaders.
-    #[allow(dead_code)]
-    fn linked(&self, leader: &Certificate, prev_leader: &Certificate, dag: &Dag) -> bool {
-        let mut parents = vec![leader];
-        for r in (prev_leader.round()..leader.round()).rev() {
-            parents = dag
-                .get(&(r))
-                .expect("We should have the whole history by now")
-                .values()
-                .filter(|(digest, _)| parents.iter().any(|x| x.header.parents.contains(digest)))
-                .map(|(_, certificate)| certificate)
-                .collect();
-        }
-        parents.contains(&prev_leader)
-    }
-
-    /// Checks whether `leader` reaches `prev_leader` through any combination
-    /// of strong (`parents`) and weak (`weak_edges`) edges.
-    ///
-    /// Weak edges may skip rounds, so unlike `linked` this method performs a
-    /// digest-based depth-first search rather than walking one round at a time.
-    #[allow(dead_code)] // Available for the VDag-aware commit rule added next.
-    fn linked_by_strong_or_weak(
-        &self,
-        leader: &Certificate,
-        prev_leader: &Certificate,
-        dag: &Dag,
-    ) -> bool {
-        let target = prev_leader.digest();
-        if leader.digest() == target {
-            return true;
-        }
-
-        let mut visited = HashSet::new();
-        let mut pending: Vec<Digest> = leader
-            .header
-            .parents
-            .iter()
-            .chain(&leader.header.weak_edges)
-            .cloned()
-            .collect();
-
-        while let Some(digest) = pending.pop() {
-            if digest == target {
-                return true;
-            }
-            if !visited.insert(digest.clone()) {
-                continue;
-            }
-
-            let certificate = dag
-                .values()
-                .flat_map(|authorities| authorities.values())
-                .find(|(candidate, _)| candidate == &digest)
-                .map(|(_, certificate)| certificate);
-
-            if let Some(certificate) = certificate {
-                pending.extend(
-                    certificate
-                        .header
-                        .parents
-                        .iter()
-                        .chain(&certificate.header.weak_edges)
-                        .cloned(),
-                );
-            }
-        }
-        false
     }
 
     /// Flatten the dag referenced by the input certificate. This is a classic depth-first search (pre-order):

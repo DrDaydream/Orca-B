@@ -1,5 +1,4 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::certificate_waiter::CertificateWaiter;
 use crate::core::Core;
 use crate::error::DagError;
 use crate::garbage_collector::GarbageCollector;
@@ -122,9 +121,7 @@ impl Primary {
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
         let (tx_headers, rx_headers) = channel(CHANNEL_CAPACITY);
         let (tx_sync_headers, rx_sync_headers) = channel(CHANNEL_CAPACITY);
-        let (tx_sync_certificates, rx_sync_certificates) = channel(CHANNEL_CAPACITY);
         let (tx_headers_loopback, rx_headers_loopback) = channel(CHANNEL_CAPACITY);
-        let (tx_certificates_loopback, rx_certificates_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         // Bound resident bulk data independently from the small control messages.
         let (tx_remote_proposals, rx_remote_proposals) = channel(32);
@@ -240,11 +237,9 @@ impl Primary {
 
         // The `Synchronizer` provides auxiliary methods helping to `Core` to sync.
         let synchronizer = Synchronizer::new(
-            name,
             &committee,
             store.clone(),
             /* tx_header_waiter */ tx_sync_headers,
-            /* tx_certificate_waiter */ tx_sync_certificates,
         );
 
         // The `SignatureService` is used to require signatures on specific digests.
@@ -286,7 +281,6 @@ impl Primary {
             parameters.gc_depth,
             /* rx_primaries */ rx_primary_messages,
             /* rx_header_waiter */ rx_headers_loopback,
-            /* rx_certificate_waiter */ rx_certificates_loopback,
             rx_stored_proposals,
             in_flight,
             tx_votes.clone(),
@@ -316,14 +310,6 @@ impl Primary {
             parameters.sync_retry_nodes,
             /* rx_synchronizer */ rx_sync_headers,
             /* tx_core */ tx_headers_loopback,
-        );
-
-        // The `CertificateWaiter` waits to receive all the ancestors of a certificate before looping it back to the
-        // `Core` for further processing.
-        CertificateWaiter::spawn(
-            store.clone(),
-            /* rx_synchronizer */ rx_sync_certificates,
-            /* tx_core */ tx_certificates_loopback,
         );
 
         // When the `Core` collects enough parent certificates, the `Proposer` generates a new header with new batch
