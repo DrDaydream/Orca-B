@@ -30,7 +30,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 #[path = "tests/core_tests.rs"]
 pub mod core_tests;
 
-const CORE_WORK_BUDGET: usize = 256;
+const CORE_WORK_BUDGET: usize = 32;
 const PROPOSAL_SERVICE_INTERVAL: usize = 32;
 // Unverified arrivals may defer repair only for a bounded time after the first
 // authenticated vote. Repeated arrivals/votes cannot extend this deadline.

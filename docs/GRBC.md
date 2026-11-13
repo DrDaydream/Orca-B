@@ -210,20 +210,25 @@ Additional arrivals or votes do not reset that deadline. Tracking is only a
 scheduling hint: every proposal still passes full validation before Core can
 observe it or vote. Frames still in transit or being decoded are not tracked.
 
-The old 32-envelope drain is replaced by a 256-work-item budget. Each vote
+Core uses a 32-work-item budget, reduced from 256. Each vote
 costs one item; opening a vector and other control messages also cost one.
-Core services one consensus command and one stored proposal before the burst
-and every 32 items, so actual commit feedback is not starved by hot vote traffic.
+Core services one consensus command and one stored proposal at the start of
+each burst, so actual commit feedback is not starved by hot vote traffic.
 Oversized vectors retain their unconsumed votes across bursts, without new
 network packets; later control frames do not overtake that remainder. At the
 end of a full burst Core yields to the runtime and reselects among its inputs.
 An empty network queue returns directly to selection without an extra yield.
 Queue capacities, outgoing vote batching and GRBC thresholds are unchanged.
-This increases the limit for small frames while bounding the long runs caused
-by many votes in one frame; it does not imply an eightfold throughput gain.
+The smaller budget returns control to the input selector more often, including
+when a vote vector is larger than one burst.
 
-All 96 workspace unit tests with all features and the doctest checks pass on
-Windows. Regressions cover processing and stored-header queues, failure and
+The 32-item setting passes all 46 primary unit tests with all features, doctest
+checks and the benchmark-feature node build on Windows. The process results
+below were recorded with the earlier 256-item setting; performance with 32
+items remains to be measured.
+
+The original 256-item change passed all 96 workspace unit tests with all
+features and the doctest checks on Windows. Regressions cover processing and stored-header queues, failure and
 duplicate guards, queue cancellation, a repair deadline that cannot be renewed,
 oversized-vector continuation/FIFO, and a proposal completing during a burst.
 The benchmark-feature node build also passes. Final real-process runs agree on
