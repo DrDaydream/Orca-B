@@ -46,6 +46,8 @@ impl Harness {
                 rx_header_waiter: channel(1).1,
                 rx_certificate_waiter: channel(1).1,
                 rx_proposals: channel(1).1,
+                in_flight: ProposalTracker::default(),
+                vote_batch: Vec::new().into_iter(),
                 tx_votes,
                 tx_cert_requests: tx_repairs,
                 tx_consensus: tx_events,
@@ -360,7 +362,7 @@ async fn complete_payloads_progress_across_rounds_using_local_finish_parents() {
                 // Exercise the exact network enum and serialization, including data.
                 let wire = bincode::serialize(&PrimaryMessage::Proposal(proposal.clone())).unwrap();
                 node.core
-                    .process_primary_message(bincode::deserialize(&wire).unwrap())
+                    .process_primary_burst(Some(bincode::deserialize(&wire).unwrap()))
                     .await
                     .unwrap();
             }
@@ -384,7 +386,7 @@ async fn complete_payloads_progress_across_rounds_using_local_finish_parents() {
             for wire in messages.into_iter().rev() {
                 for node in &mut nodes {
                     node.core
-                        .process_primary_message(bincode::deserialize(&wire).unwrap())
+                        .process_primary_burst(Some(bincode::deserialize(&wire).unwrap()))
                         .await
                         .unwrap();
                 }
@@ -550,6 +552,222 @@ async fn forged_vote_cannot_poison_the_authenticated_vote_buffer() {
     h.core.process_proposal(p.clone()).await.unwrap();
     assert_eq!(h.core.votes_aggregators[&p.header.id].ready_weight, 1);
     assert!(h.grades().is_empty());
+}
+
+#[tokio::test]
+async fn in_flight_proposal_suppresses_repair_through_core_registration() {
+    let mut h = Harness::new("in_flight_registration", 0);
+    let p = proposal();
+    let digest = p.block().digest();
+    let guard = h.core.in_flight.track(&p.header);
+    h.core
+        .process_grbc_vote(votes(&p.header, GrbcPhase::Echo).remove(1))
+        .await
+        .unwrap();
+    h.core.retry_missing_proposals().await;
+    assert!(h.core.cancel_handlers.is_empty());
+    let (stored, _) = crate::proposal_processor::prepare_proposal(
+        p.clone(),
+        committee(),
+        &mut h.core.store,
+        false,
+        Some(guard),
+    )
+    .await
+    .unwrap();
+    let (tx, rx) = channel(1);
+    h.core.rx_proposals = rx;
+    tx.send(stored).await.ok().unwrap();
+    assert!(h.core.in_flight.contains(&digest));
+    h.core
+        .process_grbc_vote(votes(&p.header, GrbcPhase::Echo).remove(2))
+        .await
+        .unwrap();
+    h.core.retry_missing_proposals().await;
+    assert!(
+        h.core.cancel_handlers.is_empty(),
+        "Stored but unregistered data must not be re-requested"
+    );
+    h.core.process_primary_burst(None).await.unwrap();
+    assert!(!h.core.in_flight.contains(&digest));
+    assert!(h.core.missing_proposals.is_empty());
+    assert!(h.core.pending_votes.is_empty());
+    assert_eq!(h.grades(), vec![1]);
+}
+
+#[tokio::test]
+async fn failed_duplicate_and_cancelled_proposals_release_repair_suppression() {
+    let mut h = Harness::new("in_flight_failure", 0);
+    let p = proposal();
+    let digest = p.block().digest();
+    let guard = h.core.in_flight.track(&p.header);
+    let duplicate = h.core.in_flight.track(&p.header);
+    h.core
+        .process_grbc_vote(votes(&p.header, GrbcPhase::Echo).remove(1))
+        .await
+        .unwrap();
+    let mut invalid = p.clone();
+    invalid.header.signature = Signature::default();
+    assert!(crate::proposal_processor::prepare_proposal(
+        invalid,
+        committee(),
+        &mut h.core.store,
+        false,
+        Some(guard)
+    )
+    .await
+    .is_err());
+    assert!(
+        h.core.in_flight.contains(&digest),
+        "One failure must not clear another live arrival"
+    );
+    h.core.retry_missing_proposals().await;
+    assert!(h.core.cancel_handlers.is_empty());
+    let (tx, rx) = channel(1);
+    tx.send((p.clone(), duplicate)).await.unwrap();
+    drop(rx);
+    assert!(!h.core.in_flight.contains(&digest));
+    h.core.retry_missing_proposals().await;
+    assert_eq!(
+        h.core.cancel_handlers[&p.header.round].len(),
+        committee().size() - 1
+    );
+}
+
+#[tokio::test]
+async fn missing_proposals_request_immediately_and_stuck_work_cannot_suppress_forever() {
+    let mut h = Harness::new("repair_deadline", 0);
+    let p = proposal();
+    let digest = p.block().digest();
+    let vote = votes(&p.header, GrbcPhase::Echo).remove(1);
+    h.core.process_grbc_vote(vote.clone()).await.unwrap();
+    let peers = committee().size() - 1;
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), peers);
+    let first_seen = h.core.missing_proposals[&digest].1;
+    h.core.process_grbc_vote(vote).await.unwrap();
+    h.core
+        .process_grbc_vote(votes(&p.header, GrbcPhase::Ready).remove(1))
+        .await
+        .unwrap();
+    assert_eq!(h.core.missing_proposals[&digest].1, first_seen);
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), peers);
+    let guard = h.core.in_flight.track(&p.header);
+    h.core.retry_missing_proposals().await;
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), peers);
+    h.core.missing_proposals.get_mut(&digest).unwrap().1 = Instant::now() - PROPOSAL_REPAIR_GRACE;
+    drop(guard);
+    let _new_arrival = h.core.in_flight.track(&p.header);
+    h.core.retry_missing_proposals().await;
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), 2 * peers);
+}
+
+#[tokio::test]
+async fn large_vote_vector_yields_to_stored_headers_and_preserves_remaining_work() {
+    let mut h = Harness::new("large_vector_fairness", 0);
+    let p = proposal();
+    h.core.process_proposal(p.clone()).await.unwrap();
+    let mut later = p.clone();
+    later.header = crate::common::headers().remove(1);
+    let guard = h.core.in_flight.track(&later.header);
+    let (stored, _) = crate::proposal_processor::prepare_proposal(
+        later.clone(),
+        committee(),
+        &mut h.core.store,
+        false,
+        Some(guard),
+    )
+    .await
+    .unwrap();
+    let (tx_stored, rx_stored) = channel(1);
+    h.core.rx_proposals = rx_stored;
+    let echo = votes(&p.header, GrbcPhase::Echo).remove(1);
+    let mut vector = vec![echo; 2 * CORE_WORK_BUDGET];
+    vector.push(votes(&later.header, GrbcPhase::Echo).remove(1));
+    h.core
+        .process_primary_burst(Some(PrimaryMessage::GrbcVoteBatch(
+            GrbcVoteBatch::from_votes(vector).unwrap(),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(h.core.vote_batch.len(), CORE_WORK_BUDGET + 2);
+    tx_stored.send(stored).await.ok().unwrap();
+    let (tx_net, rx_net) = channel(1);
+    h.core.rx_primaries = rx_net;
+    tx_net
+        .send(PrimaryMessage::GrbcVote(
+            votes(&later.header, GrbcPhase::Ready).remove(1),
+        ))
+        .await
+        .unwrap();
+    h.core.process_primary_burst(None).await.unwrap();
+    assert!(h.core.proposal_headers.contains_key(&later.header.id));
+    assert_eq!(h.core.vote_batch.len(), 2);
+    assert_eq!(
+        h.core.rx_primaries.len(),
+        1,
+        "A later frame must not overtake the vector remainder"
+    );
+    h.core.process_primary_burst(None).await.unwrap();
+    assert_eq!(h.core.vote_batch.len(), 0);
+    assert_eq!(h.core.rx_primaries.len(), 0);
+    assert_eq!(h.core.votes_aggregators[&p.header.id].echo_weight, 2);
+    assert_eq!(h.core.votes_aggregators[&later.header.id].echo_weight, 2);
+    assert_eq!(h.core.votes_aggregators[&later.header.id].ready_weight, 1);
+    assert!(h.core.cancel_handlers.is_empty());
+}
+
+#[tokio::test]
+async fn proposal_completed_during_a_vote_burst_is_serviced_before_the_burst_ends() {
+    let mut h = Harness::new("mid_burst_registration", 0);
+    let (tx_votes, mut outgoing) = channel(1);
+    h.core.tx_votes = tx_votes;
+    let p = proposal();
+    h.core.process_proposal(p.clone()).await.unwrap();
+    h.core
+        .process_grbc_vote(votes(&p.header, GrbcPhase::Echo).remove(1))
+        .await
+        .unwrap();
+    let later = Proposal {
+        header: crate::common::headers().remove(1),
+        batches: BTreeMap::new(),
+    };
+    let (stored, _) = crate::proposal_processor::prepare_proposal(
+        later.clone(),
+        committee(),
+        &mut h.core.store,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let (tx_stored, rx_stored) = channel(1);
+    h.core.rx_proposals = rx_stored;
+    let mut events = h.events;
+    let producer = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if matches!(event, ConsensusMessage::GradeOne(_)) {
+                tx_stored.send(stored).await.ok().unwrap();
+                break;
+            }
+        }
+        // The first local ECHO fills this queue. Release it only after the
+        // stored header arrives, so the READY send orders this race exactly.
+        while outgoing.recv().await.is_some() {}
+    });
+    let vector = vec![votes(&p.header, GrbcPhase::Echo).remove(2); 2 * PROPOSAL_SERVICE_INTERVAL];
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        h.core
+            .process_primary_burst(Some(PrimaryMessage::GrbcVoteBatch(
+                GrbcVoteBatch::from_votes(vector).unwrap(),
+            ))),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(h.core.proposal_headers.contains_key(&later.header.id));
+    assert_eq!(h.core.vote_batch.len(), 0);
+    producer.abort();
 }
 
 #[tokio::test]

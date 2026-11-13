@@ -10,7 +10,7 @@ use crate::messages::{
     GrbcVoteBatch as VoteBatch, Proposal, MAX_PROPOSAL_BYTES,
 };
 use crate::payload_receiver::PayloadReceiver;
-use crate::proposal_processor::spawn_proposal_processors;
+use crate::proposal_processor::{spawn_proposal_processors, ProposalTracker, QueuedProposal};
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
 use crate::vote_sender::spawn_vote_sender;
@@ -200,6 +200,7 @@ impl Primary {
         // Atomic variable use to synchronizer all tasks with the latest consensus round. This is only
         // used for cleanup. The only tasks that write into this variable is `GarbageCollector`.
         let consensus_round = Arc::new(AtomicU64::new(0));
+        let in_flight = ProposalTracker::default();
 
         // Spawn the network receiver listening to messages from the other primaries.
         let mut address = committee
@@ -213,6 +214,7 @@ impl Primary {
             PrimaryReceiverHandler {
                 tx_primary_messages,
                 tx_remote_proposals,
+                in_flight: in_flight.clone(),
                 tx_cert_requests: tx_cert_requests.clone(),
             },
         );
@@ -290,6 +292,7 @@ impl Primary {
             rx_remote_proposals,
             rx_headers,
             tx_stored_proposals,
+            in_flight.clone(),
         );
 
         // Core handles compact validated headers and GRBC votes.
@@ -305,6 +308,7 @@ impl Primary {
             /* rx_header_waiter */ rx_headers_loopback,
             /* rx_certificate_waiter */ rx_certificates_loopback,
             rx_stored_proposals,
+            in_flight,
             tx_votes.clone(),
             tx_cert_requests,
             tx_consensus,
@@ -374,7 +378,8 @@ impl Primary {
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
-    tx_remote_proposals: Sender<Proposal>,
+    tx_remote_proposals: Sender<QueuedProposal>,
+    in_flight: ProposalTracker,
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
 }
 
@@ -419,11 +424,14 @@ impl MessageHandler for PrimaryReceiverHandler {
             bincode::deserialize(&serialized).map_err(DagError::SerializationError)?
         };
         match message {
-            PrimaryMessage::Proposal(proposal) => self
-                .tx_remote_proposals
-                .send(proposal)
-                .await
-                .expect("Failed to enqueue remote proposal"),
+            PrimaryMessage::Proposal(proposal) => {
+                // Register before waiting for space in the bounded bulk queue.
+                let guard = self.in_flight.track(&proposal.header);
+                self.tx_remote_proposals
+                    .send((proposal, guard))
+                    .await
+                    .expect("Failed to enqueue remote proposal");
+            }
             PrimaryMessage::CertificatesRequest(missing, requestor) => self
                 .tx_cert_requests
                 .send((missing, requestor))

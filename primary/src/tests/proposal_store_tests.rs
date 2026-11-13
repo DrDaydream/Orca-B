@@ -217,13 +217,13 @@ async fn proposal_processor_rejects_changed_bytes_even_for_a_known_header() {
     let p = with_payload();
     let digest = p.block().digest();
     let prepare = crate::proposal_processor::prepare_proposal;
-    let (stored, _) = prepare(p.clone(), committee(), &mut store, false)
+    let (stored, _) = prepare(p.clone(), committee(), &mut store, false, None)
         .await
         .unwrap();
     assert_eq!(stored.into_header(), p.header);
     let mut forged = p.clone();
     forged.batches.values_mut().next().unwrap()[0] ^= 1;
-    assert!(prepare(forged, committee(), &mut store, false)
+    assert!(prepare(forged, committee(), &mut store, false, None)
         .await
         .is_err());
     let restored = load_proposal(&mut store, &digest).await.unwrap().unwrap();

@@ -1,25 +1,75 @@
 //! Complete payload work stays outside the GRBC vote processing loop.
 use crate::error::{DagError, DagResult};
-use crate::messages::{Header, Proposal};
+use crate::messages::{Certificate, Header, Proposal};
 use crate::primary::{PrimaryMessage, Round};
 use crate::proposal_store::{assemble_proposal, store_verified_proposal};
 use bytes::Bytes;
 use config::Committee;
-use crypto::PublicKey;
+use crypto::{Digest, Hash as _, PublicKey};
 use log::{debug, warn};
 use network::{CancelHandler, ReliableSender};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
+/// Presence means work is queued/in flight, never that the proposal is valid.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProposalTracker(Arc<Mutex<HashMap<Digest, usize>>>);
+
+impl ProposalTracker {
+    pub(crate) fn track(&self, header: &Header) -> ProposalGuard {
+        let digest = Certificate {
+            header: Header {
+                id: header.id.clone(),
+                round: header.round,
+                author: header.author,
+                ..Header::default()
+            },
+            votes: Vec::new(),
+        }
+        .digest();
+        *self.0.lock().unwrap().entry(digest.clone()).or_default() += 1;
+        ProposalGuard {
+            tracker: self.clone(),
+            digest,
+        }
+    }
+
+    pub(crate) fn contains(&self, digest: &Digest) -> bool {
+        self.0.lock().unwrap().contains_key(digest)
+    }
+}
+
+/// Travels with the proposal through queueing, validation, storage and Core
+/// registration. Failure, cancellation and closed queues release it too.
+#[derive(Debug)]
+pub(crate) struct ProposalGuard {
+    tracker: ProposalTracker,
+    digest: Digest,
+}
+
+impl Drop for ProposalGuard {
+    fn drop(&mut self) {
+        let mut pending = self.tracker.0.lock().unwrap();
+        let count = pending.get_mut(&self.digest).expect("Untracked proposal");
+        *count -= 1;
+        if *count == 0 {
+            pending.remove(&self.digest);
+        }
+    }
+}
+
+pub(crate) type QueuedProposal = (Proposal, ProposalGuard);
+
 /// Created only after complete authentication, payload checks and atomic storage.
-pub(crate) struct StoredProposalHeader(Header);
+pub(crate) struct StoredProposalHeader(Header, Option<ProposalGuard>);
 
 impl StoredProposalHeader {
     pub(crate) fn into_header(self) -> Header {
-        self.0
+        let Self(header, _guard) = self;
+        header
     }
 }
 
@@ -28,6 +78,7 @@ pub(crate) async fn prepare_proposal(
     committee: Committee,
     store: &mut Store,
     outbound: bool,
+    in_flight: Option<ProposalGuard>,
 ) -> DagResult<(StoredProposalHeader, Option<Bytes>)> {
     let (proposal, bytes) = tokio::task::spawn_blocking(move || {
         proposal.verify(&committee)?;
@@ -45,7 +96,7 @@ pub(crate) async fn prepare_proposal(
     .await
     .expect("Proposal validation task failed")?;
     let header = store_verified_proposal(store, proposal).await?;
-    Ok((StoredProposalHeader(header), bytes))
+    Ok((StoredProposalHeader(header, in_flight), bytes))
 }
 
 fn report(result: DagResult<()>) {
@@ -64,9 +115,10 @@ pub(crate) fn spawn_proposal_processors(
     store: Store,
     consensus_round: Arc<AtomicU64>,
     gc_depth: Round,
-    mut rx_remote: Receiver<Proposal>,
+    mut rx_remote: Receiver<QueuedProposal>,
     mut rx_local: Receiver<Header>,
     tx: Sender<StoredProposalHeader>,
+    in_flight: ProposalTracker,
 ) {
     // Separate bounded consumers prevent a remote payload backlog from blocking
     // local proposals. At most one blocking validation job per consumer is active.
@@ -75,7 +127,7 @@ pub(crate) fn spawn_proposal_processors(
     let remote_round = consensus_round.clone();
     let remote_tx = tx.clone();
     tokio::spawn(async move {
-        while let Some(proposal) = rx_remote.recv().await {
+        while let Some((proposal, guard)) = rx_remote.recv().await {
             if proposal.header.round
                 < remote_round
                     .load(Ordering::Relaxed)
@@ -90,6 +142,7 @@ pub(crate) fn spawn_proposal_processors(
                         remote_committee.clone(),
                         &mut remote_store,
                         false,
+                        Some(guard),
                     )
                     .await?;
                     remote_tx
@@ -119,8 +172,9 @@ pub(crate) fn spawn_proposal_processors(
                     if header.round < consensus_round.load(Ordering::Relaxed).saturating_sub(gc_depth) { continue; }
                     report(async {
                         let round = header.round;
+                        let guard = in_flight.track(&header);
                         let proposal = assemble_proposal(&mut store, header).await?;
-                        let (header, bytes) = prepare_proposal(proposal, committee.clone(), &mut store, true).await?;
+                        let (header, bytes) = prepare_proposal(proposal, committee.clone(), &mut store, true, Some(guard)).await?;
                         pending.entry(round).or_default().extend(
                             network.broadcast(addresses.clone(), bytes.expect("Missing outbound proposal")).await
                         );
