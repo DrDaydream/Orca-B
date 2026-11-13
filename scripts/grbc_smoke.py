@@ -30,7 +30,8 @@ def main():
     root.mkdir(parents=True, exist_ok=True)
     flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     env = {k: v for k, v in os.environ.items() if not k.startswith('ORCA_')}
-    env.update(RUST_LOG='info', TOKIO_WORKER_THREADS='2')
+    env.pop('TOKIO_WORKER_THREADS', None)
+    env.update(RUST_LOG='info')
     held_ports = []
 
     def address():

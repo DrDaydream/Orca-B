@@ -68,8 +68,13 @@ after the entire write succeeds. It uses the existing default RocksDB durability
 options, without adding an fsync. A header marker means complete authenticated
 data was retained; it does not imply DAG validation, READY, or FINISH.
 
-Virtual-edge dependency checks and waiters read only this small header record.
-Strong/weak dependencies read the small local completion records. Both
+Dependency checks reuse Core's existing READY metadata for blocks already
+marked locally completed; READY alone cannot satisfy a strong/weak edge.
+Virtual edges can reuse READY metadata without completion. Missing or GC'd
+metadata, including commits before local READY, retain the storage fallback:
+virtual targets read only the small header record, and strong/weak dependencies
+read the local completion record. Round advancement uses the same completion
+check. This adds no cache, certificate exchange, or thread setting. Both
 ordinary repair replies and leader recovery reconstruct the full wire Proposal
 from its header and batch keys; missing data produces an error instead of a
 partial reply. Recovery still includes only the responder's own votes.

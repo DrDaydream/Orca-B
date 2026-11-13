@@ -5,6 +5,7 @@ use crate::messages::{proposal_header_key, Certificate, Header};
 use config::Committee;
 use crypto::Digest;
 use crypto::Hash as _;
+use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::Sender;
 
@@ -37,11 +38,25 @@ impl Synchronizer {
     /// Returns the parents of a header if we have them all. If at least one parent is missing,
     /// we return an empty vector, synchronize with other nodes, and re-schedule processing
     /// of the header for when we will have all the parents.
-    pub async fn get_parents(&mut self, header: &Header) -> DagResult<Vec<Certificate>> {
+    pub async fn get_parents(
+        &mut self,
+        header: &Header,
+        ready: &HashMap<Digest, Certificate>,
+        completed: &HashSet<Digest>,
+    ) -> DagResult<Vec<Certificate>> {
         let mut missing_required = Vec::new();
         let mut missing_virtual = Vec::new();
         let mut parents = Vec::new();
-        for digest in &header.parents {
+        for digest in header.parents.iter().chain(&header.weak_edges) {
+            // READY metadata alone cannot satisfy a strong/weak dependency.
+            // Reuse Core's immutable record only after local completion.
+            if let Some(parent) = ready
+                .get(digest)
+                .filter(|c| completed.contains(&c.header.id))
+            {
+                parents.push(parent.clone());
+                continue;
+            }
             if let Some(genesis) = self
                 .genesis
                 .iter()
@@ -57,21 +72,11 @@ impl Synchronizer {
                 None => missing_required.push(digest.clone()),
             };
         }
-        for digest in &header.weak_edges {
-            if let Some((_, genesis)) = self
-                .genesis
-                .iter()
-                .find(|(candidate, _)| candidate == digest)
-            {
-                parents.push(genesis.clone());
+        for digest in &header.virtual_edges {
+            if let Some(parent) = ready.get(digest) {
+                parents.push(parent.clone());
                 continue;
             }
-            match self.store.read(digest.to_vec()).await? {
-                Some(certificate) => parents.push(bincode::deserialize(&certificate)?),
-                None => missing_required.push(digest.clone()),
-            }
-        }
-        for digest in &header.virtual_edges {
             if let Some((_, genesis)) = self
                 .genesis
                 .iter()
@@ -105,13 +110,24 @@ impl Synchronizer {
         Ok(parents)
     }
 
-    pub async fn ready_for_round_advance(&mut self, certificate: &Certificate) -> DagResult<bool> {
+    pub async fn ready_for_round_advance(
+        &mut self,
+        certificate: &Certificate,
+        ready: &HashMap<Digest, Certificate>,
+        completed: &HashSet<Digest>,
+    ) -> DagResult<bool> {
         for digest in certificate
             .header
             .parents
             .iter()
             .chain(&certificate.header.weak_edges)
         {
+            if ready
+                .get(digest)
+                .map_or(false, |c| completed.contains(&c.header.id))
+            {
+                continue;
+            }
             if self
                 .genesis
                 .iter()
