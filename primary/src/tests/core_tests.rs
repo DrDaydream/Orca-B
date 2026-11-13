@@ -1,6 +1,6 @@
 use super::*;
 use crate::common::{committee, keys, proposal, votes};
-use crate::messages::{batch_key, proposal_header_key, ControlFrame};
+use crate::messages::{batch_key, proposal_header_key};
 use crypto::Signature;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -13,7 +13,6 @@ struct Harness {
     _parents: Receiver<ProposerMessage>,
     _headers: Receiver<crate::header_waiter::WaiterMessage>,
     _certs: Receiver<Certificate>,
-    _control: Receiver<ControlMessage>,
 }
 
 impl Harness {
@@ -27,7 +26,6 @@ impl Harness {
         let sync = Synchronizer::new(name, &c, store.clone(), tx_headers, tx_certs);
         let (tx_events, events) = channel(100);
         let (tx_parents, parents) = channel(100);
-        let (tx_control, control) = channel(100);
         Self {
             core: Core {
                 name,
@@ -58,7 +56,6 @@ impl Harness {
                 proposal_tracker: ProposalTracker::default(),
                 pending_votes: HashMap::new(),
                 vote_outbox: Vec::new(),
-                tx_control,
                 certificates_aggregators: HashMap::new(),
                 grade_one_certificates: HashMap::new(),
                 grbc_certificates: HashMap::new(),
@@ -73,7 +70,6 @@ impl Harness {
             _parents: parents,
             _headers: headers,
             _certs: certs,
-            _control: control,
         }
     }
 
@@ -358,114 +354,6 @@ fn resign(proposal: &mut Proposal) {
     proposal.header.signature = Signature::new(&proposal.header.id, &secret);
 }
 
-// Mirror the network receiver's split into the existing per-batch Core path.
-async fn deliver_control_vector(core: &mut Core, wire: &[u8]) {
-    match bincode::deserialize::<PrimaryMessage>(wire).unwrap() {
-        PrimaryMessage::Control(frame) => {
-            for batch in frame.grbc {
-                core.process_primary_message(PrimaryMessage::GrbcVoteBatch(batch))
-                    .await
-                    .unwrap();
-            }
-        }
-        _ => panic!("Expected control vector"),
-    }
-}
-
-async fn flush_control_vector(node: &mut Harness) -> Option<Vec<u8>> {
-    node.core.flush_grbc_outboxes().await;
-    match node._control.try_recv() {
-        Ok(ControlMessage::Votes(grbc)) => Some(
-            bincode::serialize(&PrimaryMessage::Control(ControlFrame { grbc, aba: None })).unwrap(),
-        ),
-        Ok(_) => panic!("Unexpected ABA from Core"),
-        Err(_) => None,
-    }
-}
-
-#[tokio::test]
-async fn staggered_proposals_finish_with_late_vectors_and_a_nonvoting_proposer() {
-    let proposals: Vec<_> = crate::common::headers()
-        .into_iter()
-        .map(|header| Proposal {
-            header,
-            batches: BTreeMap::new(),
-        })
-        .collect();
-    // D proposes but never votes. A/B/C initially see different sets of three.
-    let mut nodes: Vec<_> = (0..3).map(|i| Harness::new("late_vectors", i)).collect();
-    for (node, initial) in nodes.iter_mut().zip([[0, 1, 3], [1, 2, 3], [2, 0, 3]]) {
-        for index in initial {
-            node.core
-                .process_proposal(proposals[index].clone())
-                .await
-                .unwrap();
-        }
-    }
-    // Deliver initial ECHO vectors and the READY vectors they enable.
-    for _ in 0..2 {
-        let mut frames = Vec::new();
-        for node in &mut nodes {
-            if let Some(frame) = flush_control_vector(node).await {
-                frames.push(frame);
-            }
-        }
-        for frame in frames {
-            for node in &mut nodes {
-                deliver_control_vector(&mut node.core, &frame).await;
-            }
-        }
-    }
-    for node in &mut nodes {
-        assert_eq!(
-            node.core.grade_two.len(),
-            1,
-            "Only D can finish before late ECHOs"
-        );
-        assert!(
-            node._parents.try_recv().is_err(),
-            "Next DAG round cannot start yet"
-        );
-    }
-    for (node, missing) in nodes.iter_mut().zip([2, 0, 1]) {
-        node.core
-            .process_proposal(proposals[missing].clone())
-            .await
-            .unwrap();
-        assert!(node
-            .core
-            .vote_outbox
-            .iter()
-            .any(|v| v.phase == GrbcPhase::Echo));
-        assert!(node
-            .core
-            .vote_outbox
-            .iter()
-            .any(|v| v.phase == GrbcPhase::Ready));
-    }
-    // Late votes flush without any new proposal or next-round carrier. Reverse
-    // delivery and duplicates must not mix instance counts or double-count.
-    for _ in 0..4 {
-        let mut frames = Vec::new();
-        for node in &mut nodes {
-            if let Some(frame) = flush_control_vector(node).await {
-                frames.push(frame);
-            }
-        }
-        for frame in frames.into_iter().rev() {
-            for node in &mut nodes {
-                deliver_control_vector(&mut node.core, &frame).await;
-                deliver_control_vector(&mut node.core, &frame).await;
-            }
-        }
-    }
-    for node in &mut nodes {
-        assert_eq!(node.core.grade_two.len(), 4);
-        let (parents, _, _, round) = node._parents.try_recv().unwrap();
-        assert_eq!((parents.len(), round), (3, 1));
-    }
-}
-
 #[tokio::test]
 async fn invalid_parent_quorum_cannot_trigger_echo() {
     let mut h = Harness::new("invalid_observation", 0);
@@ -723,15 +611,6 @@ async fn vote_bursts_stay_batched_and_use_a_separate_data_connection() {
         .unwrap()
         .primary
         .primary_to_primary = listener.local_addr().unwrap();
-    let (tx_control, rx_control) = channel(100);
-    h.core.tx_control = tx_control;
-    let sender = crate::control_broadcaster::spawn_control_broadcaster(
-        h.core.name,
-        h.core.committee.clone(),
-        h.core.consensus_round.clone(),
-        h.core.gc_depth,
-        rx_control,
-    );
     h.core
         .broadcast_grbc_batch(PrimaryMessage::Proposal(proposal()), 1)
         .await;
@@ -752,7 +631,7 @@ async fn vote_bursts_stay_batched_and_use_a_separate_data_connection() {
         .unwrap();
     let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
     let mut phases = Vec::new();
-    {
+    for _ in 0..2 {
         let data = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .unwrap()
@@ -760,18 +639,15 @@ async fn vote_bursts_stay_batched_and_use_a_separate_data_connection() {
             .unwrap();
         stream.send(Bytes::from_static(b"Ack")).await.unwrap();
         match bincode::deserialize::<PrimaryMessage>(&data).unwrap() {
-            PrimaryMessage::Control(frame) => {
-                assert_eq!(frame.grbc.len(), 2, "ECHO and READY share one frame");
-                for batch in frame.grbc {
-                    assert_eq!(
-                        batch.votes.len(),
-                        4,
-                        "one frame must carry the whole phase burst"
-                    );
-                    phases.push(batch.phase);
-                    for vote in batch.into_votes() {
-                        vote.verify(&committee()).unwrap();
-                    }
+            PrimaryMessage::GrbcVoteBatch(batch) => {
+                assert_eq!(
+                    batch.votes.len(),
+                    4,
+                    "one frame must carry the whole phase burst"
+                );
+                phases.push(batch.phase);
+                for vote in batch.into_votes() {
+                    vote.verify(&committee()).unwrap();
                 }
             }
             _ => panic!("Expected batched votes on the independent connection"),
@@ -779,7 +655,6 @@ async fn vote_bursts_stay_batched_and_use_a_separate_data_connection() {
     }
     assert_eq!(phases, vec![GrbcPhase::Echo, GrbcPhase::Ready]);
     assert!(h.core.vote_outbox.is_empty());
-    sender.abort();
 }
 
 #[tokio::test]

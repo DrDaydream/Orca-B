@@ -1,14 +1,13 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::certificate_waiter::CertificateWaiter;
-use crate::control_broadcaster::{spawn_control_broadcaster, ControlMessage};
 use crate::core::Core;
 use crate::error::DagError;
 use crate::garbage_collector::GarbageCollector;
 use crate::header_waiter::HeaderWaiter;
 use crate::helper::Helper;
 use crate::messages::{
-    batch_digest, batch_key, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage,
-    ControlFrame, GrbcVote, GrbcVoteBatch as VoteBatch, Proposal, MAX_PROPOSAL_BYTES,
+    batch_digest, batch_key, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GrbcVote,
+    GrbcVoteBatch as VoteBatch, Proposal, MAX_PROPOSAL_BYTES,
 };
 use crate::payload_receiver::PayloadReceiver;
 use crate::proposal_repair::{PrimaryInput, ProposalTracker};
@@ -19,14 +18,16 @@ use bytes::Bytes;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
 use futures::sink::SinkExt as _;
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use log::info;
-use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
+use network::{MessageHandler, Receiver as NetworkReceiver, ReliableSender, Writer};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::time::{sleep, Duration};
 
 /// The default channel capacity for each channel of the primary.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -39,9 +40,9 @@ pub enum PrimaryMessage {
     Proposal(Proposal),
     GrbcVote(GrbcVote),
     GrbcVoteBatch(VoteBatch),
+    Consensus(ConsensusNetworkMessage),
     LeaderRequest(Round, PublicKey, /* requestor */ PublicKey),
     CertificatesRequest(Vec<Digest>, /* requestor */ PublicKey),
-    Control(ControlFrame),
 }
 
 /// The messages sent by the primary to its workers.
@@ -62,6 +63,42 @@ pub enum WorkerPrimaryMessage {
     OurBatch(Vec<u8>, WorkerId),
     /// The worker indicates it received a batch's digest from another authority.
     OthersBatch(Digest, WorkerId),
+}
+
+fn spawn_aba_broadcaster(
+    name: PublicKey,
+    committee: Committee,
+    mut signature_service: SignatureService,
+    mut rx_messages: Receiver<Vec<Vec<u8>>>,
+) {
+    tokio::spawn(async move {
+        let addresses: Vec<_> = committee
+            .others_primaries(&name)
+            .iter()
+            .map(|(_, address)| address.aba_to_aba)
+            .collect();
+        let mut network = ReliableSender::new();
+        let mut pending = FuturesUnordered::new();
+
+        loop {
+            tokio::select! {
+                Some(messages) = rx_messages.recv() => {
+                    let payload = bincode::serialize(&messages)
+                        .expect("Failed to serialize ABA batch");
+                    let message = ConsensusNetworkMessage::new(
+                        payload,
+                        name,
+                        &mut signature_service,
+                    ).await;
+                    let bytes = bincode::serialize(&message)
+                        .expect("Failed to serialize ABA network message");
+                    pending.extend(network.broadcast(addresses.clone(), Bytes::from(bytes)).await);
+                }
+                Some(_) = pending.next(), if !pending.is_empty() => {}
+                else => break,
+            }
+        }
+    });
 }
 
 pub struct Primary;
@@ -87,9 +124,7 @@ impl Primary {
         let proposal_tracker = ProposalTracker::default();
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_consensus_commands, rx_consensus_commands) = channel(CHANNEL_CAPACITY);
-        let (tx_control, rx_control) = channel(CHANNEL_CAPACITY);
-        let tx_aba = tx_control.clone();
-        let name = keypair.name;
+        let (tx_aba_broadcast, rx_aba_broadcast) = channel(CHANNEL_CAPACITY);
         let (tx_cleanup, rx_cleanup) = channel(CHANNEL_CAPACITY);
 
         tokio::spawn(async move {
@@ -107,13 +142,38 @@ impl Primary {
                                 .expect("Failed to send cleanup batch");
                         }
                     }
-                    ConsensusCommand::AbaBroadcast(messages) => tx_aba
-                        .send(ControlMessage::Aba(ConsensusNetworkMessage {
-                            author: name,
-                            messages,
-                        }))
-                        .await
-                        .expect("Failed to send ABA batch"),
+                    ConsensusCommand::AbaBroadcast(mut messages) => {
+                        // Coalesce bursts from independent ABA instances. The
+                        // Core signs the resulting batch once.
+                        let deadline = sleep(Duration::from_millis(1));
+                        tokio::pin!(deadline);
+                        loop {
+                            tokio::select! {
+                                () = &mut deadline => break,
+                                next = rx_consensus.recv() => match next {
+                                    Some(ConsensusCommand::AbaBroadcast(mut more)) => {
+                                        messages.append(&mut more);
+                                    }
+                                    Some(ConsensusCommand::Cleanup(certificate)) => {
+                                        tx_cleanup.send(certificate).await.expect("Failed to send cleanup");
+                                    }
+                                    Some(ConsensusCommand::CleanupBatch(certificates)) => {
+                                        for certificate in certificates {
+                                            tx_cleanup.send(certificate).await.expect("Failed to send cleanup batch");
+                                        }
+                                    }
+                                    Some(command) => {
+                                        tx_consensus_commands.send(command).await.expect("Failed to send consensus command");
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
+                        tx_aba_broadcast
+                            .send(messages)
+                            .await
+                            .expect("Failed to send ABA batch");
+                    }
                     command => tx_consensus_commands
                         .send(command)
                         .await
@@ -126,6 +186,7 @@ impl Primary {
         parameters.log();
 
         // Parse the public and secret key of this authority.
+        let name = keypair.name;
         let secret = keypair.secret;
 
         // Atomic variable use to synchronizer all tasks with the latest consensus round. This is only
@@ -143,7 +204,6 @@ impl Primary {
             /* handler */
             PrimaryReceiverHandler {
                 tx_primary_messages,
-                tx_consensus: tx_consensus.clone(),
                 proposal_tracker: proposal_tracker.clone(),
                 tx_cert_requests,
             },
@@ -162,6 +222,7 @@ impl Primary {
         NetworkReceiver::spawn(
             address,
             AbaReceiverHandler {
+                committee: committee.clone(),
                 tx_consensus: tx_consensus.clone(),
             },
         );
@@ -198,12 +259,11 @@ impl Primary {
 
         // The `SignatureService` is used to require signatures on specific digests.
         let signature_service = SignatureService::new(secret);
-        spawn_control_broadcaster(
+        spawn_aba_broadcaster(
             name,
             committee.clone(),
-            consensus_round.clone(),
-            parameters.gc_depth,
-            rx_control,
+            signature_service.clone(),
+            rx_aba_broadcast,
         );
 
         // The `Core` receives and handles headers, votes, and certificates from the other primaries.
@@ -223,7 +283,6 @@ impl Primary {
             tx_consensus,
             /* tx_proposer */ tx_parents,
             rx_consensus_commands,
-            tx_control,
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
@@ -288,14 +347,15 @@ impl Primary {
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryInput>,
-    tx_consensus: Sender<ConsensusMessage>,
     proposal_tracker: ProposalTracker,
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
 }
 
-/// Unsigned experimental ABA ingress, bypassing the GRBC Core queue.
+/// Dedicated ABA ingress. Authentication and decoding happen outside Core;
+/// consensus remains the single ordered state mutator.
 #[derive(Clone)]
 struct AbaReceiverHandler {
+    committee: Committee,
     tx_consensus: Sender<ConsensusMessage>,
 }
 
@@ -304,9 +364,13 @@ impl MessageHandler for AbaReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
         let message: ConsensusNetworkMessage =
             bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
+        message.verify(&self.committee)?;
+        let batch = bincode::deserialize::<Vec<Vec<u8>>>(&message.payload)
+            .map_err(DagError::SerializationError)?;
+
         let _ = writer.send(Bytes::from("Ack")).await;
         self.tx_consensus
-            .send(ConsensusMessage::AbaBatch(message.author, message.messages))
+            .send(ConsensusMessage::AbaBatch(message.author, batch))
             .await
             .expect("Failed to deliver ABA batch");
         Ok(())
@@ -319,42 +383,20 @@ impl MessageHandler for PrimaryReceiverHandler {
         // Reply with an ACK.
         let _ = writer.send(Bytes::from("Ack")).await;
 
-        self.route(bincode::deserialize(&serialized).map_err(DagError::SerializationError)?)
-            .await;
-        Ok(())
-    }
-}
-
-impl PrimaryReceiverHandler {
-    async fn route(&self, message: PrimaryMessage) {
-        match message {
-            PrimaryMessage::Control(frame) => {
-                // Deliver ABA first, without waiting for proposal processing or
-                // a free Core slot. Core independently verifies every GRBC vote.
-                if let Some(aba) = frame.aba {
-                    self.tx_consensus
-                        .send(ConsensusMessage::AbaBatch(aba.author, aba.messages))
-                        .await
-                        .expect("Failed to deliver piggybacked ABA");
-                }
-                for votes in frame.grbc {
-                    self.forward(PrimaryMessage::GrbcVoteBatch(votes)).await;
-                }
-            }
+        // Deserialize and parse the message.
+        match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
             PrimaryMessage::CertificatesRequest(missing, requestor) => self
                 .tx_cert_requests
                 .send((missing, requestor))
                 .await
                 .expect("Failed to send primary message"),
-            request => self.forward(request).await,
+            request => self
+                .tx_primary_messages
+                .send(PrimaryInput::new(request, &self.proposal_tracker))
+                .await
+                .expect("Failed to send certificate"),
         }
-    }
-
-    async fn forward(&self, message: PrimaryMessage) {
-        self.tx_primary_messages
-            .send(PrimaryInput::new(message, &self.proposal_tracker))
-            .await
-            .expect("Failed to send primary message");
+        Ok(())
     }
 }
 
@@ -396,7 +438,3 @@ impl MessageHandler for WorkerReceiverHandler {
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "tests/primary_receiver_tests.rs"]
-mod tests;
