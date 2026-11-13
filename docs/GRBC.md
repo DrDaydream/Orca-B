@@ -78,11 +78,7 @@ itself establish a measured throughput or latency improvement.
 
 The previous task-per-message transport optimization was reverted before this
 revision. The implementation again uses Core's original bounded input bursts
-(up to 32 messages) and outbox grouping by round/phase. Before processing a
-Proposal within a mixed burst, Core flushes pending votes to the existing
-control sender, before payload verification or storage. It still flushes at
-the end of a burst, so votes need no subsequent proposal to leave Core. Empty
-flushes are no-ops, and consecutive vote inputs remain batched. There is no added
+(up to 32 messages) and outbox grouping by round/phase. There is no added
 per-vote sender task, per-proposal processing queue or blocking-pool handoff.
 Separate persistent sender instances keep complete proposals and small votes
 on different TCP connections to the existing primary port. Helper also uses
@@ -150,22 +146,7 @@ a READY carrier, or late READYs need a next-round proposal that they themselves
 enable. The existing queues serve as the late-message buffer; no separate
 late-evidence state machine or transport rounds are added. There is no new
 task per vote or signing task. The old 1 ms ABA coalescing delay remains
-removed; consensus batches all broadcasts from one ABA transition in a single
-control input. It moves those messages into one serialized vector without
-cloning them, before applying any local decision. In particular, DECIDE and
-any next-round BVAL leave consensus together even if rule checks, missing
-leader recovery or commit output subsequently block. A DECIDE is still emitted
-only by the existing ABA decision/confirmation rules; local application never
-creates an extra DECIDE or changes a quorum threshold.
-
-Primary returns a clone of its existing control queue sender to Consensus.
-ABA therefore bypasses cleanup and repair feedback. The old AbaBroadcast
-command, consensus outbox and end-of-ingress flush calls have been removed.
-There is no additional queue, per-message task, timer or duplicate send path.
-The sender can coalesce queued transitions across instances, including with
-GRBC votes. Earlier enqueueing may change frame packing opportunities; it does
-not guarantee fewer network frames for every arrival pattern. Wire formats,
-batch/header parameters and benchmark timestamp definitions are unchanged.
+removed; consensus still batches its own generated ABA actions.
 
 Vote-only and mixed frames use a control connection to the primary port.
 Standalone ABA uses the existing ABA port. Complete Proposal bytes never
@@ -324,19 +305,3 @@ ten online (1,018), one of four absent (550), and one of four three seconds late
 (644), all with zero round lag at shutdown. Debug logs record 3,115 multi-batch
 frames among 15,820 GRBC vector frames across these runs. These remain short
 Windows functional checks, not Ubuntu throughput or latency measurements.
-
-The early-control-send revision passes 77 relevant unit tests (primary 49,
-consensus 28), doctest checks and the benchmark-feature node build. Regressions
-verify that pending ECHO/READY batches leave Core before the next proposal
-blocks on local processing, and that an actual ABA decision's DECIDE and
-next-round BVAL share one control input before blocked missing-leader recovery
-or commit output. Confirmation and duplicate DECIDEs do not generate another
-local broadcast. The multi-round GRBC regression now drains the actual control
-queue, including votes flushed before later proposals.
-
-Real-process checks pass for four nodes online (702 common committed blocks),
-ten online (953), one of four absent (547), and one of four three seconds late
-(649). The ten-node run ends with two rounds of lag; the other runs have zero.
-The same 12-second Windows smoke workload is used, not an Ubuntu latency/TPS
-benchmark. Earlier sends can reduce batching opportunities even though each
-logical vote/action is emitted once; no frame-count reduction is claimed.

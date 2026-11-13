@@ -100,7 +100,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             let name = keypair.name;
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
-            let tx_control = Primary::spawn(
+            Primary::spawn(
                 keypair,
                 committee.clone(),
                 parameters.clone(),
@@ -114,7 +114,6 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 parameters.gc_depth,
                 /* rx_primary */ rx_new_certificates,
                 /* tx_primary */ tx_feedback,
-                tx_control,
                 tx_output,
             );
         }

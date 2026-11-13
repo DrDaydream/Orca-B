@@ -97,79 +97,6 @@ impl Harness {
 }
 
 #[tokio::test]
-async fn pending_votes_send_before_the_next_proposal_blocks_on_local_processing() {
-    let mut h = Harness::new("flush_before_proposal", 0);
-    let first = proposal();
-    h.core.process_proposal(first.clone()).await.unwrap();
-    for vote in votes(&first.header, GrbcPhase::Echo)
-        .into_iter()
-        .skip(1)
-        .take(2)
-    {
-        h.core.process_grbc_vote(vote).await.unwrap();
-    }
-    assert_eq!(h.core.vote_outbox.len(), 2);
-
-    // Stall the next valid proposal at Observed delivery. ECHO/READY from the
-    // preceding proposal must leave Core without waiting for that operation.
-    let (tx_events, mut blocked_events) = channel(1);
-    tx_events
-        .send(ConsensusMessage::RoundAdvanced(0))
-        .await
-        .unwrap();
-    h.core.tx_consensus = tx_events;
-    let next = Proposal {
-        header: crate::common::headers().remove(1),
-        batches: BTreeMap::new(),
-    };
-    let next_id = next.header.id.clone();
-    let input = PrimaryInput::new(PrimaryMessage::Proposal(next), &h.core.proposal_tracker);
-    let mut core = h.core;
-    let processing = tokio::spawn(async move {
-        core.process_input(input).await.unwrap();
-        core
-    });
-    let queued = tokio::time::timeout(Duration::from_secs(3), h._control.recv())
-        .await
-        .expect("votes waited for the next proposal")
-        .unwrap();
-    match queued {
-        ControlMessage::Votes(batches) => {
-            assert_eq!(batches.len(), 2);
-            assert_eq!(batches[0].phase, GrbcPhase::Echo);
-            assert_eq!(batches[1].phase, GrbcPhase::Ready);
-            for batch in batches {
-                assert_eq!(batch.votes.len(), 1);
-                assert_eq!(batch.votes[0].0, first.header.id);
-            }
-        }
-        _ => panic!("Expected one grouped GRBC send"),
-    }
-    assert!(!processing.is_finished());
-    blocked_events.recv().await.unwrap();
-    let mut core = tokio::time::timeout(Duration::from_secs(3), processing)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        blocked_events.try_recv(),
-        Ok(ConsensusMessage::Observed(_))
-    ));
-    assert_eq!(core.vote_outbox.len(), 1);
-    assert_eq!(core.vote_outbox[0].id, next_id);
-    core.flush_grbc_outboxes().await;
-    assert!(matches!(
-        h._control.try_recv(),
-        Ok(ControlMessage::Votes(_))
-    ));
-    core.flush_grbc_outboxes().await;
-    assert!(
-        h._control.try_recv().is_err(),
-        "empty flush duplicated a send"
-    );
-}
-
-#[tokio::test]
 async fn echo_quorum_delivers_ready_but_never_finish() {
     let mut h = Harness::new("thresholds", 0);
     let p = proposal();
@@ -363,20 +290,25 @@ async fn complete_payloads_progress_across_rounds_using_local_finish_parents() {
         for _ in 0..3 {
             let mut messages = Vec::new();
             for node in &mut nodes {
-                node.core.flush_grbc_outboxes().await;
-                while let Ok(ControlMessage::Votes(grbc)) = node._control.try_recv() {
+                let mut grouped = BTreeMap::<GrbcPhase, Vec<GrbcVote>>::new();
+                for vote in std::mem::take(&mut node.core.vote_outbox) {
+                    grouped.entry(vote.phase).or_default().push(vote);
+                }
+                for votes in grouped.into_values() {
                     messages.push(
-                        bincode::serialize(&PrimaryMessage::Control(ControlFrame {
-                            grbc,
-                            aba: None,
-                        }))
+                        bincode::serialize(&PrimaryMessage::GrbcVoteBatch(
+                            GrbcVoteBatch::from_votes(votes).unwrap(),
+                        ))
                         .unwrap(),
                     );
                 }
             }
             for wire in messages.into_iter().rev() {
                 for node in &mut nodes {
-                    deliver_control_vector(&mut node.core, &wire).await;
+                    node.core
+                        .process_primary_message(bincode::deserialize(&wire).unwrap())
+                        .await
+                        .unwrap();
                 }
             }
         }

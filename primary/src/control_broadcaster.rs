@@ -21,9 +21,7 @@ use tokio::time::{interval, Duration};
 const MAX_CONTROL_BYTES: u64 = 64 * 1024;
 const MAX_DRAIN: usize = 32;
 
-/// Local inputs to the shared control sender. Consensus sends ABA directly;
-/// Core sends GRBC votes through the same queue for opportunistic packing.
-pub enum ControlMessage {
+pub(crate) enum ControlMessage {
     Votes(Vec<GrbcVoteBatch>),
     Aba(ConsensusNetworkMessage),
 }
