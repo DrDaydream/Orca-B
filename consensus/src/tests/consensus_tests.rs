@@ -8,9 +8,6 @@ use rand::SeedableRng as _;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use tokio::sync::mpsc::{channel, Sender};
 
-#[path = "commit_progress_tests.rs"]
-mod commit_progress_tests;
-
 async fn deliver(tx: &Sender<ConsensusMessage>, certificate: Certificate) {
     let entered_round = certificate.round() + 1;
     tx.send(ConsensusMessage::GradeOne(certificate.clone()))
