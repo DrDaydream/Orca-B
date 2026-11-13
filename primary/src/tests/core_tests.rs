@@ -926,7 +926,7 @@ async fn large_vote_vector_yields_to_stored_headers_and_preserves_remaining_work
 }
 
 #[tokio::test]
-async fn proposal_completed_during_a_vote_burst_is_serviced_before_the_burst_ends() {
+async fn proposal_completed_during_a_vote_burst_is_serviced_by_the_next_burst() {
     let mut h = Harness::new("mid_burst_registration", 0);
     let (tx_votes, mut outgoing) = channel(1);
     h.core.tx_votes = tx_votes;
@@ -963,7 +963,7 @@ async fn proposal_completed_during_a_vote_burst_is_serviced_before_the_burst_end
         // stored header arrives, so the READY send orders this race exactly.
         while outgoing.recv().await.is_some() {}
     });
-    let vector = vec![votes(&p.header, GrbcPhase::Echo).remove(2); 2 * PROPOSAL_SERVICE_INTERVAL];
+    let vector = vec![votes(&p.header, GrbcPhase::Echo).remove(2); 2 * CORE_WORK_BUDGET];
     tokio::time::timeout(
         Duration::from_secs(5),
         h.core
@@ -974,8 +974,13 @@ async fn proposal_completed_during_a_vote_burst_is_serviced_before_the_burst_end
     .await
     .unwrap()
     .unwrap();
+    assert!(!h.core.proposal_headers.contains_key(&later.header.id));
+    assert_eq!(h.core.vote_batch.len(), CORE_WORK_BUDGET + 1);
+    // A proposal arriving after this burst's service point is registered at
+    // the next boundary, before processing the remaining votes.
+    h.core.process_primary_burst(None).await.unwrap();
     assert!(h.core.proposal_headers.contains_key(&later.header.id));
-    assert_eq!(h.core.vote_batch.len(), 0);
+    assert_eq!(h.core.vote_batch.len(), 1);
     producer.abort();
 }
 
