@@ -386,7 +386,9 @@ pub enum ConsensusMessage {
 
 #[derive(Debug)]
 pub enum ConsensusCommand {
+    /// Actual local commit output: Core completes dependencies before GC.
     Cleanup(Certificate),
+    /// A leader and the causal history committed with it, in output order.
     CleanupBatch(Vec<Certificate>),
     AbaBroadcast(Vec<Vec<u8>>),
     LeaderRequest(Round, PublicKey),

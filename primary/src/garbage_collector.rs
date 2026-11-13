@@ -15,7 +15,7 @@ pub struct GarbageCollector {
     /// The current consensus round (used for cleanup).
     consensus_round: Arc<AtomicU64>,
     /// Receives the ordered certificates from consensus.
-    rx_consensus: Receiver<Certificate>,
+    rx_consensus: Receiver<Vec<Certificate>>,
     /// The network addresses of our workers.
     addresses: Vec<SocketAddr>,
     /// A network sender to notify our workers of cleanup events.
@@ -27,7 +27,7 @@ impl GarbageCollector {
         name: &PublicKey,
         committee: &Committee,
         consensus_round: Arc<AtomicU64>,
-        rx_consensus: Receiver<Certificate>,
+        rx_consensus: Receiver<Vec<Certificate>>,
     ) {
         let addresses = committee
             .our_workers(name)
@@ -50,10 +50,16 @@ impl GarbageCollector {
 
     async fn run(&mut self) {
         let mut last_committed_round = 0;
-        while let Some(certificate) = self.rx_consensus.recv().await {
+        while let Some(certificates) = self.rx_consensus.recv().await {
             // TODO [issue #9]: Re-include batch digests that have not been sequenced into our next block.
 
-            let round = certificate.round();
+            // Core has already applied the whole committed sequence. Notify
+            // workers once per batch, after dependency completion is published.
+            let round = certificates
+                .iter()
+                .map(Certificate::round)
+                .max()
+                .unwrap_or(0);
             if round > last_committed_round {
                 last_committed_round = round;
 

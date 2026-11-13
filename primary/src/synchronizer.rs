@@ -193,4 +193,13 @@ impl Synchronizer {
         }
         Ok(true)
     }
+
+    pub async fn committed(&mut self, blocks: Vec<(Digest, Digest)>) {
+        if !blocks.is_empty() {
+            self.tx_header_waiter
+                .send(WaiterMessage::Committed(blocks))
+                .await
+                .expect("Failed to clear committed dependency requests");
+        }
+    }
 }

@@ -26,8 +26,10 @@ const TIMER_RESOLUTION: u64 = 1_000;
 #[derive(Debug)]
 pub enum WaiterMessage {
     SyncBatches(HashMap<Digest, WorkerId>, Header),
-    // Local FINISH records for strong/weak edges, complete-proposal header markers for virtual edges.
+    // Local completion records for strong/weak edges, proposal markers for virtual edges.
     SyncParents(Vec<Digest>, Vec<Digest>, Header),
+    // (block digest, header ID) completed by local consensus commit.
+    Committed(Vec<(Digest, Digest)>),
 }
 
 #[cfg(test)]
@@ -188,6 +190,16 @@ impl HeaderWaiter {
             tokio::select! {
                 Some(message) = self.rx_synchronizer.recv() => {
                     match message {
+                        WaiterMessage::Committed(blocks) => {
+                            for (digest, header_id) in blocks {
+                                self.parent_requests.remove(&digest);
+                                self.virtual_requests.remove(&digest);
+                                // Dropping the sender cancels this header's
+                                // obsolete wait, while other children wake on
+                                // the completion record written to storage.
+                                self.pending.remove(&header_id);
+                            }
+                        }
                         WaiterMessage::SyncBatches(missing, header) => {
                             debug!("Synching the payload of {}", header);
                             let header_id = header.id.clone();

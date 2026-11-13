@@ -22,6 +22,9 @@ primary vote/certificate dissemination with one complete-proposal protocol.
    READY. It does not wait for an incoming READY when ECHOs already suffice.
 5. **Local FINISH:** on a READY quorum, the primary stores a local completion
    record and delivers grade 2. ECHO votes alone cannot produce FINISH.
+6. **Actual local commit:** a committed block with matching complete local data
+   also becomes a completed dependency and counts toward round advancement.
+   This shortcut emits no GRBC grade or additional vote; see below.
 
 The thresholds use the existing stake-based committee functions. For equal
 stake and `n = 3f + 1`, quorum is `2f + 1` and the READY relay threshold is
@@ -39,12 +42,13 @@ Each honest process sends at most one ECHO and one READY per instance.
 - The legacy Rust type `Certificate` remains a **local** consensus/storage
   delivery record. Production grade records have an empty `votes` vector.
 - Recovery returns a complete proposal plus the responding node's own votes.
-  The requester must assemble its own local counts; it cannot import a
-  remote FINISH assertion. Votes received before data are buffered; missing
+  The requester assembles its own local counts unless local consensus has
+  actually committed the block; it cannot import a remote FINISH assertion.
+  Votes received before data are buffered; missing
   proposals are requested with retries, subject to the in-flight grace below.
 - Grade-1 records use `orca-ready-v2/`; payloads and local votes also have
   separate `v2` key prefixes. Strong/weak dependency checks
-  before ECHO require local FINISH records. Virtual targets require their
+  before ECHO require local completion, from FINISH or actual commit. Virtual targets require their
   complete-proposal signed header markers to check rounds, not a local READY grade: another
   node's READY does not guarantee this node can immediately reach READY.
 
@@ -64,7 +68,7 @@ options, without adding an fsync. A header marker means complete authenticated
 data was retained; it does not imply DAG validation, READY, or FINISH.
 
 Virtual-edge dependency checks and waiters read only this small header record.
-Strong/weak dependencies continue to read the small local FINISH records. Both
+Strong/weak dependencies read the small local completion records. Both
 ordinary repair replies and leader recovery reconstruct the full wire Proposal
 from its header and batch keys; missing data produces an error instead of a
 partial reply. Recovery still includes only the responder's own votes.
@@ -154,7 +158,8 @@ that validation still gates the local ECHO/READY/FINISH state machine. Traversal
 orders the chosen history; it does not by itself disambiguate two conflicting
 signed proposals from the same author and round. End-to-end experiments here
 assume no such equivocation. Consensus promotion does not fabricate primary
-READY votes or bypass the primary's FINISH quorum.
+READY votes. Actual commit can now satisfy local dependencies and count toward
+round advancement without collecting a FINISH quorum, as described below.
 
 The second audit fixed deferred weak/virtual round checks (including genesis
 weak edges), mixed dependency wakeups, stale repair requests caused by
@@ -207,7 +212,8 @@ observe it or vote. Frames still in transit or being decoded are not tracked.
 
 The old 32-envelope drain is replaced by a 256-work-item budget. Each vote
 costs one item; opening a vector and other control messages also cost one.
-Core services one completed proposal before the burst and every 32 items.
+Core services one consensus command and one stored proposal before the burst
+and every 32 items, so actual commit feedback is not starved by hot vote traffic.
 Oversized vectors retain their unconsumed votes across bursts, without new
 network packets; later control frames do not overtake that remainder. At the
 end of a full burst Core yields to the runtime and reselects among its inputs.
@@ -227,6 +233,48 @@ three seconds late; both end with zero round lag. The ten-node run keeps a
 53-round maximum lag. These Windows debug runs verify functional behavior;
 they do not establish Ubuntu throughput or latency gains, or resolve the
 previously observed ten-node lag.
+
+## Completing committed proposals without vote repair
+
+The existing local consensus output carries the actual committed sequence,
+including the leader and the strong/weak history committed with it. Core now
+applies this sequence before forwarding its cleanup batch to the garbage
+collector. A remote commit claim, an ABA decision alone, or an uncommitted
+proposal is not a trigger for this shortcut.
+
+Each committed header must exactly match its complete authenticated local
+proposal. Core uses its header cache, falling back to the atomic stored-header
+marker when the result has not yet been registered. This reads only metadata;
+it does not reload batches or repeat payload hashing or signature verification.
+Missing local data or a mismatched header cannot create a completion record.
+
+Core stores a local completion record and closes the author's voting slot,
+without synthesizing ECHO/READY votes or emitting GradeOne/GradeTwo events.
+It publishes the entire committed sequence before counting new completions
+toward the ordinary distinct-author round quorum. Records completed earlier
+by GRBC are not written or counted again. Strong/weak dependency waiters wake
+from these records; corresponding repair requests and buffered votes are
+cleared. The garbage collector receives one batch after this work completes.
+
+Both GRBC FINISH and actual commit are terminal for local broadcast processing.
+Late votes are discarded before verification, without applying their untrusted
+fields; stored-result duplicates and dependency loopbacks also return early.
+Existing signed local votes remain available for peer recovery. This changes
+the meaning of the local completion record: it proves dependency usability in
+this experimental implementation, not necessarily a locally collected READY
+quorum. Ordinary uncommitted instances retain their ECHO/READY thresholds.
+
+Validation passes all 100 workspace unit tests with all features, doctest checks
+and the benchmark-feature node build. New regressions cover stored but not yet
+registered proposals, missing or mismatched local data, dependency release and
+idempotent round counting, and commit feedback during a hot vote burst. Late
+votes and dependency loopbacks after FINISH are checked to do no further work.
+Windows debug process checks have identical commit prefixes: 697 blocks with
+four nodes online, 544 with one absent authority, and 1170 with a node starting
+three seconds late; all three end with zero round lag. Ten nodes retain a
+792-block common prefix and recent progress at every node, but still have a
+30-round maximum lag. These functional runs do not establish Ubuntu latency or
+throughput improvements, and the ten-node lag remains unresolved.
 
 ## Reproduce validation
 

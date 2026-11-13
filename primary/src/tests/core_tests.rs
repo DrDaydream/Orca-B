@@ -13,6 +13,7 @@ struct Harness {
     _parents: Receiver<ProposerMessage>,
     _headers: Receiver<crate::header_waiter::WaiterMessage>,
     _certs: Receiver<Certificate>,
+    cleanup: Receiver<Vec<Certificate>>,
 }
 
 impl Harness {
@@ -31,6 +32,7 @@ impl Harness {
         let (tx_parents, parents) = channel(100);
         let (tx_votes, outgoing) = channel(100);
         let (tx_repairs, repairs) = channel(100);
+        let (tx_cleanup, cleanup) = channel(100);
         Self {
             core: Core {
                 name,
@@ -53,6 +55,7 @@ impl Harness {
                 tx_consensus: tx_events,
                 tx_proposer: tx_parents,
                 rx_consensus: channel(1).1,
+                tx_cleanup,
                 gc_round: 0,
                 last_voted: HashMap::new(),
                 processing: HashMap::new(),
@@ -66,8 +69,8 @@ impl Harness {
                 pending_votes: HashMap::new(),
                 certificates_aggregators: HashMap::new(),
                 grade_one_certificates: HashMap::new(),
-                grbc_certificates: HashMap::new(),
-                grade_two: HashSet::new(),
+                completed_certificates: HashMap::new(),
+                completed: HashSet::new(),
                 round_advance_pending: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
                 network: ReliableSender::new(),
@@ -79,6 +82,7 @@ impl Harness {
             _parents: parents,
             _headers: headers,
             _certs: certs,
+            cleanup,
         }
     }
 
@@ -121,7 +125,7 @@ async fn echo_quorum_delivers_ready_but_never_finish() {
     assert!(h.grades().is_empty());
     h.core.process_grbc_vote(echoes[2].clone()).await.unwrap();
     assert_eq!(h.grades(), vec![1]);
-    assert!(h.core.grade_two.is_empty());
+    assert!(h.core.completed.is_empty());
     assert_eq!(
         h.outgoing()
             .iter()
@@ -136,12 +140,12 @@ async fn echo_quorum_delivers_ready_but_never_finish() {
     assert_eq!(h.grades(), vec![2]);
     h.core.process_grbc_vote(ready[2].clone()).await.unwrap();
     assert!(h.grades().is_empty());
-    // Fresh votes after FINISH and a dependency loopback must be idempotent.
+    // FINISH is terminal: late votes and dependency loopbacks do no more work.
     h.core.process_grbc_vote(echoes[3].clone()).await.unwrap();
     h.core.process_grbc_vote(ready[3].clone()).await.unwrap();
     h.core.process_header(&p.header).await.unwrap();
-    assert_eq!(h.core.votes_aggregators[&p.header.id].echo_weight, 4);
-    assert_eq!(h.core.votes_aggregators[&p.header.id].ready_weight, 4);
+    assert_eq!(h.core.votes_aggregators[&p.header.id].echo_weight, 3);
+    assert_eq!(h.core.votes_aggregators[&p.header.id].ready_weight, 3);
     assert!(h.grades().is_empty());
     assert!(h.outgoing().is_empty());
 }
@@ -552,6 +556,211 @@ async fn forged_vote_cannot_poison_the_authenticated_vote_buffer() {
     h.core.process_proposal(p.clone()).await.unwrap();
     assert_eq!(h.core.votes_aggregators[&p.header.id].ready_weight, 1);
     assert!(h.grades().is_empty());
+}
+
+#[tokio::test]
+async fn actual_commit_completes_a_stored_unregistered_proposal_without_votes() {
+    let mut h = Harness::new("commit_stored", 0);
+    let p = proposal();
+    let guard = h.core.in_flight.track(&p.header);
+    let (stored, _) = crate::proposal_processor::prepare_proposal(
+        p.clone(),
+        committee(),
+        &mut h.core.store,
+        false,
+        Some(guard),
+    )
+    .await
+    .unwrap();
+    h.core
+        .process_grbc_vote(votes(&p.header, GrbcPhase::Ready).remove(1))
+        .await
+        .unwrap();
+    assert_eq!(h.core.pending_votes[&p.header.id].len(), 1);
+    h.core
+        .process_consensus_command(ConsensusCommand::Cleanup(p.block()))
+        .await
+        .unwrap();
+    assert!(h.core.completed.contains(&p.header.id));
+    assert!(!h.core.validated.contains(&p.header.id));
+    assert!(h.core.grade_one_certificates.is_empty());
+    assert!(h.core.pending_votes.is_empty());
+    assert!(h.core.missing_proposals.is_empty());
+    assert!(h
+        .core
+        .store
+        .read(p.block().digest().to_vec())
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(h.cleanup.try_recv().unwrap()[0].header, p.header);
+    assert!(matches!(h._headers.try_recv().unwrap(),
+        crate::header_waiter::WaiterMessage::Committed(ref blocks)
+        if blocks == &vec![(p.block().digest(),p.header.id.clone())]));
+    h.core.process_stored_proposal(stored).await.unwrap();
+    h.core.process_header(&p.header).await.unwrap();
+    for phase in [GrbcPhase::Echo, GrbcPhase::Ready] {
+        for vote in votes(&p.header, phase) {
+            h.core.process_grbc_vote(vote).await.unwrap();
+        }
+    }
+    h.core.retry_missing_proposals().await;
+    assert!(h.outgoing().is_empty());
+    assert!(
+        h.events.try_recv().is_err(),
+        "A commit must not fabricate GRBC grade events"
+    );
+    assert!(h.core.cancel_handlers.is_empty());
+    assert!(!h.core.in_flight.contains(&p.block().digest()));
+    // Commitment closes the voting slot even though no local vote was needed.
+    let mut conflicting = p.clone();
+    let bytes = vec![7, 8, 9];
+    let digest = crate::messages::batch_digest(&bytes);
+    conflicting.header.payload.insert(digest.clone(), 0);
+    conflicting.batches.insert(digest, bytes);
+    resign(&mut conflicting);
+    h.core.process_proposal(conflicting).await.unwrap();
+    assert!(h.outgoing().is_empty());
+}
+
+#[tokio::test]
+async fn commit_requires_the_exact_complete_local_proposal() {
+    let mut h = Harness::new("commit_requires_data", 0);
+    let p = proposal();
+    assert!(h
+        .core
+        .process_consensus_command(ConsensusCommand::Cleanup(p.block()))
+        .await
+        .is_err());
+    assert!(h.core.completed.is_empty());
+    assert!(h.cleanup.try_recv().is_err());
+    h.core.process_proposal(p.clone()).await.unwrap();
+    let mut changed = p.block();
+    changed.header.signature = Signature::default();
+    assert!(h
+        .core
+        .process_consensus_command(ConsensusCommand::Cleanup(changed))
+        .await
+        .is_err());
+    assert!(h.core.completed.is_empty());
+    assert!(h
+        .core
+        .store
+        .read(p.block().digest().to_vec())
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn committed_parent_batch_unlocks_dependencies_and_counts_with_grbc_once() {
+    let mut h = Harness::new("commit_parent_batch", 0);
+    let parents: Vec<_> = crate::common::headers()
+        .into_iter()
+        .take(3)
+        .map(|header| Proposal {
+            header,
+            batches: BTreeMap::new(),
+        })
+        .collect();
+    // One parent completes normally; two only have complete stored data.
+    h.core.process_proposal(parents[0].clone()).await.unwrap();
+    for vote in votes(&parents[0].header, GrbcPhase::Ready)
+        .into_iter()
+        .skip(1)
+        .take(2)
+    {
+        h.core.process_grbc_vote(vote).await.unwrap();
+    }
+    assert_eq!(h.grades(), vec![1, 2]);
+    h.outgoing();
+    for p in &parents[1..] {
+        crate::proposal_processor::prepare_proposal(
+            p.clone(),
+            committee(),
+            &mut h.core.store,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let mut child = proposal();
+    child.header.round = 2;
+    child.header.parents = parents.iter().map(|p| p.block().digest()).collect();
+    resign(&mut child);
+    h.core.process_proposal(child.clone()).await.unwrap();
+    assert!(!h.core.validated.contains(&child.header.id));
+    assert!(h.outgoing().is_empty());
+    let committed: Vec<_> = parents.iter().map(Proposal::block).collect();
+    h.core
+        .process_consensus_command(ConsensusCommand::CleanupBatch(committed.clone()))
+        .await
+        .unwrap();
+    let (strong, _, _, round) = h._parents.try_recv().unwrap();
+    assert_eq!(round, 1);
+    assert_eq!(strong.len(), 3);
+    assert!(h.grades().is_empty());
+    assert!(h.outgoing().is_empty());
+    assert_eq!(h.cleanup.try_recv().unwrap().len(), 3);
+    for p in &parents {
+        assert!(h
+            .core
+            .store
+            .read(p.block().digest().to_vec())
+            .await
+            .unwrap()
+            .is_some());
+    }
+    h.core.process_header(&child.header).await.unwrap();
+    assert!(h.core.validated.contains(&child.header.id));
+    let outgoing = h.outgoing();
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].id, child.header.id);
+    assert_eq!(outgoing[0].phase, GrbcPhase::Echo);
+    h.core
+        .process_consensus_command(ConsensusCommand::CleanupBatch(committed))
+        .await
+        .unwrap();
+    assert!(
+        h._parents.try_recv().is_err(),
+        "Repeated commit must not count parents twice"
+    );
+    assert!(h.outgoing().is_empty());
+}
+
+#[tokio::test]
+async fn commit_feedback_is_serviced_inside_a_hot_vote_burst() {
+    let mut h = Harness::new("commit_burst", 0);
+    let p = proposal();
+    let (stored, _) = crate::proposal_processor::prepare_proposal(
+        p.clone(),
+        committee(),
+        &mut h.core.store,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    let (tx, rx) = channel(1);
+    h.core.rx_consensus = rx;
+    tx.send(ConsensusCommand::Cleanup(p.block())).await.unwrap();
+    let batch = GrbcVoteBatch::from_votes(vec![
+        votes(&p.header, GrbcPhase::Echo).remove(1);
+        2 * CORE_WORK_BUDGET
+    ])
+    .unwrap();
+    h.core
+        .process_primary_burst(Some(PrimaryMessage::GrbcVoteBatch(batch)))
+        .await
+        .unwrap();
+    assert!(h.core.completed.contains(&p.header.id));
+    assert!(h.core.pending_votes.is_empty());
+    assert!(h.core.cancel_handlers.is_empty());
+    assert_eq!(h.cleanup.try_recv().unwrap().len(), 1);
+    assert!(h.core.vote_batch.len() > 0);
+    h.core.process_stored_proposal(stored).await.unwrap();
+    assert!(h.outgoing().is_empty());
 }
 
 #[tokio::test]
