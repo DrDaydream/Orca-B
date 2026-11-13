@@ -434,7 +434,10 @@ impl Core {
         // Ensure we have the parents. If at least one parent is missing, the synchronizer returns an empty
         // vector; it will gather the missing parents (as well as all ancestors) from other nodes and then
         // reschedule processing of this header.
-        let referenced = self.synchronizer.get_parents(header).await?;
+        let referenced = self
+            .synchronizer
+            .get_parents(header, &self.grade_one_certificates, &self.completed)
+            .await?;
         if referenced.is_empty() {
             debug!("Processing of {} suspended: missing parent(s)", header.id);
             return Ok(());
@@ -681,7 +684,7 @@ impl Core {
     async fn try_advance_completed(&mut self, certificate: Certificate) -> DagResult<()> {
         if !self
             .synchronizer
-            .ready_for_round_advance(&certificate)
+            .ready_for_round_advance(&certificate, &self.grade_one_certificates, &self.completed)
             .await?
         {
             self.round_advance_pending

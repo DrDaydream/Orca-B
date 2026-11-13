@@ -2,6 +2,7 @@ use super::*;
 use crate::common::{committee, keys, proposal, votes};
 use crate::messages::{batch_key, proposal_header_key, GrbcVoteBatch};
 use crypto::Signature;
+use futures::FutureExt;
 use std::collections::BTreeMap;
 use tokio::sync::mpsc::channel;
 
@@ -734,6 +735,254 @@ async fn committed_parent_batch_unlocks_dependencies_and_counts_with_grbc_once()
         "Repeated commit must not count parents twice"
     );
     assert!(h.outgoing().is_empty());
+}
+
+async fn completed_parent_fixture(label: &str) -> (Harness, Proposal) {
+    let mut h = Harness::new(label, 0);
+    let mut child = proposal();
+    child.header.round = 2;
+    child.header.parents.clear();
+    for header in crate::common::headers().into_iter().take(3) {
+        let parent = Proposal {
+            header,
+            batches: BTreeMap::new(),
+        };
+        h.core.process_proposal(parent.clone()).await.unwrap();
+        for vote in votes(&parent.header, GrbcPhase::Ready)
+            .into_iter()
+            .skip(1)
+            .take(2)
+        {
+            h.core.process_grbc_vote(vote).await.unwrap();
+        }
+        assert!(h.core.completed.contains(&parent.header.id));
+        child.header.parents.insert(parent.block().digest());
+    }
+    resign(&mut child);
+    h.grades();
+    h.outgoing();
+    (h, child)
+}
+
+#[tokio::test]
+async fn completed_parent_lookup_does_not_wait_for_storage() {
+    let (mut h, child) = completed_parent_fixture("cached_parent_lookup").await;
+    // A store actor cannot reply during this first poll on a current-thread
+    // runtime. Completion here proves known parents incur no storage wait.
+    let parents = h
+        .core
+        .synchronizer
+        .get_parents(
+            &child.header,
+            &h.core.grade_one_certificates,
+            &h.core.completed,
+        )
+        .now_or_never()
+        .expect("Completed parent metadata must be immediately available")
+        .unwrap();
+    assert_eq!(parents.len(), 3);
+    let mut mixed = child.header.clone();
+    let weak = mixed.parents.pop_first().unwrap();
+    mixed.weak_edges.insert(weak);
+    assert_eq!(
+        h.core
+            .synchronizer
+            .get_parents(&mixed, &h.core.grade_one_certificates, &h.core.completed,)
+            .now_or_never()
+            .expect("Completed weak metadata must also avoid storage waits")
+            .unwrap()
+            .len(),
+        3
+    );
+    h.core.process_proposal(child.clone()).await.unwrap();
+    let outgoing = h.outgoing();
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].phase, GrbcPhase::Echo);
+    assert_eq!(outgoing[0].id, child.header.id);
+
+    // GC may remove both in-memory indices while the immutable record remains.
+    h.core
+        .consensus_round
+        .store(h.core.gc_depth + 2, Ordering::Relaxed);
+    h.core.cleanup();
+    assert!(h.core.grade_one_certificates.is_empty());
+    assert!(h.core.completed.is_empty());
+    assert_eq!(
+        h.core
+            .synchronizer
+            .get_parents(
+                &child.header,
+                &h.core.grade_one_certificates,
+                &h.core.completed,
+            )
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(h
+        .core
+        .synchronizer
+        .ready_for_round_advance(
+            &child.block(),
+            &h.core.grade_one_certificates,
+            &h.core.completed,
+        )
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn completed_parent_round_advance_does_not_wait_for_storage() {
+    let (mut h, child) = completed_parent_fixture("cached_parent_advance").await;
+    assert_eq!(
+        h.core
+            .synchronizer
+            .ready_for_round_advance(
+                &child.block(),
+                &h.core.grade_one_certificates,
+                &h.core.completed
+            )
+            .now_or_never()
+            .expect("Completed dependencies must not wait on the store")
+            .unwrap(),
+        true
+    );
+}
+
+#[tokio::test]
+async fn ready_only_parent_still_blocks_echo_and_round_advance() {
+    let (mut h, mut child) = completed_parent_fixture("cached_ready_only").await;
+    let parent = Proposal {
+        header: crate::common::headers().pop().unwrap(),
+        batches: BTreeMap::new(),
+    };
+    h.core.process_proposal(parent.clone()).await.unwrap();
+    for vote in votes(&parent.header, GrbcPhase::Echo)
+        .into_iter()
+        .skip(1)
+        .take(2)
+    {
+        h.core.process_grbc_vote(vote).await.unwrap();
+    }
+    assert_eq!(h.grades(), vec![1]);
+    h.outgoing();
+    child.header.parents.insert(parent.block().digest());
+    resign(&mut child);
+    h.core.process_proposal(child.clone()).await.unwrap();
+    assert!(!h.core.validated.contains(&child.header.id));
+    assert!(h.outgoing().is_empty());
+    assert!(!h
+        .core
+        .synchronizer
+        .ready_for_round_advance(
+            &child.block(),
+            &h.core.grade_one_certificates,
+            &h.core.completed
+        )
+        .await
+        .unwrap());
+
+    child.header.parents.remove(&parent.block().digest());
+    child.header.weak_edges.insert(parent.block().digest());
+    assert!(h
+        .core
+        .synchronizer
+        .get_parents(
+            &child.header,
+            &h.core.grade_one_certificates,
+            &h.core.completed,
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!h
+        .core
+        .synchronizer
+        .ready_for_round_advance(
+            &child.block(),
+            &h.core.grade_one_certificates,
+            &h.core.completed,
+        )
+        .await
+        .unwrap());
+
+    // A virtual edge needs authenticated metadata, not local FINISH.
+    child.header.weak_edges.clear();
+    child.header.virtual_edges.insert(parent.block().digest());
+    assert_eq!(
+        h.core
+            .synchronizer
+            .get_parents(
+                &child.header,
+                &h.core.grade_one_certificates,
+                &h.core.completed,
+            )
+            .now_or_never()
+            .expect("READY virtual metadata is already available")
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+#[tokio::test]
+#[ignore = "manual dependency-processing microbenchmark, not end-to-end TPS"]
+async fn benchmark_completed_dependency_processing() {
+    for references in [10, 11, 20] {
+        let mut h = Harness::new(&format!("dependency_bench_{}", references), 0);
+        let mut child = proposal();
+        child.header.round = 2;
+        child.header.parents.clear();
+        for index in 0..references {
+            let mut parent = proposal().block();
+            // Unique immutable records with committee-sized reference sets.
+            parent.header.payload.insert(Digest([index as u8; 32]), 0);
+            parent.header.parents = (0..references).map(|i| Digest([i as u8; 32])).collect();
+            parent.header.id = parent.header.digest();
+            let digest = parent.digest();
+            h.core
+                .store
+                .write(digest.to_vec(), bincode::serialize(&parent).unwrap())
+                .await;
+            h.core.completed.insert(parent.header.id.clone());
+            h.core.grade_one_certificates.insert(digest.clone(), parent);
+            child.header.parents.insert(digest);
+        }
+        // Flush setup writes before starting the measurements.
+        h.core.store.read(vec![]).await.unwrap();
+        let block = child.block();
+        let iterations = 100 * references;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            assert_eq!(
+                h.core
+                    .synchronizer
+                    .get_parents(
+                        &child.header,
+                        &h.core.grade_one_certificates,
+                        &h.core.completed
+                    )
+                    .await
+                    .unwrap()
+                    .len(),
+                references
+            );
+            assert!(h
+                .core
+                .synchronizer
+                .ready_for_round_advance(&block, &h.core.grade_one_certificates, &h.core.completed)
+                .await
+                .unwrap());
+        }
+        println!(
+            "DEPENDENCY_BENCH references={} pairs={} total_us={} us_per_pair={:.2}",
+            references,
+            iterations,
+            start.elapsed().as_micros(),
+            start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64
+        );
+    }
 }
 
 #[tokio::test]

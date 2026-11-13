@@ -115,7 +115,10 @@ async fn virtual_dependency_uses_header_without_loading_batch_bytes() {
     let mut sync = crate::synchronizer::Synchronizer::new(&c, store.clone(), tx_headers);
     let mut child = proposal().header;
     child.virtual_edges.insert(digest.clone());
-    let parents = sync.get_parents(&child).await.unwrap();
+    let parents = sync
+        .get_parents(&child, &Default::default(), &Default::default())
+        .await
+        .unwrap();
     assert!(parents
         .iter()
         .any(|parent| parent.header.id == dependency.header.id));
