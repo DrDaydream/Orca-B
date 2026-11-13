@@ -31,7 +31,7 @@ type VDag = HashMap<Round, HashMap<PublicKey, (Digest, Certificate)>>;
 
 #[derive(Default)]
 struct AbaSupport {
-    processed_grade_two: HashSet<Digest>,
+    initialized: bool,
     strong: HashSet<PublicKey>,
     strong_or_virtual: HashSet<PublicKey>,
 }
@@ -286,7 +286,10 @@ impl State {
         if let Some(children) = self.strong_children.get(&digest).cloned() {
             let parents: HashSet<_> = certificate.header.parents.iter().cloned().collect();
             for child in children {
-                self.index_two_hop_ancestors(child, parents.clone());
+                self.index_two_hop_ancestors(child.clone(), parents.clone());
+                if self.grade_two.contains(&child) {
+                    self.mark_aba_support_dirty(child, certificate.round() + 1);
+                }
             }
         }
     }
@@ -883,24 +886,28 @@ impl Consensus {
             if state.leaders.insert(observed_round, designated).is_none() {
                 debug!("Round {} designated leader {}", observed_round, designated);
             }
-            if first_observation {
-                self.ensure_aba_instance(observed_round, &mut state).await;
-                // The designated leader may arrive after its r+2 Grade-2
-                // supporters. Reconcile only that leader's GRBC-derived ABA
-                // support instead of rescanning historical leaders.
-                if observed_origin == self.ordering_leader_authority(observed_round) {
-                    state.dirty_aba_instances.insert(observed_round);
-                }
-            }
-
             // Incremental hot path: a block in support round r can affect only
             // the leaders at r-1 (rule 1) and r-2 (rule 2 / ABA input). Also
             // inspect rounds of blocks newly promoted from VDag, since a late
             // promotion can cross a Dag-only threshold.
-            let promoted_rounds: HashSet<_> = promoted.iter().map(Certificate::round).collect();
-            let mut affected_rounds = promoted_rounds.clone();
+            let mut affected_rounds: BTreeSet<_> =
+                promoted.iter().map(Certificate::round).collect();
             if first_observation {
                 affected_rounds.insert(observed_round);
+                let digest = &state.observed_by_round[&observed_round][&observed_origin];
+                // Late intermediate data completes two-hop paths from its
+                // children; a late leader also unlocks its own cached support.
+                if state.strong_children.contains_key(digest) {
+                    affected_rounds.insert(observed_round + 1);
+                }
+                if observed_origin == self.ordering_leader_authority(observed_round) {
+                    state.dirty_aba_instances.insert(observed_round);
+                    affected_rounds.extend(
+                        (observed_round + 1..=observed_round + 2)
+                            .filter(|round| state.observed_by_round.contains_key(round)),
+                    );
+                }
+                self.ensure_aba_instance(observed_round, &mut state).await;
             }
             for support_round in affected_rounds {
                 self.evaluate_commit_rule_one(support_round, &mut state, true)
@@ -1187,7 +1194,7 @@ impl Consensus {
             .pending_aba_evidence
             .remove(&leader_round)
             .unwrap_or_default();
-        let blocks: Vec<_> = if pending.is_empty() && support.processed_grade_two.is_empty() {
+        let blocks: Vec<_> = if pending.is_empty() && !support.initialized {
             // Compatibility path for restored/test state that predates the
             // event index. Production updates normally use `pending` below.
             state
@@ -1218,12 +1225,10 @@ impl Consensus {
                 })
                 .collect()
         };
-        let fresh: Vec<_> = blocks
-            .into_iter()
-            .filter(|(block_digest, _)| support.processed_grade_two.insert(block_digest.clone()))
-            .map(|(_, block)| block)
-            .collect();
-        for block in &fresh {
+        support.initialized |= !blocks.is_empty();
+        // Pending evidence is already deduplicated. Re-evaluate it when a late
+        // parent changes a formerly unknown strong or virtual path.
+        for (_, block) in &blocks {
             let origin = block.origin();
             let strong = self.has_two_hop_strong_path(block, &digest, state);
             let strong_or_virtual = strong || self.has_two_hop_virtual_path(block, &digest, state);
