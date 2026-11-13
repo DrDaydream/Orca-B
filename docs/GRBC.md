@@ -305,3 +305,46 @@ ten online (1,018), one of four absent (550), and one of four three seconds late
 (644), all with zero round lag at shutdown. Debug logs record 3,115 multi-batch
 frames among 15,820 GRBC vector frames across these runs. These remain short
 Windows functional checks, not Ubuntu throughput or latency measurements.
+
+## Commit ordering and progress repair
+
+The repair starts from the cross-instance vector version `072c554`; the
+subsequent early-control-send revision `8144ec6` was reverted. The four
+commit-path defects below were reproduced again on that restored baseline.
+
+- A monotonic `resolved_through` frontier records the contiguous sequence of
+  committed or skipped leaders. An out-of-order skip is saved, but cannot
+  release a later leader before every earlier round has been resolved.
+  Advancing the frontier also consumes consecutive saved skips and wakes the
+  next pending leader. The frontier survives GC and rejects replayed commits
+  or ABA decisions even after individual outcome records have been collected.
+- When late causal history wakes the ready queue, the consensus event loop
+  drains it immediately after flushing the existing ABA outbox. Empty ready
+  queues do not add another drain or GC pass.
+- A newly observed designated leader rechecks its existing r+1/r+2 support.
+  Checks are deduplicated by leader and rule together with ordinary observation
+  and promotion events, with no scan across historical rounds.
+- ABA input checks the decision again after creating an instance and replaying
+  its buffered messages. A cached DECIDE quorum may already have completed and
+  removed that instance; no new input or duplicate broadcast is generated then.
+
+The restored GRBC/ABA transport and batching remain the baseline for this
+repair. ABA=1 still permits complete observed data before local READY; final
+output still waits for missing strong/weak causal history. Virtual references
+do not pull their targets into the ordered output. SUMMARY latency continues
+to use the rule-ready timestamp rather than the final ordered-commit timestamp.
+
+Validation on 2026-11-13 passes 108 workspace unit tests with all features
+(consensus 32, primary 48, crypto 7, network 6, store 5, worker 9, client 1),
+plus the doctest checks and the benchmark-feature node build. Six new tests
+cover the four defects, both direct commit rules for a late leader, identical
+output for replicas receiving skip decisions in different orders, consecutive
+out-of-order skips, GC, and duplicate decisions. Before the fix, all four
+original reproductions fail on the restored baseline.
+
+Four 12-second real-process runs pass with matching common commit prefixes:
+four nodes online (712 blocks), ten online (944), one of four absent (544),
+and one of four three seconds late (651). All nodes continue committing near
+shutdown. The ten-node run has a maximum eight-round difference at shutdown;
+the other runs have zero. These Windows functional checks do not establish
+Ubuntu throughput or latency improvements.
