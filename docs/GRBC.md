@@ -40,8 +40,8 @@ Each honest process sends at most one ECHO and one READY per instance.
   delivery record. Production grade records have an empty `votes` vector.
 - Recovery returns a complete proposal plus the responding node's own votes.
   The requester must assemble its own local counts; it cannot import a
-  remote FINISH assertion. Votes received before data are buffered and cause
-  proposal requests, with retries.
+  remote FINISH assertion. Votes received before data are buffered; missing
+  proposals are requested with retries, subject to the in-flight grace below.
 - Grade-1 records use `orca-ready-v2/`; payloads and local votes also have
   separate `v2` key prefixes. Strong/weak dependency checks
   before ECHO require local FINISH records. Virtual targets require their
@@ -185,6 +185,48 @@ replica lag; a comparison binary built from the unchanged parent revision,
 using the same authority keys, also stalls and fails the recent-progress check.
 These runs do not establish a throughput or latency improvement. Ubuntu 24.04
 performance remains to be measured.
+
+## Proposal registration and bounded Core work
+
+Decoded remote proposals are tracked before waiting for space in the bulk
+queue. The same guard follows validation, storage and the stored-header queue
+until Core consumes the result. Local proposals are tracked before payload
+assembly through broadcast and Core registration. Tracking stores only a
+block digest and a reference count, never another payload copy. A failed or
+cancelled operation, a stale proposal or a dropped queue releases its guard;
+one failed duplicate does not clear another copy still being processed.
+
+An authenticated vote for an unknown header still enters the pending-vote
+buffer. If the corresponding proposal is in flight, Core defers the immediate
+repair and periodic retries. Without matching work, the first request remains
+immediate. Suppression expires two seconds after the first authenticated vote;
+the existing one-second repair tick then retries even if processing is stuck.
+Additional arrivals or votes do not reset that deadline. Tracking is only a
+scheduling hint: every proposal still passes full validation before Core can
+observe it or vote. Frames still in transit or being decoded are not tracked.
+
+The old 32-envelope drain is replaced by a 256-work-item budget. Each vote
+costs one item; opening a vector and other control messages also cost one.
+Core services one completed proposal before the burst and every 32 items.
+Oversized vectors retain their unconsumed votes across bursts, without new
+network packets; later control frames do not overtake that remainder. At the
+end of a full burst Core yields to the runtime and reselects among its inputs.
+An empty network queue returns directly to selection without an extra yield.
+Queue capacities, outgoing vote batching and GRBC thresholds are unchanged.
+This increases the limit for small frames while bounding the long runs caused
+by many votes in one frame; it does not imply an eightfold throughput gain.
+
+All 96 workspace unit tests with all features and the doctest checks pass on
+Windows. Regressions cover processing and stored-header queues, failure and
+duplicate guards, queue cancellation, a repair deadline that cannot be renewed,
+oversized-vector continuation/FIFO, and a proposal completing during a burst.
+The benchmark-feature node build also passes. Final real-process runs agree on
+698 blocks with four nodes online and 1185 blocks with the fourth starting
+three seconds late; both end with zero round lag. The ten-node run keeps a
+516-block common prefix and recent progress at every node, but still has a
+53-round maximum lag. These Windows debug runs verify functional behavior;
+they do not establish Ubuntu throughput or latency gains, or resolve the
+previously observed ten-node lag.
 
 ## Reproduce validation
 

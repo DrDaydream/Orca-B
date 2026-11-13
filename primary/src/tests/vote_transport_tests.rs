@@ -19,12 +19,16 @@ async fn echo_and_ready_bypass_a_blocked_proposal_connection() {
     let (tx_primary_messages, mut rx_control) = channel(10);
     let (tx_remote_proposals, mut rx_bulk) = channel(1);
     let (tx_cert_requests, _rx_requests) = channel(10);
+    let in_flight = ProposalTracker::default();
     // Fill the bulk queue and deliberately never run its consumer.
-    tx_remote_proposals.send(proposal()).await.unwrap();
+    let first = proposal();
+    let guard = in_flight.track(&first.header);
+    tx_remote_proposals.send((first, guard)).await.unwrap();
     let handler = PrimaryReceiverHandler {
         tx_primary_messages,
         tx_remote_proposals,
         tx_cert_requests,
+        in_flight: in_flight.clone(),
     };
     // Use the production handler, with an independent dispatch task per socket.
     let accept = tokio::spawn(async move {
@@ -63,6 +67,15 @@ async fn echo_and_ready_bypass_a_blocked_proposal_connection() {
         .await
         .unwrap()
         .unwrap();
+    // ACK precedes blocking-task decoding. Wait for decoded ingress so this
+    // checks the full-queue case, not an incidental decoding/transport race.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !in_flight.contains(&p.block().digest()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let (tx_votes, rx_votes) = channel(10);
     spawn_vote_sender(keys()[0].0, c, Arc::new(AtomicU64::new(0)), 50, rx_votes);
     for phase in [GrbcPhase::Echo, GrbcPhase::Ready] {
@@ -88,6 +101,7 @@ async fn echo_and_ready_bypass_a_blocked_proposal_connection() {
         }
     }
     // Only now release the intentionally blocked proposal consumer.
+    assert!(in_flight.contains(&p.block().digest()));
     rx_bulk.recv().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), rx_bulk.recv())
         .await

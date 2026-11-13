@@ -7,7 +7,7 @@ use crate::messages::{
     local_votes_key, Certificate, ConsensusCommand, ConsensusMessage, GrbcPhase, GrbcVote, Header,
 };
 use crate::primary::{PrimaryMessage, Round};
-use crate::proposal_processor::StoredProposalHeader;
+use crate::proposal_processor::{ProposalTracker, StoredProposalHeader};
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
 use crate::verified_vote::VerifiedGrbcVote;
@@ -22,12 +22,19 @@ use network::{CancelHandler, ReliableSender};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[cfg(test)]
 #[path = "tests/core_tests.rs"]
 pub mod core_tests;
+
+const CORE_WORK_BUDGET: usize = 256;
+const PROPOSAL_SERVICE_INTERVAL: usize = 32;
+// Unverified arrivals may defer repair only for a bounded time after the first
+// authenticated vote. Repeated arrivals/votes cannot extend this deadline.
+const PROPOSAL_REPAIR_GRACE: Duration = Duration::from_secs(2);
 
 pub struct Core {
     /// The public key of this primary.
@@ -56,6 +63,9 @@ pub struct Core {
     rx_certificate_waiter: Receiver<Certificate>,
     /// Compact metadata delivered after full proposal validation and storage.
     rx_proposals: Receiver<StoredProposalHeader>,
+    in_flight: ProposalTracker,
+    /// Unconsumed votes from one wire batch, retained across bounded bursts.
+    vote_batch: std::vec::IntoIter<GrbcVote>,
     tx_votes: Sender<VoteDispatch>,
     tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
     /// Output all certificates to the consensus layer.
@@ -77,7 +87,7 @@ pub struct Core {
     validated: HashSet<Digest>,
     last_ready: HashMap<Round, HashSet<PublicKey>>,
     local_votes: HashMap<Digest, Vec<GrbcVote>>,
-    missing_proposals: HashMap<Digest, Round>,
+    missing_proposals: HashMap<Digest, (Round, Instant)>,
     pending_votes: HashMap<Digest, Vec<VerifiedGrbcVote>>,
     /// Aggregates certificates to use as parents for new headers.
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>,
@@ -110,6 +120,7 @@ impl Core {
         rx_header_waiter: Receiver<Header>,
         rx_certificate_waiter: Receiver<Certificate>,
         rx_proposals: Receiver<StoredProposalHeader>,
+        in_flight: ProposalTracker,
         tx_votes: Sender<VoteDispatch>,
         tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
         tx_consensus: Sender<ConsensusMessage>,
@@ -131,6 +142,8 @@ impl Core {
                 rx_header_waiter,
                 rx_certificate_waiter,
                 rx_proposals,
+                in_flight,
+                vote_batch: Vec::new().into_iter(),
                 tx_votes,
                 tx_cert_requests,
                 tx_consensus,
@@ -181,6 +194,7 @@ impl Core {
             self.committee.clone(),
             &mut self.store,
             false,
+            None,
         )
         .await?;
         self.process_stored_proposal(header).await
@@ -458,11 +472,14 @@ impl Core {
                 return Ok(());
             }
             pending.push(vote.clone());
-            if self
-                .missing_proposals
-                .insert(digest.clone(), vote.round)
-                .is_none()
-            {
+            let first = match self.missing_proposals.entry(digest.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((vote.round, Instant::now()));
+                    true
+                }
+                std::collections::hash_map::Entry::Occupied(_) => false,
+            };
+            if first && !self.in_flight.contains(&digest) {
                 self.broadcast_grbc_batch(
                     PrimaryMessage::CertificatesRequest(vec![digest], self.name),
                     vote.round,
@@ -673,17 +690,6 @@ impl Core {
             #[cfg(test)]
             PrimaryMessage::Proposal(proposal) => self.process_proposal(proposal).await,
             PrimaryMessage::GrbcVote(vote) => self.process_grbc_vote(vote).await,
-            PrimaryMessage::GrbcVoteBatch(batch) => {
-                for vote in batch.into_votes() {
-                    if let Err(error) = self.process_grbc_vote(vote).await {
-                        match error {
-                            DagError::StoreError(_) => return Err(error),
-                            _ => warn!("Ignoring invalid GRBC vote: {}", error),
-                        }
-                    }
-                }
-                Ok(())
-            }
             PrimaryMessage::Consensus(message) => {
                 message.verify(&self.committee)?;
                 let batch = bincode::deserialize::<Vec<Vec<u8>>>(&message.payload)
@@ -701,28 +707,70 @@ impl Core {
         }
     }
 
+    /// Budget actual votes, not just envelopes. Keep the remainder of a large
+    /// vector in place and preserve FIFO order across bursts.
+    async fn process_primary_burst(&mut self, mut first: Option<PrimaryMessage>) -> DagResult<()> {
+        for work in 0..CORE_WORK_BUDGET {
+            if work % PROPOSAL_SERVICE_INTERVAL == 0 {
+                if let Ok(stored) = self.rx_proposals.try_recv() {
+                    match self.process_stored_proposal(stored).await {
+                        Err(error @ DagError::StoreError(_)) => return Err(error),
+                        Err(error) => warn!("Ignoring stored proposal: {}", error),
+                        Ok(()) => (),
+                    }
+                }
+            }
+            let message = match self.vote_batch.next() {
+                Some(vote) => PrimaryMessage::GrbcVote(vote),
+                None => match first.take().or_else(|| self.rx_primaries.try_recv().ok()) {
+                    Some(message) => message,
+                    None => return Ok(()),
+                },
+            };
+            if let PrimaryMessage::GrbcVoteBatch(batch) = message {
+                self.vote_batch = batch.into_votes().into_iter();
+                continue;
+            }
+            match self.process_primary_message(message).await {
+                Err(error @ DagError::StoreError(_)) => return Err(error),
+                Err(error) => warn!("Ignoring primary message: {}", error),
+                Ok(()) => (),
+            }
+        }
+        // Only a full burst needs an explicit yield; an empty input queue goes
+        // straight back to select without an extra low-load context switch.
+        tokio::task::yield_now().await;
+        Ok(())
+    }
+
+    async fn retry_missing_proposals(&mut self) {
+        let pending: Vec<_> = self
+            .missing_proposals
+            .iter()
+            .filter(|(digest, (_, since))| {
+                since.elapsed() >= PROPOSAL_REPAIR_GRACE || !self.in_flight.contains(digest)
+            })
+            .map(|(digest, (round, _))| (digest.clone(), *round))
+            .collect();
+        for (digest, round) in pending {
+            self.broadcast_grbc_batch(
+                PrimaryMessage::CertificatesRequest(vec![digest], self.name),
+                round,
+            )
+            .await;
+        }
+    }
+
     // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
         let mut repair = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             let result = tokio::select! {
                 // We receive here messages from other primaries.
-                Some(message) = self.rx_primaries.recv() => {
-                    let mut result = self.process_primary_message(message).await;
-                    // Drain a bounded burst while the channel is already hot.
-                    // This amortizes scheduler/select overhead without starving
-                    // proposer, waiter, or consensus-command channels.
-                    for _ in 1..32 {
-                        if result.is_err() {
-                            break;
-                        }
-                        match self.rx_primaries.try_recv() {
-                            Ok(message) => result = self.process_primary_message(message).await,
-                            Err(_) => break,
-                        }
-                    }
-                    result
-                },
+                Some(message) = self.rx_primaries.recv(), if self.vote_batch.len() == 0 =>
+                    self.process_primary_burst(Some(message)).await,
+                _ = std::future::ready(()), if self.vote_batch.len() != 0 =>
+                    self.process_primary_burst(None).await,
 
                 // We receive here loopback headers from the `HeaderWaiter`. Those are headers for which we interrupted
                 // execution (we were missing some of their dependencies) and we are now ready to resume processing.
@@ -737,10 +785,7 @@ impl Core {
                 Some(header) = self.rx_proposals.recv() => self.process_stored_proposal(header).await,
                 Some(command) = self.rx_consensus.recv() => self.process_consensus_command(command).await,
                 _ = repair.tick() => {
-                    let pending: Vec<_> = self.missing_proposals.iter().map(|(d, r)| (d.clone(), *r)).collect();
-                    for (digest, round) in pending {
-                        self.broadcast_grbc_batch(PrimaryMessage::CertificatesRequest(vec![digest], self.name), round).await;
-                    }
+                    self.retry_missing_proposals().await;
                     Ok(())
                 },
             };
@@ -764,7 +809,8 @@ impl Core {
                 let proposal_headers = &self.proposal_headers;
                 self.validated
                     .retain(|id| proposal_headers.contains_key(id));
-                self.missing_proposals.retain(|_, round| *round >= gc_round);
+                self.missing_proposals
+                    .retain(|_, (round, _)| *round >= gc_round);
                 self.local_votes
                     .retain(|_, votes| votes.first().map_or(false, |v| v.round >= gc_round));
                 self.processing.retain(|k, _| k >= &gc_round);
