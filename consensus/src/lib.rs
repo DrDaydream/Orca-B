@@ -58,7 +58,8 @@ struct State {
     observed: HashMap<Digest, Certificate>,
     /// Locates an observed leader even before it reaches grade 1.
     observed_by_round: HashMap<Round, HashMap<PublicKey, Digest>>,
-    strong_ancestors: HashMap<Digest, HashSet<Digest>>,
+    /// Rule 2 and r+2 ABA input only query exactly two strong edges.
+    two_hop_ancestors: HashMap<Digest, HashSet<Digest>>,
     strong_children: HashMap<Digest, HashSet<Digest>>,
     observed_strong_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
     dag_strong_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
@@ -170,7 +171,7 @@ impl State {
             dag_digests,
             observed,
             observed_by_round,
-            strong_ancestors: HashMap::new(),
+            two_hop_ancestors: HashMap::new(),
             strong_children: HashMap::new(),
             observed_strong_support: HashMap::new(),
             dag_strong_support: HashMap::new(),
@@ -275,42 +276,37 @@ impl State {
                 .entry(parent.clone())
                 .or_default()
                 .insert(digest.clone());
-            additions.insert(parent.clone());
-            if let Some(ancestors) = self.strong_ancestors.get(parent) {
-                additions.extend(ancestors.iter().cloned());
+            if let Some(parent) = self.observed.get(parent) {
+                additions.extend(parent.header.parents.iter().cloned());
             }
         }
-        self.propagate_strong_ancestors(digest, additions);
+        self.index_two_hop_ancestors(digest.clone(), additions);
+        // A late intermediate affects its immediate children only. More distant
+        // descendants already carry the digests needed for their own two hops.
+        if let Some(children) = self.strong_children.get(&digest).cloned() {
+            let parents: HashSet<_> = certificate.header.parents.iter().cloned().collect();
+            for child in children {
+                self.index_two_hop_ancestors(child, parents.clone());
+            }
+        }
     }
 
-    fn propagate_strong_ancestors(&mut self, source: Digest, additions: HashSet<Digest>) {
-        let mut pending = vec![(source, additions)];
-        while let Some((digest, candidates)) = pending.pop() {
-            let ancestors = self.strong_ancestors.entry(digest.clone()).or_default();
-            let fresh: HashSet<_> = candidates
-                .into_iter()
-                .filter(|ancestor| ancestors.insert(ancestor.clone()))
-                .collect();
-            if fresh.is_empty() {
-                continue;
-            }
-            if let Some(block) = self.observed.get(&digest) {
-                for ancestor in &fresh {
-                    self.observed_strong_support
-                        .entry((block.round(), ancestor.clone()))
+    fn index_two_hop_ancestors(&mut self, digest: Digest, additions: HashSet<Digest>) {
+        let ancestors = self.two_hop_ancestors.entry(digest.clone()).or_default();
+        if let Some(block) = self.observed.get(&digest) {
+            for ancestor in additions {
+                if !ancestors.insert(ancestor.clone()) {
+                    continue;
+                }
+                self.observed_strong_support
+                    .entry((block.round(), ancestor.clone()))
+                    .or_default()
+                    .insert(block.origin());
+                if self.dag_digests.contains(&digest) {
+                    self.dag_strong_support
+                        .entry((block.round(), ancestor))
                         .or_default()
                         .insert(block.origin());
-                    if self.dag_digests.contains(&digest) {
-                        self.dag_strong_support
-                            .entry((block.round(), ancestor.clone()))
-                            .or_default()
-                            .insert(block.origin());
-                    }
-                }
-            }
-            if let Some(children) = self.strong_children.get(&digest).cloned() {
-                for child in children {
-                    pending.push((child, fresh.clone()));
                 }
             }
         }
@@ -425,7 +421,7 @@ impl State {
         if !self.dag_digests.insert(digest.clone()) {
             return;
         }
-        if let Some(ancestors) = self.strong_ancestors.get(&digest) {
+        if let Some(ancestors) = self.two_hop_ancestors.get(&digest) {
             for ancestor in ancestors {
                 self.dag_strong_support
                     .entry((round, ancestor.clone()))
@@ -563,7 +559,7 @@ impl State {
         });
         self.grade_two.retain(|digest| retained.contains(digest));
         let observed = &self.observed;
-        self.strong_ancestors
+        self.two_hop_ancestors
             .retain(|digest, _| observed.contains_key(digest));
         self.strong_children.retain(|digest, children| {
             children.retain(|child| observed.contains_key(child));
@@ -1229,7 +1225,7 @@ impl Consensus {
             .collect();
         for block in &fresh {
             let origin = block.origin();
-            let strong = self.has_strong_path(block, &digest, state);
+            let strong = self.has_two_hop_strong_path(block, &digest, state);
             let strong_or_virtual = strong || self.has_two_hop_virtual_path(block, &digest, state);
             if strong {
                 support.strong.insert(origin);
@@ -1461,25 +1457,16 @@ impl Consensus {
         )
     }
 
-    /// Strong-path reachability over blocks observed in Dag union VDag.
-    fn has_strong_path(&self, block: &Certificate, target: &Digest, state: &State) -> bool {
-        if let Some(ancestors) = state.strong_ancestors.get(&block.digest()) {
+    /// ABA compares round r+2 with round r; validated strong edges
+    /// always go back one round, so exactly two hops cover every strong path.
+    fn has_two_hop_strong_path(&self, block: &Certificate, target: &Digest, state: &State) -> bool {
+        if let Some(ancestors) = state.two_hop_ancestors.get(&block.digest()) {
             return ancestors.contains(target);
         }
-        let mut pending: Vec<_> = block.header.parents.iter().cloned().collect();
-        let mut visited = HashSet::new();
-        while let Some(digest) = pending.pop() {
-            if &digest == target {
-                return true;
-            }
-            if !visited.insert(digest.clone()) {
-                continue;
-            }
-            if let Some(parent) = Self::observed_certificate(&digest, state) {
-                pending.extend(parent.header.parents.iter().cloned());
-            }
-        }
-        false
+        block.header.parents.iter().any(|parent_digest| {
+            Self::observed_certificate(parent_digest, state)
+                .map_or(false, |parent| parent.header.parents.contains(target))
+        })
     }
 
     /// Exactly two hops: one strong edge followed by one virtual edge to the

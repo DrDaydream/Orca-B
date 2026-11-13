@@ -410,6 +410,81 @@ fn virtual_path_checks_the_reference_without_loading_its_target() {
 }
 
 #[test]
+fn strong_support_index_is_bounded_by_two_rounds() {
+    let committee = mock_committee();
+    let genesis = Certificate::genesis(&committee);
+    let parents = genesis.iter().map(|block| block.digest()).collect();
+    let authorities: Vec<_> = committee.authorities.keys().copied().collect();
+    let (blocks, _) = make_certificates(1, 20, &parents, &authorities);
+    let mut state = State::new(genesis);
+    for block in blocks {
+        state.observe(block);
+    }
+    // A rule-2 or r+2 ABA query never needs support for more distant rounds.
+    // Retained support entries must grow linearly with the observed window.
+    assert!(state.observed_strong_support.len() <= 20 * authorities.len());
+}
+
+#[test]
+fn two_hop_support_matches_reference_with_late_parents() {
+    let committee = mock_committee();
+    let genesis = Certificate::genesis(&committee);
+    let parents = genesis.iter().map(|block| block.digest()).collect();
+    let authorities: Vec<_> = committee.authorities.keys().copied().collect();
+    let (blocks, _) = make_certificates(1, 6, &parents, &authorities);
+    // Reverse delivery makes intermediates arrive after their children have
+    // already entered Dag, exercising both observed and Dag index repair.
+    let mut state = State::new(genesis);
+    for block in blocks.into_iter().rev() {
+        state.observe(block.clone());
+        state.promote_to_dag(block);
+        for source in state.observed.values().filter(|block| block.round() >= 2) {
+            for target in state
+                .observed
+                .values()
+                .filter(|target| target.round() + 2 == source.round())
+            {
+                let target_digest = target.digest();
+                let expected = source.header.parents.iter().any(|parent| {
+                    state.observed.get(parent).map_or(false, |middle| {
+                        middle.header.parents.contains(&target_digest)
+                    })
+                });
+                let key = (source.round(), target_digest);
+                for index in [&state.observed_strong_support, &state.dag_strong_support] {
+                    assert_eq!(
+                        index
+                            .get(&key)
+                            .map_or(false, |support| support.contains(&source.origin())),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "manual CPU and index-size measurement"]
+fn measure_strong_support_index() {
+    let mut rng = StdRng::from_seed([19; 32]);
+    let authorities: Vec<_> = (0..10).map(|_| generate_keypair(&mut rng).0).collect();
+    let (blocks, _) = make_certificates(1, 80, &BTreeSet::new(), &authorities);
+    let mut state = State::new(Vec::new());
+    let started = Instant::now();
+    for block in blocks {
+        state.observe(block.clone());
+        state.promote_to_dag(block);
+    }
+    eprintln!(
+        "10 nodes x 80 rounds: {:?}, observed support keys {}, Dag support keys {}",
+        started.elapsed(),
+        state.observed_strong_support.len(),
+        state.dag_strong_support.len()
+    );
+}
+
+#[test]
 fn unfinished_aba_instance_survives_dag_gc() {
     let committee = mock_committee();
     let name = keys()[0].0;
