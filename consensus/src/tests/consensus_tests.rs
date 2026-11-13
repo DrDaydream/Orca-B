@@ -788,6 +788,173 @@ async fn leader_commits_wait_for_the_previous_leader() {
     assert!(state.pending_leaders.is_empty());
 }
 
+async fn commit_observed_in_order(blocks: Vec<Certificate>) -> Vec<Certificate> {
+    let committee = mock_committee();
+    let (tx_ingress, rx_primary) = channel(blocks.len() + 1);
+    let (tx_primary, _rx_commands) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
+    for block in blocks {
+        tx_ingress
+            .send(ConsensusMessage::Observed(block.header))
+            .await
+            .unwrap();
+    }
+    drop(tx_ingress);
+    let mut consensus = Consensus {
+        name: keys()[0].0,
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    consensus.run().await;
+    drop(consensus);
+    let mut committed = Vec::new();
+    while let Some(block) = rx_output.recv().await {
+        committed.push(block);
+    }
+    committed
+}
+
+#[tokio::test]
+async fn late_leader_rechecks_existing_rule_one_support() {
+    let committee = mock_committee();
+    let authorities: Vec<_> = committee.authorities.keys().copied().collect();
+    let genesis = Certificate::genesis(&committee)
+        .iter()
+        .map(Certificate::digest)
+        .collect();
+    let (mut first_round, parents) = make_certificates(1, 1, &genesis, &authorities);
+    let leader = first_round.pop_front().unwrap();
+    let (mut support, _) = make_certificates(2, 2, &parents, &authorities[..3]);
+    let last_support = support.pop_back().unwrap();
+    let mut arrivals: Vec<_> = first_round.into_iter().chain(support).collect();
+    let mut below_threshold = arrivals.clone();
+    below_threshold.push(leader.clone());
+    assert!(commit_observed_in_order(below_threshold).await.is_empty());
+    arrivals.push(last_support);
+
+    // Three observed supporters suffice, but only after the complete leader arrives.
+    assert!(commit_observed_in_order(arrivals.clone()).await.is_empty());
+    arrivals.push(leader.clone());
+    assert_eq!(commit_observed_in_order(arrivals).await, vec![leader]);
+}
+
+async fn check_late_rule_two_support(late_leader: bool) {
+    let committee = mock_committee();
+    let authorities: Vec<_> = committee.authorities.keys().copied().collect();
+    let genesis = Certificate::genesis(&committee)
+        .iter()
+        .map(Certificate::digest)
+        .collect();
+    let (mut first_round, parents) = make_certificates(1, 1, &genesis, &authorities);
+    let leader = first_round.pop_front().unwrap();
+    let nonleader_parents = parents
+        .iter()
+        .filter(|digest| **digest != leader.digest())
+        .cloned()
+        .collect();
+    let (middle_digest, middle) = mock_certificate(authorities[3], 2, parents);
+    let (second_round, mut child_parents) =
+        make_certificates(2, 2, &nonleader_parents, &authorities[1..3]);
+    child_parents.insert(middle_digest);
+    let (mut support, _) = make_certificates(3, 3, &child_parents, &authorities[..3]);
+    let last_support = support.pop_back().unwrap();
+
+    // Only one round-2 block references the leader, below the rule-1 threshold.
+    // Three round-3 proposals provide rule-2 support through that block.
+    let mut arrivals: Vec<_> = first_round.into_iter().collect();
+    arrivals.push(if late_leader {
+        middle.clone()
+    } else {
+        leader.clone()
+    });
+    arrivals.extend(second_round);
+    arrivals.extend(support);
+    let late = if late_leader { leader.clone() } else { middle };
+    let mut below_threshold = arrivals.clone();
+    below_threshold.push(late.clone());
+    assert!(commit_observed_in_order(below_threshold).await.is_empty());
+    arrivals.push(last_support);
+    assert!(commit_observed_in_order(arrivals.clone()).await.is_empty());
+    arrivals.push(late);
+    assert_eq!(commit_observed_in_order(arrivals).await, vec![leader]);
+}
+
+#[tokio::test]
+async fn late_leader_rechecks_existing_rule_two_support() {
+    check_late_rule_two_support(true).await;
+}
+
+#[tokio::test]
+async fn late_parent_rechecks_existing_rule_two_support() {
+    check_late_rule_two_support(false).await;
+}
+
+async fn check_late_aba_support(virtual_path: bool) {
+    let committee = mock_committee();
+    let (tx_primary, _rx_primary) = channel(100);
+    let mut consensus = Consensus {
+        name: keys()[0].0,
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(channel(1).0),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    let (leader_digest, leader) =
+        mock_certificate(consensus.ordering_leader_authority(1), 1, BTreeSet::new());
+    let (_, mut middle) =
+        mock_certificate(keys()[1].0, 2, [leader_digest].iter().cloned().collect());
+    if virtual_path {
+        middle.header.virtual_edges = std::mem::take(&mut middle.header.parents);
+    }
+    let middle_digest = middle.digest();
+    let (support_digest, support) = mock_certificate(
+        keys()[2].0,
+        3,
+        [middle_digest.clone()].iter().cloned().collect(),
+    );
+    state.observe(leader);
+    state.observe(support);
+    state.mark_grade_two(support_digest);
+    consensus.process_dirty_aba_instances(&mut state).await;
+    assert!(!state.aba_inputs.contains(&1));
+
+    state.observe(middle.clone());
+    consensus.process_dirty_aba_instances(&mut state).await;
+    if virtual_path {
+        // One virtual supporter is still below f+1. Duplicate arrivals cannot
+        // increase its stake; a second authority must finish its broadcast.
+        assert!(!state.aba_inputs.contains(&1));
+        state.observe(middle);
+        consensus.process_dirty_aba_instances(&mut state).await;
+        assert!(!state.aba_inputs.contains(&1));
+        let (digest, second) =
+            mock_certificate(keys()[3].0, 3, [middle_digest].iter().cloned().collect());
+        state.observe(second);
+        state.mark_grade_two(digest);
+        consensus.process_dirty_aba_instances(&mut state).await;
+    }
+    assert!(state.aba_inputs.contains(&1));
+    assert!(state.aba_outbox.iter().any(|message| message.instance == 1
+        && message.kind == aba::AbaMessageKind::BVal(BinaryValue::One)));
+}
+
+#[tokio::test]
+async fn late_parent_refreshes_grade_two_aba_evidence() {
+    check_late_aba_support(false).await;
+}
+
+#[tokio::test]
+async fn late_virtual_parent_refreshes_grade_two_aba_evidence() {
+    check_late_aba_support(true).await;
+}
+
 // Run for 4 dag rounds in ideal conditions (all nodes reference all other nodes). We should commit
 // the leader of round 2.
 #[tokio::test]
