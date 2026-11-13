@@ -10,15 +10,19 @@ fn echo_and_ready_are_independent_and_duplicates_do_not_add_weight() {
     let c = committee();
     let mut state = GrbcVotesAggregator::new();
     for v in votes(&h, GrbcPhase::Echo).into_iter().take(3) {
-        let v = VerifiedGrbcVote::verify(v, &c).unwrap();
-        assert!(state.append(&v, &c, &h).unwrap());
-        assert!(!state.append(&v, &c, &h).unwrap());
+        assert!(state
+            .append(&VerifiedGrbcVote::verify(v.clone(), &c).unwrap(), &c, &h)
+            .unwrap());
+        assert!(!state
+            .append(&VerifiedGrbcVote::verify(v.clone(), &c).unwrap(), &c, &h)
+            .unwrap());
     }
     assert_eq!(state.echo_weight, 3);
     assert_eq!(state.ready_weight, 0);
     for v in votes(&h, GrbcPhase::Ready).into_iter().take(3) {
-        let v = VerifiedGrbcVote::verify(v, &c).unwrap();
-        state.append(&v, &c, &h).unwrap();
+        state
+            .append(&VerifiedGrbcVote::verify(v.clone(), &c).unwrap(), &c, &h)
+            .unwrap();
     }
     assert_eq!(state.ready_weight, 3);
 }

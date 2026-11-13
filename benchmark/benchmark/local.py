@@ -1,9 +1,7 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
-import os
 import subprocess
 from math import ceil
 from os.path import basename, splitext
-from pathlib import Path
 from time import sleep
 
 from benchmark.commands import CommandMaker
@@ -35,28 +33,11 @@ class LocalBench:
         try:
             cmd = CommandMaker.kill().split()
             subprocess.run(cmd, stderr=subprocess.DEVNULL)
-        except (subprocess.SubprocessError, OSError) as e:
+        except subprocess.SubprocessError as e:
             raise BenchError('Failed to kill testbed', e)
 
     def run(self, debug=False):
         assert isinstance(debug, bool)
-        # Fabric can discover fabfile.py above the caller's current directory.
-        # Anchor every relative path (including cleanup) to that benchmark tree.
-        benchmark_dir = Path(__file__).resolve().parents[1]
-        node_dir = benchmark_dir.parent / 'node'
-        if not (node_dir / 'Cargo.toml').is_file():
-            raise BenchError(
-                'Cannot find the Orca-B node source directory',
-                NotADirectoryError(f'Expected a Rust crate at {node_dir} (node/Cargo.toml)'),
-            )
-        previous_dir = Path.cwd()
-        try:
-            os.chdir(benchmark_dir)
-            return self._run(debug)
-        finally:
-            os.chdir(previous_dir)
-
-    def _run(self, debug):
         Print.heading('Starting local benchmark')
 
         # Kill any previous testbed.
@@ -151,6 +132,6 @@ class LocalBench:
             Print.info('Parsing logs...')
             return LogParser.process(PathMaker.logs_path(), faults=self.faults)
 
-        except (subprocess.SubprocessError, OSError, ParseError) as e:
+        except (subprocess.SubprocessError, ParseError) as e:
             self._kill_nodes()
             raise BenchError('Failed to run benchmark', e)
