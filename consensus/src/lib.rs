@@ -40,6 +40,9 @@ struct AbaSupport {
 struct State {
     /// The last committed round.
     last_committed_round: Round,
+    /// Every leader through this round has been committed or skipped in order.
+    /// Unlike the individual outcome sets, this frontier survives garbage collection.
+    resolved_through: Round,
     // Keeps the last committed round for each authority. This map is used to clean up the dag and
     // ensure we don't commit twice the same certificate.
     last_committed: HashMap<PublicKey, Round>,
@@ -155,6 +158,7 @@ impl State {
 
         Self {
             last_committed_round: 0,
+            resolved_through: 0,
             last_committed: genesis_dag
                 .get(&0)
                 .unwrap()
@@ -459,9 +463,7 @@ impl State {
     }
 
     fn predecessor_resolved(&self, round: Round) -> bool {
-        round > 0
-            && (self.committed_leaders.contains(&(round - 1))
-                || self.skipped_leaders.contains(&(round - 1)))
+        round.checked_sub(1) == Some(self.resolved_through)
     }
 
     fn wake_pending(&mut self, round: Round) {
@@ -471,11 +473,23 @@ impl State {
     }
 
     fn mark_skipped(&mut self, round: Round) -> bool {
+        if round <= self.resolved_through {
+            return false;
+        }
         let inserted = self.skipped_leaders.insert(round);
         if inserted {
-            self.wake_pending(round + 1);
+            self.advance_commit_frontier();
         }
         inserted
+    }
+
+    fn advance_commit_frontier(&mut self) {
+        while self.committed_leaders.contains(&(self.resolved_through + 1))
+            || self.skipped_leaders.contains(&(self.resolved_through + 1))
+        {
+            self.resolved_through += 1;
+        }
+        self.wake_pending(self.resolved_through + 1);
     }
 
     fn mark_grade_two(&mut self, digest: Digest) -> bool {
@@ -692,9 +706,7 @@ impl Consensus {
     }
 
     fn mark_rule_skipped(&self, round: Round, rule: u8, state: &mut State) {
-        if state.leader_commit_rules.contains_key(&round)
-            || state.committed_leaders.contains(&round)
-        {
+        if round <= state.resolved_through || state.leader_commit_rules.contains_key(&round) {
             return;
         }
         if state.mark_skipped(round) {
@@ -901,20 +913,42 @@ impl Consensus {
             // the leaders at r-1 (rule 1) and r-2 (rule 2 / ABA input). Also
             // inspect rounds of blocks newly promoted from VDag, since a late
             // promotion can cross a Dag-only threshold.
-            let promoted_rounds: HashSet<_> = promoted.iter().map(Certificate::round).collect();
-            let mut affected_rounds = promoted_rounds.clone();
-            if first_observation {
-                affected_rounds.insert(observed_round);
+            // Deduplicate by leader and rule, including evidence that arrived
+            // before the designated leader itself. No historical round scan.
+            let mut affected: BTreeMap<Round, (bool, bool)> = BTreeMap::new();
+            for support_round in promoted
+                .iter()
+                .map(Certificate::round)
+                .chain(first_observation.then_some(observed_round))
+            {
+                if support_round >= 2 {
+                    affected.entry(support_round - 1).or_default().0 = true;
+                }
+                if support_round >= 3 {
+                    affected.entry(support_round - 2).or_default().1 = true;
+                }
             }
-            for support_round in affected_rounds {
-                self.evaluate_commit_rule_one(support_round, &mut state, true)
-                    .await;
-                self.evaluate_commit_rule_two(support_round, &mut state, true)
-                    .await;
+            if first_observation
+                && observed_origin == self.ordering_leader_authority(observed_round)
+            {
+                affected.insert(observed_round, (true, true));
+            }
+            for (leader_round, (rule_one, rule_two)) in affected {
+                if rule_one {
+                    self.evaluate_commit_rule_one(leader_round + 1, &mut state, true)
+                        .await;
+                }
+                if rule_two {
+                    self.evaluate_commit_rule_two(leader_round + 2, &mut state, true)
+                        .await;
+                }
             }
             self.resolve_requested_leaders(&mut state).await;
             self.process_dirty_aba_instances(&mut state).await;
             self.flush_aba_outbox(&mut state).await;
+            if !state.ready_pending.is_empty() {
+                self.drain_ready_leaders(&mut state).await;
+            }
         }
     }
 
@@ -1009,7 +1043,11 @@ impl Consensus {
             return;
         }
         self.ensure_aba_instance(leader_round, state).await;
-        if !state.aba_inputs.insert(leader_round) {
+        // Buffered DECIDE messages can finish and remove a newly created
+        // instance while ensure_aba_instance replays its inbox.
+        if state.aba_decisions.contains_key(&leader_round)
+            || !state.aba_inputs.insert(leader_round)
+        {
             return;
         }
         debug!("ABA instance {} receives input {:?}", leader_round, value);
@@ -1073,6 +1111,9 @@ impl Consensus {
         value: BinaryValue,
         state: &mut State,
     ) {
+        if leader_round <= state.resolved_through {
+            return;
+        }
         // An ABA result produced before entering r+3 belongs to rule 2. Once
         // r+3 has been entered, the same fallback is accounted to rule 3.
         let aba_rule = if state.highest_entered_round <= leader_round + 2 {
@@ -1347,7 +1388,7 @@ impl Consensus {
         {
             return;
         }
-        if state.committed_leaders.contains(&leader_round)
+        if leader_round <= state.resolved_through
             || state.leader_commit_rules.contains_key(&leader_round)
             || state.pending_leaders.contains_key(&leader_round)
         {
@@ -1393,7 +1434,7 @@ impl Consensus {
         if self.adversarial_leader(leader_round, state) {
             return;
         }
-        if state.committed_leaders.contains(&leader_round)
+        if leader_round <= state.resolved_through
             || state.leader_commit_rules.contains_key(&leader_round)
             || state.pending_leaders.contains_key(&leader_round)
         {
@@ -1607,7 +1648,7 @@ impl Consensus {
     /// Queue a leader once and commit ready leaders in consecutive round order.
     async fn queue_leader_commit(&mut self, leader: Certificate, rule: u8, state: &mut State) {
         let round = leader.round();
-        if state.committed_leaders.contains(&round)
+        if round <= state.resolved_through
             || state.skipped_leaders.contains(&round)
             || state.pending_leaders.contains_key(&round)
         {
@@ -1685,7 +1726,7 @@ impl Consensus {
             if !state.committed_leaders.insert(ready_round) {
                 continue;
             }
-            state.wake_pending(ready_round + 1);
+            state.advance_commit_frontier();
 
             let mut sequence = state
                 .pending_order
