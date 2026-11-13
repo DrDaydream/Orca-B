@@ -17,8 +17,11 @@ struct Harness {
 
 impl Harness {
     fn new(label: &str, node: usize) -> Self {
+        Self::with_committee(label, node, committee())
+    }
+
+    fn with_committee(label: &str, node: usize, c: Committee) -> Self {
         let (name, secret) = keys().remove(node);
-        let c = committee();
         let path = format!(".db_test_grbc_{}_{}_{}", label, node, std::process::id());
         let store = Store::new(&path).unwrap();
         let (tx_headers, headers) = channel(100);
@@ -31,6 +34,8 @@ impl Harness {
         Self {
             core: Core {
                 name,
+                quorum_threshold: c.quorum_threshold(),
+                validity_threshold: c.validity_threshold(),
                 committee: c,
                 store,
                 synchronizer: sync,
@@ -129,6 +134,73 @@ async fn echo_quorum_delivers_ready_but_never_finish() {
     assert_eq!(h.grades(), vec![2]);
     h.core.process_grbc_vote(ready[2].clone()).await.unwrap();
     assert!(h.grades().is_empty());
+    // Fresh votes after FINISH and a dependency loopback must be idempotent.
+    h.core.process_grbc_vote(echoes[3].clone()).await.unwrap();
+    h.core.process_grbc_vote(ready[3].clone()).await.unwrap();
+    h.core.process_header(&p.header).await.unwrap();
+    assert_eq!(h.core.votes_aggregators[&p.header.id].echo_weight, 4);
+    assert_eq!(h.core.votes_aggregators[&p.header.id].ready_weight, 4);
+    assert!(h.grades().is_empty());
+    assert!(h.outgoing().is_empty());
+}
+
+#[tokio::test]
+async fn weighted_votes_can_cross_multiple_thresholds_without_another_message() {
+    for phase in [GrbcPhase::Echo, GrbcPhase::Ready] {
+        let mut c = committee();
+        c.authorities.get_mut(&keys()[3].0).unwrap().stake = 7;
+        // Total stake 10: quorum 7, relay 4. One remote vote can cross both.
+        let mut h = Harness::with_committee(&format!("weighted_{:?}", phase), 0, c);
+        let p = proposal();
+        h.core.process_proposal(p.clone()).await.unwrap();
+        assert!(h.grades().is_empty());
+        h.core
+            .process_grbc_vote(votes(&p.header, phase).remove(3))
+            .await
+            .unwrap();
+        if phase == GrbcPhase::Echo {
+            assert_eq!(h.grades(), vec![1]);
+            h.core
+                .process_grbc_vote(votes(&p.header, GrbcPhase::Ready).remove(3))
+                .await
+                .unwrap();
+            assert_eq!(h.grades(), vec![2]);
+        } else {
+            assert_eq!(h.grades(), vec![1, 2]);
+        }
+        assert_eq!(h.core.votes_aggregators[&p.header.id].ready_weight, 8);
+        let outgoing = h.outgoing();
+        assert_eq!(outgoing.len(), 2);
+        assert_eq!(outgoing[0].phase, GrbcPhase::Echo);
+        assert_eq!(outgoing[1].phase, GrbcPhase::Ready);
+    }
+}
+
+#[tokio::test]
+async fn local_votes_finish_a_single_authority_committee() {
+    let name = keys()[0].0;
+    let mut c = committee();
+    c.authorities.retain(|key, _| *key == name);
+    let mut p = Proposal {
+        header: Header {
+            author: name,
+            round: 1,
+            parents: Certificate::genesis(&c)
+                .iter()
+                .map(Certificate::digest)
+                .collect(),
+            ..Header::default()
+        },
+        batches: BTreeMap::new(),
+    };
+    resign(&mut p);
+    let mut h = Harness::with_committee("single_authority", 0, c);
+    h.core.process_proposal(p.clone()).await.unwrap();
+    assert_eq!(h.grades(), vec![1, 2]);
+    let outgoing = h.outgoing();
+    assert_eq!(outgoing.len(), 2);
+    assert_eq!(outgoing[0].phase, GrbcPhase::Echo);
+    assert_eq!(outgoing[1].phase, GrbcPhase::Ready);
 }
 
 #[tokio::test]
@@ -482,65 +554,83 @@ async fn forged_vote_cannot_poison_the_authenticated_vote_buffer() {
 
 #[tokio::test]
 async fn virtual_metadata_recovers_without_requiring_a_local_ready_grade() {
-    let mut h = Harness::new("virtual_recovery", 0);
-    let parents = crate::common::headers();
-    for header in &parents[..3] {
-        let block = Certificate {
-            header: header.clone(),
-            votes: vec![],
-        };
-        h.core
-            .store
-            .write(block.digest().to_vec(), bincode::serialize(&block).unwrap())
-            .await;
-    }
-    let dependency = Proposal {
-        header: parents[3].clone(),
-        batches: BTreeMap::new(),
-    };
-    let mut p = proposal();
-    p.header.round = 2;
-    p.header.parents = parents[..3]
-        .iter()
-        .map(|header| {
-            Certificate {
+    for phase in [GrbcPhase::Echo, GrbcPhase::Ready] {
+        let mut h = Harness::new(&format!("virtual_recovery_{:?}", phase), 0);
+        let parents = crate::common::headers();
+        for header in &parents[..3] {
+            let block = Certificate {
                 header: header.clone(),
                 votes: vec![],
+            };
+            h.core
+                .store
+                .write(block.digest().to_vec(), bincode::serialize(&block).unwrap())
+                .await;
+        }
+        let dependency = Proposal {
+            header: parents[3].clone(),
+            batches: BTreeMap::new(),
+        };
+        let mut p = proposal();
+        p.header.round = 2;
+        p.header.parents = parents[..3]
+            .iter()
+            .map(|header| {
+                Certificate {
+                    header: header.clone(),
+                    votes: vec![],
+                }
+                .digest()
+            })
+            .collect();
+        p.header.virtual_edges.insert(dependency.block().digest());
+        resign(&mut p);
+        h.core.process_proposal(p.clone()).await.unwrap();
+        assert!(matches!(
+            h.events.try_recv().unwrap(),
+            ConsensusMessage::Observed(_)
+        ));
+        assert!(h.outgoing().is_empty());
+        for vote in votes(&p.header, phase).into_iter().skip(1) {
+            h.core.process_grbc_vote(vote).await.unwrap();
+        }
+        assert!(
+            h.core.pending_votes.is_empty(),
+            "known proposal must count votes while dependencies are pending"
+        );
+        assert!(h.events.try_recv().is_err());
+        h.core
+            .store
+            .write(
+                proposal_header_key(&dependency.block().digest()),
+                bincode::serialize(&dependency.header).unwrap(),
+            )
+            .await;
+        assert!(h
+            .core
+            .store
+            .read(crate::messages::grade_one_key(&dependency.block().digest()))
+            .await
+            .unwrap()
+            .is_none());
+        h.core.process_header(&p.header).await.unwrap();
+        if phase == GrbcPhase::Echo {
+            assert_eq!(h.grades(), vec![1]);
+            for vote in votes(&p.header, GrbcPhase::Ready)
+                .into_iter()
+                .skip(1)
+                .take(2)
+            {
+                h.core.process_grbc_vote(vote).await.unwrap();
             }
-            .digest()
-        })
-        .collect();
-    p.header.virtual_edges.insert(dependency.block().digest());
-    resign(&mut p);
-    h.core.process_proposal(p.clone()).await.unwrap();
-    assert!(matches!(
-        h.events.try_recv().unwrap(),
-        ConsensusMessage::Observed(_)
-    ));
-    assert!(h.outgoing().is_empty());
-    for vote in votes(&p.header, GrbcPhase::Ready).into_iter().skip(1) {
-        h.core.process_grbc_vote(vote).await.unwrap();
+            assert_eq!(h.grades(), vec![2]);
+        } else {
+            assert_eq!(h.grades(), vec![1, 2]);
+        }
+        assert!(h.core.validated.contains(&p.header.id));
+        let outgoing = h.outgoing();
+        assert_eq!(outgoing.len(), 2);
+        assert_eq!(outgoing[0].phase, GrbcPhase::Echo);
+        assert_eq!(outgoing[1].phase, GrbcPhase::Ready);
     }
-    assert!(
-        h.core.pending_votes.is_empty(),
-        "known proposal must count votes while dependencies are pending"
-    );
-    assert!(h.events.try_recv().is_err());
-    h.core
-        .store
-        .write(
-            proposal_header_key(&dependency.block().digest()),
-            bincode::serialize(&dependency.header).unwrap(),
-        )
-        .await;
-    assert!(h
-        .core
-        .store
-        .read(crate::messages::grade_one_key(&dependency.block().digest()))
-        .await
-        .unwrap()
-        .is_none());
-    h.core.process_header(&p.header).await.unwrap();
-    assert_eq!(h.grades(), vec![1, 2]);
-    assert!(h.core.validated.contains(&p.header.id));
 }

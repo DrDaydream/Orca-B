@@ -14,7 +14,7 @@ use crate::verified_vote::VerifiedGrbcVote;
 use crate::vote_sender::VoteDispatch;
 use async_recursion::async_recursion;
 use bytes::Bytes;
-use config::Committee;
+use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, error, warn};
@@ -34,6 +34,9 @@ pub struct Core {
     name: PublicKey,
     /// The committee information.
     committee: Committee,
+    /// Fixed committee thresholds, computed once rather than for every vote.
+    quorum_threshold: Stake,
+    validity_threshold: Stake,
     /// The persistent storage.
     store: Store,
     /// Handles synchronization with other nodes and our workers.
@@ -116,6 +119,8 @@ impl Core {
         tokio::spawn(async move {
             Self {
                 name,
+                quorum_threshold: committee.quorum_threshold(),
+                validity_threshold: committee.validity_threshold(),
                 committee,
                 store,
                 synchronizer,
@@ -207,7 +212,7 @@ impl Core {
                 self.missing_proposals.remove(&vote.block_digest());
                 // Invalid buffered metadata must not crash the primary or discard
                 // the remaining valid votes in the same queue.
-                if let Err(error) = self.record_vote(&vote, &header) {
+                if let Err(error) = self.record_vote(&vote) {
                     warn!("Ignoring invalid buffered GRBC vote: {}", error);
                 }
             }
@@ -215,11 +220,35 @@ impl Core {
         self.process_header(&header).await
     }
 
-    fn record_vote(&mut self, vote: &VerifiedGrbcVote, header: &Header) -> DagResult<bool> {
-        self.votes_aggregators
+    /// Count a fresh vote and report only threshold crossings. Proposal and
+    /// dependency arrival separately recheck votes collected before validation.
+    fn record_vote(&mut self, vote: &VerifiedGrbcVote) -> DagResult<bool> {
+        let header = self
+            .proposal_headers
+            .get(&vote.id)
+            .ok_or_else(|| DagError::MalformedHeader(vote.id.clone()))?;
+        let state = self
+            .votes_aggregators
             .entry(header.id.clone())
-            .or_insert_with(GrbcVotesAggregator::new)
-            .append(vote, &self.committee, header)
+            .or_insert_with(GrbcVotesAggregator::new);
+        let previous = match vote.phase {
+            GrbcPhase::Echo => state.echo_weight,
+            GrbcPhase::Ready => state.ready_weight,
+        };
+        if !state.append(vote, &self.committee, header)? {
+            return Ok(false);
+        }
+        Ok(match vote.phase {
+            GrbcPhase::Echo => {
+                previous < self.quorum_threshold && state.echo_weight >= self.quorum_threshold
+            }
+            GrbcPhase::Ready => {
+                (previous < self.validity_threshold
+                    && state.ready_weight >= self.validity_threshold)
+                    || (previous < self.quorum_threshold
+                        && state.ready_weight >= self.quorum_threshold)
+            }
+        })
     }
 
     async fn save_local_vote(&mut self, vote: GrbcVote) -> DagResult<()> {
@@ -360,7 +389,7 @@ impl Core {
             stake += self.committee.stake(&x.origin());
         }
         ensure!(
-            stake >= self.committee.quorum_threshold(),
+            stake >= self.quorum_threshold,
             DagError::HeaderRequiresQuorum(header.id.clone())
         );
 
@@ -405,7 +434,7 @@ impl Core {
                 &mut self.signature_service,
             )
             .await;
-            self.record_vote(&vote, header)?;
+            self.record_vote(&vote)?;
             self.save_local_vote(vote.into_vote()).await?;
         }
         self.evaluate_grbc(header).await?;
@@ -419,33 +448,33 @@ impl Core {
             DagError::TooOld(vote.id.clone(), vote.round)
         );
         let vote = VerifiedGrbcVote::verify(vote, &self.committee)?;
-        let header = match self.proposal_headers.get(&vote.id).cloned() {
-            Some(header) => header,
-            None => {
-                let digest = vote.block_digest();
-                let pending = self.pending_votes.entry(vote.id.clone()).or_default();
-                if pending
-                    .iter()
-                    .any(|v| v.author == vote.author && v.phase == vote.phase)
-                {
-                    return Ok(());
-                }
-                pending.push(vote.clone());
-                if self
-                    .missing_proposals
-                    .insert(digest.clone(), vote.round)
-                    .is_none()
-                {
-                    self.broadcast_grbc_batch(
-                        PrimaryMessage::CertificatesRequest(vec![digest], self.name),
-                        vote.round,
-                    )
-                    .await;
-                }
+        if !self.proposal_headers.contains_key(&vote.id) {
+            let digest = vote.block_digest();
+            let pending = self.pending_votes.entry(vote.id.clone()).or_default();
+            if pending
+                .iter()
+                .any(|v| v.author == vote.author && v.phase == vote.phase)
+            {
                 return Ok(());
             }
-        };
-        if self.record_vote(&vote, &header)? {
+            pending.push(vote.clone());
+            if self
+                .missing_proposals
+                .insert(digest.clone(), vote.round)
+                .is_none()
+            {
+                self.broadcast_grbc_batch(
+                    PrimaryMessage::CertificatesRequest(vec![digest], self.name),
+                    vote.round,
+                )
+                .await;
+            }
+            return Ok(());
+        }
+        if self.record_vote(&vote)? && self.validated.contains(&vote.id) {
+            // Borrow metadata when counting; clone the full header only when
+            // a validated instance crosses a threshold that can advance GRBC.
+            let header = self.proposal_headers[&vote.id].clone();
             self.evaluate_grbc(&header).await?;
         }
         Ok(())
@@ -459,8 +488,8 @@ impl Core {
             Some(state) => state,
             None => return Ok(()),
         };
-        let ready = state.echo_weight >= self.committee.quorum_threshold()
-            || state.ready_weight >= self.committee.validity_threshold();
+        let ready = state.echo_weight >= self.quorum_threshold
+            || state.ready_weight >= self.validity_threshold;
         if ready
             && self
                 .last_ready
@@ -475,7 +504,7 @@ impl Core {
                 &mut self.signature_service,
             )
             .await;
-            self.record_vote(&vote, header)?;
+            self.record_vote(&vote)?;
             // Publish local READY before enqueueing the outbound vote. The
             // independent sender needs no later Core iteration to flush it.
             self.deliver_grade_one(header).await?;
@@ -484,9 +513,7 @@ impl Core {
         let finished = self
             .votes_aggregators
             .get(&header.id)
-            .map_or(false, |state| {
-                state.ready_weight >= self.committee.quorum_threshold()
-            });
+            .map_or(false, |state| state.ready_weight >= self.quorum_threshold);
         if finished {
             let block = Certificate {
                 header: header.clone(),
@@ -536,8 +563,7 @@ impl Core {
                 && self
                     .votes_aggregators
                     .get(&block.header.id)
-                    .map_or(false, |s| s.ready_weight
-                        >= self.committee.quorum_threshold()),
+                    .map_or(false, |s| s.ready_weight >= self.quorum_threshold),
             DagError::CertificateRequiresQuorum
         );
         let digest = block.digest();

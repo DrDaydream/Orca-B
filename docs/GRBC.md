@@ -163,6 +163,29 @@ The proposer also stops polling an already elapsed timer while awaiting
 parents. Regression tests cover early ABA acceptance, late ungraded leader
 recovery, missing causal history, and the separate GRBC voting gates.
 
+## GRBC vote processing
+
+Core caches the fixed committee's quorum and READY relay thresholds. Counting
+a vote borrows the stored header; it clones the complete header and evaluates
+GRBC only when fresh weight crosses the ECHO quorum, READY relay threshold, or
+READY quorum. Duplicate votes still contribute no weight. Authentication and
+instance matching are unchanged, as are the wire messages and send batching.
+
+Proposal and dependency arrival still evaluate accumulated votes explicitly,
+so thresholds reached before validation are not lost. A locally generated
+READY is counted before checking FINISH, allowing the same update to complete
+the instance. Regression tests cover delayed proposals/dependencies, late and
+duplicate votes, weighted thresholds and single-authority completion.
+
+Validation of this change passes all 91 workspace unit tests with all features,
+the doctest checks and the benchmark-feature node build on Windows. The
+four-node process check has an identical commit sequence at all replicas.
+The ten-node check retains a common commit prefix but shows substantial
+replica lag; a comparison binary built from the unchanged parent revision,
+using the same authority keys, also stalls and fails the recent-progress check.
+These runs do not establish a throughput or latency improvement. Ubuntu 24.04
+performance remains to be measured.
+
 ## Reproduce validation
 
 ```sh
