@@ -8,7 +8,7 @@ use config::Committee;
 use crypto::{Digest, Hash as _, PublicKey};
 use log::{debug, warn};
 use network::{CancelHandler, ReliableSender};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use store::Store;
@@ -127,16 +127,24 @@ pub(crate) fn spawn_proposal_processors(
     let remote_round = consensus_round.clone();
     let remote_tx = tx.clone();
     tokio::spawn(async move {
+        let capacity = remote_committee
+            .size()
+            .saturating_mul(gc_depth as usize)
+            .max(1);
+        let mut delivered = HashSet::new();
+        let mut delivery_order = VecDeque::new();
         while let Some((proposal, guard)) = rx_remote.recv().await {
             if proposal.header.round
                 < remote_round
                     .load(Ordering::Relaxed)
                     .saturating_sub(gc_depth)
+                || delivered.contains(&proposal.header.id)
             {
                 continue;
             }
             report(
                 async {
+                    let id = proposal.header.id.clone();
                     let (header, _) = prepare_proposal(
                         proposal,
                         remote_committee.clone(),
@@ -149,6 +157,13 @@ pub(crate) fn spawn_proposal_processors(
                         .send(header)
                         .await
                         .expect("Failed to deliver stored proposal");
+                    // Remember only fully verified, stored and enqueued values.
+                    // Cache hits discard the incoming copy without applying it.
+                    delivered.insert(id.clone());
+                    delivery_order.push_back(id);
+                    if delivery_order.len() > capacity {
+                        delivered.remove(&delivery_order.pop_front().unwrap());
+                    }
                     Ok(())
                 }
                 .await,
