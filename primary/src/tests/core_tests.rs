@@ -1143,6 +1143,81 @@ async fn failed_duplicate_and_cancelled_proposals_release_repair_suppression() {
 }
 
 #[tokio::test]
+async fn missing_proposal_request_targets_voter_then_falls_back_until_data_arrives() {
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio::time::{timeout, Duration};
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    let p = proposal();
+    let vote = votes(&p.header, GrbcPhase::Echo).remove(1);
+    assert_ne!(vote.author, vote.origin);
+    let preferred = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fallback = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut c = committee();
+    c.authorities
+        .get_mut(&vote.author)
+        .unwrap()
+        .primary
+        .primary_to_primary = preferred.local_addr().unwrap();
+    c.authorities
+        .get_mut(&keys()[2].0)
+        .unwrap()
+        .primary
+        .primary_to_primary = fallback.local_addr().unwrap();
+    let mut h = Harness::with_committee("preferred_repair", 0, c);
+    h.core.process_grbc_vote(vote).await.unwrap();
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), 1);
+    let digest = p.block().digest();
+    let first_seen = h.core.missing_proposals[&digest].1;
+    let (socket, _) = timeout(Duration::from_secs(2), preferred.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut transport = Framed::new(socket, LengthDelimitedCodec::new());
+    let wire = timeout(Duration::from_secs(2), transport.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match bincode::deserialize::<PrimaryMessage>(&wire).unwrap() {
+        PrimaryMessage::CertificatesRequest(digests, requestor) => {
+            assert_eq!(digests, vec![digest.clone()]);
+            assert_eq!(requestor, h.core.name);
+        }
+        _ => panic!("Expected a proposal repair request"),
+    }
+    // A peer can acknowledge the request yet withhold the actual proposal.
+    transport.send(Bytes::from("Ack")).await.unwrap();
+    h.core.retry_missing_proposals().await;
+    assert_eq!(
+        h.core.cancel_handlers[&p.header.round].len(),
+        committee().size()
+    );
+    assert_eq!(h.core.missing_proposals[&digest].1, first_seen);
+    let (socket, _) = timeout(Duration::from_secs(2), fallback.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut transport = Framed::new(socket, LengthDelimitedCodec::new());
+    let wire = timeout(Duration::from_secs(2), transport.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(bincode::deserialize::<PrimaryMessage>(&wire).unwrap(),
+        PrimaryMessage::CertificatesRequest(digests, _) if digests == vec![digest])
+    );
+
+    h.core.process_proposal(p.clone()).await.unwrap();
+    assert!(h.core.missing_proposals.is_empty());
+    let requests = h.core.cancel_handlers[&p.header.round].len();
+    h.core.retry_missing_proposals().await;
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), requests);
+}
+
+#[tokio::test]
 async fn missing_proposals_request_immediately_and_stuck_work_cannot_suppress_forever() {
     let mut h = Harness::new("repair_deadline", 0);
     let p = proposal();
@@ -1150,7 +1225,7 @@ async fn missing_proposals_request_immediately_and_stuck_work_cannot_suppress_fo
     let vote = votes(&p.header, GrbcPhase::Echo).remove(1);
     h.core.process_grbc_vote(vote.clone()).await.unwrap();
     let peers = committee().size() - 1;
-    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), peers);
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), 1);
     let first_seen = h.core.missing_proposals[&digest].1;
     h.core.process_grbc_vote(vote).await.unwrap();
     h.core
@@ -1158,15 +1233,15 @@ async fn missing_proposals_request_immediately_and_stuck_work_cannot_suppress_fo
         .await
         .unwrap();
     assert_eq!(h.core.missing_proposals[&digest].1, first_seen);
-    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), peers);
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), 1);
     let guard = h.core.in_flight.track(&p.header);
     h.core.retry_missing_proposals().await;
-    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), peers);
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), 1);
     h.core.missing_proposals.get_mut(&digest).unwrap().1 = Instant::now() - PROPOSAL_REPAIR_GRACE;
     drop(guard);
     let _new_arrival = h.core.in_flight.track(&p.header);
     h.core.retry_missing_proposals().await;
-    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), 2 * peers);
+    assert_eq!(h.core.cancel_handlers[&p.header.round].len(), 1 + peers);
 }
 
 #[tokio::test]
