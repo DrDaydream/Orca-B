@@ -451,6 +451,92 @@ fn resign(proposal: &mut Proposal) {
 }
 
 #[tokio::test]
+async fn deduplicated_proposal_resumes_echo_through_waiter_when_parents_finish() {
+    use crate::header_waiter::HeaderWaiter;
+    use crate::proposal_processor::spawn_proposal_processors;
+    use tokio::time::{timeout, Duration};
+
+    let mut h = Harness::new("dedup_waiter", 0);
+    let (tx_resume, mut rx_resume) = channel(10);
+    HeaderWaiter::spawn(
+        h.core.name,
+        committee(),
+        h.core.store.clone(),
+        h.core.consensus_round.clone(),
+        50,
+        1000,
+        3,
+        std::mem::replace(&mut h._headers, channel(1).1),
+        tx_resume,
+    );
+    let (tx_remote, rx_remote) = channel(2);
+    let (tx_local, rx_local) = channel(1);
+    let (tx_stored, mut rx_stored) = channel(2);
+    spawn_proposal_processors(
+        h.core.name,
+        committee(),
+        h.core.store.clone(),
+        h.core.consensus_round.clone(),
+        50,
+        rx_remote,
+        rx_local,
+        tx_stored,
+        h.core.in_flight.clone(),
+    );
+    drop(tx_local);
+    let parents: Vec<_> = crate::common::headers()
+        .into_iter()
+        .take(3)
+        .map(|header| Proposal {
+            header,
+            batches: BTreeMap::new(),
+        })
+        .collect();
+    let mut child = proposal();
+    child.header.round = 2;
+    child.header.parents = parents.iter().map(|p| p.block().digest()).collect();
+    resign(&mut child);
+    for _ in 0..2 {
+        let guard = h.core.in_flight.track(&child.header);
+        tx_remote.send((child.clone(), guard)).await.unwrap();
+    }
+    drop(tx_remote);
+    let stored = timeout(Duration::from_secs(5), rx_stored.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    h.core.process_stored_proposal(stored).await.unwrap();
+    assert!(timeout(Duration::from_secs(5), rx_stored.recv())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!h.core.validated.contains(&child.header.id));
+    assert!(h.outgoing().is_empty());
+    assert!(!h.core.in_flight.contains(&child.block().digest()));
+
+    for parent in &parents {
+        crate::proposal_store::store_verified_proposal(&mut h.core.store, parent.clone())
+            .await
+            .unwrap();
+    }
+    h.core
+        .process_committed(parents.iter().map(Proposal::block).collect())
+        .await
+        .unwrap();
+    let resumed = timeout(Duration::from_secs(5), rx_resume.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed, child.header);
+    h.core.process_header(&resumed).await.unwrap();
+    assert!(h.core.validated.contains(&child.header.id));
+    let emitted = h.outgoing();
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].id, child.header.id);
+    assert_eq!(emitted[0].phase, GrbcPhase::Echo);
+}
+
+#[tokio::test]
 async fn invalid_parent_quorum_cannot_trigger_echo() {
     let mut h = Harness::new("invalid_observation", 0);
     let mut p = proposal();

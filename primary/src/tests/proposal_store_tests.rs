@@ -306,3 +306,106 @@ async fn proposal_processor_rejects_changed_bytes_even_for_a_known_header() {
     assert_eq!(restored.batches, p.batches);
     restored.verify(&committee()).unwrap();
 }
+
+#[tokio::test]
+async fn remote_processor_delivers_known_proposals_once_and_rejects_invalid_first_copy() {
+    use crate::proposal_processor::{spawn_proposal_processors, ProposalTracker};
+    use std::sync::{atomic::AtomicU64, Arc};
+    use tokio::time::{timeout, Duration};
+
+    let mut storage = store("remote_duplicates");
+    let tracker = ProposalTracker::default();
+    let (tx_remote, rx_remote) = channel(10);
+    let (tx_local, rx_local) = channel(1);
+    let (tx_stored, mut rx_stored) = channel(10);
+    spawn_proposal_processors(
+        keys()[0].0,
+        committee(),
+        storage.clone(),
+        Arc::new(AtomicU64::new(0)),
+        50,
+        rx_remote,
+        rx_local,
+        tx_stored,
+        tracker.clone(),
+    );
+    drop(tx_local);
+    let p = with_payload();
+    let mut invalid = p.clone();
+    invalid.batches.values_mut().next().unwrap()[0] ^= 1;
+    let mut next = p.clone();
+    next.header.round += 1;
+    next.header.id = next.header.digest();
+    next.header.signature = Signature::new(&next.header.id, &keys().pop().unwrap().1);
+    for proposal in [invalid.clone(), p.clone(), p.clone(), invalid, next.clone()] {
+        let guard = tracker.track(&proposal.header);
+        tx_remote.send((proposal, guard)).await.unwrap();
+    }
+    drop(tx_remote);
+    let mut delivered = Vec::new();
+    while let Some(stored) = timeout(Duration::from_secs(5), rx_stored.recv())
+        .await
+        .unwrap()
+    {
+        delivered.push(stored.into_header().id);
+    }
+    assert_eq!(delivered, vec![p.header.id.clone(), next.header.id.clone()]);
+    for expected in [p, next] {
+        let digest = expected.block().digest();
+        assert!(!tracker.contains(&digest));
+        let recovered = load_proposal(&mut storage, &digest).await.unwrap().unwrap();
+        assert_eq!(recovered.header, expected.header);
+        assert_eq!(recovered.batches, expected.batches);
+    }
+}
+
+#[tokio::test]
+async fn remote_duplicate_cache_eviction_and_restart_do_not_prevent_recovery() {
+    use crate::proposal_processor::{spawn_proposal_processors, ProposalTracker};
+    use std::sync::{atomic::AtomicU64, Arc};
+    use tokio::time::{timeout, Duration};
+
+    let storage = store("remote_cache_eviction");
+    let tracker = ProposalTracker::default();
+    let p = proposal();
+    // One round of cache capacity; more distinct proposals must evict old IDs.
+    // Recreating the processors against the same store must redeliver metadata.
+    for _ in 0..2 {
+        let (tx_remote, rx_remote) = channel(1);
+        let (tx_local, rx_local) = channel(1);
+        let (tx_stored, mut rx_stored) = channel(1);
+        spawn_proposal_processors(
+            keys()[0].0,
+            committee(),
+            storage.clone(),
+            Arc::new(AtomicU64::new(0)),
+            1,
+            rx_remote,
+            rx_local,
+            tx_stored,
+            tracker.clone(),
+        );
+        drop(tx_local);
+        let rounds = (1..=committee().size() as u64 + 1).chain(std::iter::once(1));
+        for round in rounds {
+            let mut expected = p.clone();
+            expected.header.round = round;
+            expected.header.id = expected.header.digest();
+            expected.header.signature =
+                Signature::new(&expected.header.id, &keys().pop().unwrap().1);
+            let guard = tracker.track(&expected.header);
+            tx_remote.send((expected.clone(), guard)).await.unwrap();
+            let stored = timeout(Duration::from_secs(5), rx_stored.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.into_header(), expected.header);
+            assert!(!tracker.contains(&expected.block().digest()));
+        }
+        drop(tx_remote);
+        assert!(timeout(Duration::from_secs(5), rx_stored.recv())
+            .await
+            .unwrap()
+            .is_none());
+    }
+}

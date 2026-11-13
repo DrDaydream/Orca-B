@@ -87,12 +87,16 @@ itself establish a measured throughput or latency improvement.
 
 ### Validation reuse and independent vote transport
 
-Each incoming complete proposal passes header authentication, size/shape checks
+Each previously unseen complete proposal passes header authentication, size/shape checks
 and all batch digest checks once in a dedicated proposal processor. Core receives
 an opaque stored-header result only after successful validation and atomic
 storage. Local proposals use the same validation path, without looping back
-through a second full verification. New network arrivals are still validated;
-matching an existing header ID never authenticates new payload bytes.
+through a second full verification. The remote processor retains a bounded FIFO
+of IDs successfully validated, stored and enqueued to Core, with capacity
+`max(1, committee size * gc_depth)`. Arrivals matching these IDs are discarded
+without applying their fields; an ID match never authenticates new payload bytes.
+Failed validation does not populate this cache. Evicted IDs and processor restarts
+use full verification again. HeaderWaiter resumes dependencies directly in Core.
 
 Incoming votes are verified once and wrapped in an immutable authenticated type.
 The buffer and aggregator accept this type, so releasing buffered votes does not
