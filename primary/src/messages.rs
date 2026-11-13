@@ -360,6 +360,7 @@ pub enum ConsensusMessage {
 pub enum ConsensusCommand {
     Cleanup(Certificate),
     CleanupBatch(Vec<Certificate>),
+    AbaBroadcast(Vec<Vec<u8>>),
     LeaderRequest(Round, PublicKey),
 }
 

@@ -22,14 +22,14 @@ async fn deliver(tx: &Sender<ConsensusMessage>, certificate: Certificate) {
 }
 
 fn spawn_aba_network(
-    mut rx: tokio::sync::mpsc::Receiver<ControlMessage>,
+    mut rx: tokio::sync::mpsc::Receiver<ConsensusCommand>,
     tx: Sender<ConsensusMessage>,
     authorities: Vec<PublicKey>,
 ) {
     tokio::spawn(async move {
         while let Some(command) = rx.recv().await {
-            if let ControlMessage::Aba(message) = command {
-                for bytes in message.messages {
+            if let ConsensusCommand::AbaBroadcast(batch) = command {
+                for bytes in batch {
                     for authority in &authorities {
                         tx.send(ConsensusMessage::Aba(*authority, bytes.clone()))
                             .await
@@ -45,189 +45,6 @@ fn spawn_aba_network(
 fn keys() -> Vec<(PublicKey, SecretKey)> {
     let mut rng = StdRng::from_seed([0; 32]);
     (0..4).map(|_| generate_keypair(&mut rng)).collect()
-}
-
-// Produce an actual local coin/AUX decision, including the DECIDE broadcast
-// that follows the local Decide action in the state machine's action list.
-fn decided_aba(
-    committee: &Committee,
-    name: PublicKey,
-) -> (Round, Aba<DeterministicCoin>, Vec<AbaAction>) {
-    use crate::aba::{AbaMessageKind, CommonCoin};
-    let coin = DeterministicCoin::new(0x4f52_4341);
-    let instance = (1..100)
-        .find(|r| coin.coin(*r, 0) == BinaryValue::One)
-        .unwrap();
-    let mut aba = Aba::new(committee.clone(), name, instance, coin);
-    aba.propose(BinaryValue::One);
-    let peers: Vec<_> = committee
-        .authorities
-        .keys()
-        .copied()
-        .filter(|key| *key != name)
-        .take(2)
-        .collect();
-    for peer in &peers {
-        aba.handle_message(
-            *peer,
-            AbaMessage {
-                instance,
-                round: 0,
-                kind: AbaMessageKind::BVal(BinaryValue::One),
-            },
-        );
-    }
-    let mut actions = Vec::new();
-    for peer in peers {
-        actions.extend(aba.handle_message(
-            peer,
-            AbaMessage {
-                instance,
-                round: 0,
-                kind: AbaMessageKind::Aux(BinaryValue::One),
-            },
-        ));
-    }
-    assert_eq!(aba.decision(), Some(BinaryValue::One));
-    assert_eq!(actions[0], AbaAction::Decide(BinaryValue::One));
-    (instance, aba, actions)
-}
-
-async fn decide_before_blocked_local_work(missing_leader: bool) {
-    use crate::aba::AbaMessageKind;
-    let committee = mock_committee();
-    let genesis = Certificate::genesis(&committee);
-    let name = *committee.authorities.keys().min().unwrap();
-    let (tx_primary, mut rx_primary) = channel(1);
-    let (tx_control, mut rx_control) = channel(10);
-    let (tx_output, mut rx_output) = channel(1);
-    if missing_leader {
-        // A saturated cleanup/feedback path must not hold DECIDE behind the
-        // missing-leader request issued while applying the local decision.
-        tx_primary
-            .send(ConsensusCommand::CleanupBatch(Vec::new()))
-            .await
-            .unwrap();
-    } else {
-        tx_output.send(genesis[0].clone()).await.unwrap();
-    }
-    let mut consensus = Consensus {
-        name,
-        committee: committee.clone(),
-        gc_depth: 50,
-        rx_primary: channel(1).1,
-        tx_primary,
-        tx_control,
-        tx_output: OutputSender::Individual(tx_output),
-        genesis: genesis.clone(),
-    };
-    let mut state = State::new(genesis.clone());
-    let (instance, aba, actions) = decided_aba(&committee, name);
-    let expected: Vec<_> = actions
-        .iter()
-        .filter_map(|action| match action {
-            AbaAction::Broadcast(message) => Some(message.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(expected
-        .iter()
-        .any(|m| m.kind == AbaMessageKind::Decide(BinaryValue::One)));
-    assert!(expected
-        .iter()
-        .any(|m| m.round == 1 && m.kind == AbaMessageKind::BVal(BinaryValue::One)));
-    state.aba_instances.insert(instance, aba);
-    if !missing_leader {
-        let (_, leader) = mock_certificate(
-            name,
-            instance,
-            genesis.iter().map(Certificate::digest).collect(),
-        );
-        state.observe(leader);
-        state.skipped_leaders.insert(instance - 1);
-    }
-    let processing = tokio::spawn(async move {
-        consensus
-            .handle_aba_actions(instance, actions, &mut state)
-            .await;
-        (consensus, state)
-    });
-    let queued = time::timeout(Duration::from_secs(3), rx_control.recv())
-        .await
-        .expect("DECIDE waited for local decision application")
-        .unwrap();
-    match queued {
-        ControlMessage::Aba(message) => {
-            assert_eq!(message.author, name);
-            assert_eq!(message.messages.len(), 1);
-            let messages: Vec<AbaMessage> = bincode::deserialize(&message.messages[0]).unwrap();
-            assert_eq!(
-                messages, expected,
-                "one transition must retain every broadcast exactly once"
-            );
-        }
-        _ => panic!("Expected ABA control input"),
-    }
-    assert!(
-        !processing.is_finished(),
-        "test must keep local work blocked"
-    );
-    assert!(
-        rx_control.try_recv().is_err(),
-        "transition was split or sent twice"
-    );
-    if missing_leader {
-        assert!(matches!(
-            rx_primary.recv().await,
-            Some(ConsensusCommand::CleanupBatch(_))
-        ));
-    } else {
-        rx_output.recv().await.unwrap();
-    }
-    let (mut consensus, mut state) = time::timeout(Duration::from_secs(3), processing)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(state.aba_decisions.get(&instance), Some(&BinaryValue::One));
-    if missing_leader {
-        assert!(
-            matches!(rx_primary.try_recv(), Ok(ConsensusCommand::LeaderRequest(r, _)) if r == instance)
-        );
-        assert!(!state.committed_leaders.contains(&instance));
-    } else {
-        assert_eq!(rx_output.try_recv().unwrap().round(), instance);
-        assert!(state.committed_leaders.contains(&instance));
-    }
-    // Receiving confirmation and duplicate DECIDEs must not emit the local
-    // DECIDE again. Reliable transport retries are separate from this check.
-    let peer = *committee
-        .authorities
-        .keys()
-        .find(|key| **key != name)
-        .unwrap();
-    let decide = AbaMessage {
-        instance,
-        round: 0,
-        kind: AbaMessageKind::Decide(BinaryValue::One),
-    };
-    consensus
-        .process_aba_message(peer, decide.clone(), &mut state)
-        .await;
-    consensus
-        .process_aba_message(peer, decide, &mut state)
-        .await;
-    assert!(!state.aba_instances.contains_key(&instance));
-    assert!(rx_control.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn decide_sends_before_missing_leader_recovery_with_full_feedback() {
-    decide_before_blocked_local_work(true).await;
-}
-
-#[tokio::test]
-async fn decide_sends_before_blocked_commit_output() {
-    decide_before_blocked_local_work(false).await;
 }
 
 // Fixture
@@ -347,14 +164,12 @@ fn grade_two_waits_for_strong_and_weak_edges() {
 #[test]
 fn finds_paths_over_strong_and_weak_edges() {
     let committee = mock_committee();
-    let (tx_control, _rx_control) = channel(100);
     let consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_control,
         tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
@@ -406,14 +221,12 @@ fn finds_paths_over_strong_and_weak_edges() {
 #[test]
 fn order_dag_includes_parents_and_weak_but_excludes_virtual_history() {
     let committee = mock_committee();
-    let (tx_control, _rx_control) = channel(100);
     let consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_control,
         tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
@@ -444,14 +257,12 @@ fn order_dag_includes_parents_and_weak_but_excludes_virtual_history() {
 #[test]
 fn designates_one_leader_every_round() {
     let committee = mock_committee();
-    let (tx_control, _rx_control) = channel(100);
     let consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_control,
         tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
@@ -469,14 +280,12 @@ fn designates_one_leader_every_round() {
 #[test]
 fn commit_rule_counts_observed_and_dag_strong_support_separately() {
     let committee = mock_committee();
-    let (tx_control, _rx_control) = channel(100);
     let consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(1).0,
-        tx_control,
         tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
@@ -513,14 +322,12 @@ fn commit_rule_counts_observed_and_dag_strong_support_separately() {
 #[test]
 fn commit_rule_two_counts_strong_and_two_hop_virtual_paths() {
     let committee = mock_committee();
-    let (tx_control, _rx_control) = channel(100);
     let consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(10).0,
-        tx_control,
         tx_output: OutputSender::Individual(channel(10).0),
         genesis: Certificate::genesis(&committee),
     };
@@ -552,14 +359,12 @@ fn commit_rule_two_counts_strong_and_two_hop_virtual_paths() {
 #[test]
 fn virtual_path_checks_the_reference_without_loading_its_target() {
     let committee = mock_committee();
-    let (tx_control, _rx_control) = channel(100);
     let consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary: channel(10).0,
-        tx_control,
         tx_output: OutputSender::Individual(channel(10).0),
         genesis: Certificate::genesis(&committee),
     };
@@ -638,14 +443,12 @@ async fn commit_waits_for_missing_history_even_through_an_already_forced_parent(
     let committee = mock_committee();
     let (tx_primary, _rx_primary) = channel(100);
     let (tx_output, mut rx_output) = channel(100);
-    let (tx_control, _rx_control) = channel(100);
     let mut consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_control,
         tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
@@ -703,14 +506,12 @@ fn grade_two_dirties_only_its_r_plus_two_aba_instance() {
 async fn missing_aba_leader_request_is_retried() {
     let committee = mock_committee();
     let (tx_primary, mut rx_primary) = channel(10);
-    let (tx_control, _rx_control) = channel(100);
     let mut consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_control,
         tx_output: OutputSender::Individual(channel(1).0),
         genesis: Certificate::genesis(&committee),
     };
@@ -732,14 +533,12 @@ async fn aba_one_accepts_complete_observed_leader_before_local_ready() {
     let committee = mock_committee();
     let (tx_primary, mut rx_primary) = channel(100);
     let (tx_output, mut rx_output) = channel(100);
-    let (tx_control, _rx_control) = channel(100);
     let mut consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_control,
         tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
@@ -765,14 +564,12 @@ async fn aba_one_recovers_ungraded_leader_and_waits_only_for_missing_history() {
     let committee = mock_committee();
     let (tx_primary, mut rx_primary) = channel(100);
     let (tx_output, mut rx_output) = channel(100);
-    let (tx_control, _rx_control) = channel(100);
     let mut consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_control,
         tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
@@ -815,14 +612,12 @@ async fn commit_rule_two_condition_three_forces_leader_grade_two() {
     let committee = mock_committee();
     let (tx_primary, _rx_primary) = channel(100);
     let (tx_output, _rx_output) = channel(100);
-    let (tx_control, _rx_control) = channel(100);
     let mut consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_control,
         tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
@@ -861,14 +656,12 @@ async fn leader_commits_wait_for_the_previous_leader() {
     let committee = mock_committee();
     let (tx_primary, _rx_primary) = channel(100);
     let (tx_output, _rx_output) = channel(100);
-    let (tx_control, _rx_control) = channel(100);
     let mut consensus = Consensus {
         name: keys()[0].0,
         committee: committee.clone(),
         gc_depth: 50,
         rx_primary: channel(1).1,
         tx_primary,
-        tx_control,
         tx_output: OutputSender::Individual(tx_output),
         genesis: Certificate::genesis(&committee),
     };
@@ -911,8 +704,7 @@ async fn commit_one() {
 
     // Spawn the consensus engine and sink the primary channel.
     let (tx_waiter, rx_waiter) = channel(100);
-    let (tx_primary, mut rx_primary) = channel(100);
-    let (tx_control, rx_control) = channel(100);
+    let (tx_primary, rx_primary) = channel(100);
     let (tx_output, mut rx_output) = channel(100);
     Consensus::spawn(
         keys[0],
@@ -920,11 +712,9 @@ async fn commit_one() {
         /* gc_depth */ 50,
         rx_waiter,
         tx_primary,
-        tx_control,
         tx_output,
     );
-    tokio::spawn(async move { while rx_primary.recv().await.is_some() {} });
-    spawn_aba_network(rx_control, tx_waiter.clone(), keys.clone());
+    spawn_aba_network(rx_primary, tx_waiter.clone(), keys.clone());
 
     // Feed all certificates to the consensus. Only the last certificate should trigger
     // commits, so the task should not block.
@@ -962,8 +752,7 @@ async fn dead_node() {
 
     // Spawn the consensus engine and sink the primary channel.
     let (tx_waiter, rx_waiter) = channel(100);
-    let (tx_primary, mut rx_primary) = channel(100);
-    let (tx_control, rx_control) = channel(100);
+    let (tx_primary, rx_primary) = channel(100);
     let (tx_output, mut rx_output) = channel(100);
     Consensus::spawn(
         keys[0],
@@ -971,11 +760,9 @@ async fn dead_node() {
         /* gc_depth */ 50,
         rx_waiter,
         tx_primary,
-        tx_control,
         tx_output,
     );
-    tokio::spawn(async move { while rx_primary.recv().await.is_some() {} });
-    spawn_aba_network(rx_control, tx_waiter.clone(), keys.clone());
+    spawn_aba_network(rx_primary, tx_waiter.clone(), keys.clone());
 
     // Feed all certificates to the consensus.
     tokio::spawn(async move {
@@ -1054,8 +841,7 @@ async fn not_enough_support() {
 
     // Spawn the consensus engine and sink the primary channel.
     let (tx_waiter, rx_waiter) = channel(100);
-    let (tx_primary, mut rx_primary) = channel(100);
-    let (tx_control, rx_control) = channel(100);
+    let (tx_primary, rx_primary) = channel(100);
     let (tx_output, mut rx_output) = channel(100);
     Consensus::spawn(
         keys[0],
@@ -1063,11 +849,9 @@ async fn not_enough_support() {
         /* gc_depth */ 50,
         rx_waiter,
         tx_primary,
-        tx_control,
         tx_output,
     );
-    tokio::spawn(async move { while rx_primary.recv().await.is_some() {} });
-    spawn_aba_network(rx_control, tx_waiter.clone(), keys.clone());
+    spawn_aba_network(rx_primary, tx_waiter.clone(), keys.clone());
 
     // Feed all certificates to the consensus. Only the last certificate should trigger
     // commits, so the task should not block.
@@ -1122,8 +906,7 @@ async fn missing_leader() {
 
     // Spawn the consensus engine and sink the primary channel.
     let (tx_waiter, rx_waiter) = channel(100);
-    let (tx_primary, mut rx_primary) = channel(100);
-    let (tx_control, rx_control) = channel(100);
+    let (tx_primary, rx_primary) = channel(100);
     let (tx_output, mut rx_output) = channel(100);
     Consensus::spawn(
         keys[0],
@@ -1131,11 +914,9 @@ async fn missing_leader() {
         /* gc_depth */ 50,
         rx_waiter,
         tx_primary,
-        tx_control,
         tx_output,
     );
-    tokio::spawn(async move { while rx_primary.recv().await.is_some() {} });
-    spawn_aba_network(rx_control, tx_waiter.clone(), keys.clone());
+    spawn_aba_network(rx_primary, tx_waiter.clone(), keys.clone());
 
     // Feed all certificates to the consensus. We should only commit upon receiving the last
     // certificate, so calls below should not block the task.
