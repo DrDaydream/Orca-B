@@ -1,16 +1,17 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::aggregators::{CertificatesAggregator, GrbcVotesAggregator};
 use crate::error::{DagError, DagResult};
+#[cfg(test)]
+use crate::messages::Proposal;
 use crate::messages::{
-    local_votes_key, Certificate, ConsensusCommand, ConsensusMessage, GrbcPhase, GrbcVote,
-    GrbcVoteBatch, Header, Proposal,
+    local_votes_key, Certificate, ConsensusCommand, ConsensusMessage, GrbcPhase, GrbcVote, Header,
 };
 use crate::primary::{PrimaryMessage, Round};
-use crate::proposal_repair::{PendingRepair, PrimaryInput, ProposalTracker};
-use crate::proposal_store::{assemble_proposal, store_verified_proposal};
+use crate::proposal_processor::StoredProposalHeader;
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
 use crate::verified_vote::VerifiedGrbcVote;
+use crate::vote_sender::VoteDispatch;
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use config::Committee;
@@ -18,12 +19,11 @@ use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, error, warn};
 use network::{CancelHandler, ReliableSender};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::time::{sleep_until, Duration, Instant};
 
 #[cfg(test)]
 #[path = "tests/core_tests.rs"]
@@ -46,13 +46,15 @@ pub struct Core {
     gc_depth: Round,
 
     /// Receiver for dag messages (headers, votes, certificates).
-    rx_primaries: Receiver<PrimaryInput>,
+    rx_primaries: Receiver<PrimaryMessage>,
     /// Receives loopback headers from the `HeaderWaiter`.
     rx_header_waiter: Receiver<Header>,
     /// Receives loopback certificates from the `CertificateWaiter`.
     rx_certificate_waiter: Receiver<Certificate>,
-    /// Receives our newly created headers from the `Proposer`.
-    rx_proposer: Receiver<Header>,
+    /// Compact metadata delivered after full proposal validation and storage.
+    rx_proposals: Receiver<StoredProposalHeader>,
+    tx_votes: Sender<VoteDispatch>,
+    tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
     /// Output all certificates to the consensus layer.
     tx_consensus: Sender<ConsensusMessage>,
     /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
@@ -65,8 +67,6 @@ pub struct Core {
     last_voted: HashMap<Round, HashSet<PublicKey>>,
     /// The set of headers we are currently processing.
     processing: HashMap<Round, HashSet<Digest>>,
-    /// The last header we proposed (for which we are waiting votes).
-    current_header: Header,
     votes_aggregators: HashMap<Digest, GrbcVotesAggregator>,
     observed_headers: HashMap<Digest, Header>,
     /// Metadata of complete proposals; payload bytes live only in batch storage.
@@ -74,10 +74,8 @@ pub struct Core {
     validated: HashSet<Digest>,
     last_ready: HashMap<Round, HashSet<PublicKey>>,
     local_votes: HashMap<Digest, Vec<GrbcVote>>,
-    missing_proposals: HashMap<Digest, PendingRepair>,
-    proposal_tracker: ProposalTracker,
+    missing_proposals: HashMap<Digest, Round>,
     pending_votes: HashMap<Digest, Vec<VerifiedGrbcVote>>,
-    vote_outbox: Vec<GrbcVote>,
     /// Aggregates certificates to use as parents for new headers.
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>,
     /// Local records delivered after the ECHO quorum or READY relay threshold.
@@ -89,9 +87,8 @@ pub struct Core {
     round_advance_pending: HashMap<Digest, Certificate>,
     /// Grade-2 blocks not yet referenced by a weak edge.
     weak_edge_candidates: HashMap<Digest, Round>,
-    /// Small votes and synchronization requests, separate from bulk data.
+    /// Sender only for small synchronization requests.
     network: ReliableSender,
-    proposal_network: ReliableSender,
     /// Keeps the cancel handlers of the messages we sent.
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
 }
@@ -106,11 +103,12 @@ impl Core {
         signature_service: SignatureService,
         consensus_round: Arc<AtomicU64>,
         gc_depth: Round,
-        rx_primaries: Receiver<PrimaryInput>,
-        proposal_tracker: ProposalTracker,
+        rx_primaries: Receiver<PrimaryMessage>,
         rx_header_waiter: Receiver<Header>,
         rx_certificate_waiter: Receiver<Certificate>,
-        rx_proposer: Receiver<Header>,
+        rx_proposals: Receiver<StoredProposalHeader>,
+        tx_votes: Sender<VoteDispatch>,
+        tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
         tx_consensus: Sender<ConsensusMessage>,
         tx_proposer: Sender<ProposerMessage>,
         rx_consensus: Receiver<ConsensusCommand>,
@@ -125,17 +123,17 @@ impl Core {
                 consensus_round,
                 gc_depth,
                 rx_primaries,
-                proposal_tracker,
                 rx_header_waiter,
                 rx_certificate_waiter,
-                rx_proposer,
+                rx_proposals,
+                tx_votes,
+                tx_cert_requests,
                 tx_consensus,
                 tx_proposer,
                 rx_consensus,
                 gc_round: 0,
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
-                current_header: Header::default(),
                 votes_aggregators: HashMap::new(),
                 observed_headers: HashMap::new(),
                 proposal_headers: HashMap::new(),
@@ -144,7 +142,6 @@ impl Core {
                 local_votes: HashMap::new(),
                 missing_proposals: HashMap::new(),
                 pending_votes: HashMap::new(),
-                vote_outbox: Vec::new(),
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 grade_one_certificates: HashMap::new(),
                 grbc_certificates: HashMap::new(),
@@ -152,7 +149,6 @@ impl Core {
                 round_advance_pending: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
                 network: ReliableSender::new(),
-                proposal_network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
             }
             .run()
@@ -173,25 +169,33 @@ impl Core {
         }
     }
 
+    #[cfg(test)]
     async fn process_proposal(&mut self, proposal: Proposal) -> DagResult<()> {
-        self.sanitize_header(&proposal.header)?;
-        proposal.verify(&self.committee)?;
-        self.process_verified_proposal(proposal).await
+        let (header, _) = crate::proposal_processor::prepare_proposal(
+            proposal,
+            self.committee.clone(),
+            &mut self.store,
+            false,
+        )
+        .await?;
+        self.process_stored_proposal(header).await
     }
 
-    // Private entry point: callers either verify the network input above or
-    // return the locally verified value from broadcast_own_header below.
-    async fn process_verified_proposal(&mut self, proposal: Proposal) -> DagResult<()> {
-        let header = proposal.header.clone();
-        let digest = proposal.block().digest();
-        self.missing_proposals.remove(&digest);
-        if !self.proposal_headers.contains_key(&header.id) {
-            // Atomically retain missing bytes and their compact header marker.
-            // Existing local-worker batches are not written a second time.
-            let stored_header = store_verified_proposal(&mut self.store, proposal).await?;
-            self.proposal_headers
-                .insert(header.id.clone(), stored_header);
+    async fn process_stored_proposal(&mut self, stored: StoredProposalHeader) -> DagResult<()> {
+        let header = stored.into_header();
+        ensure!(
+            header.round >= self.gc_round,
+            DagError::TooOld(header.id.clone(), header.round)
+        );
+        let digest = Certificate {
+            header: header.clone(),
+            votes: Vec::new(),
         }
+        .digest();
+        self.missing_proposals.remove(&digest);
+        self.proposal_headers
+            .entry(header.id.clone())
+            .or_insert_with(|| header.clone());
         // Consensus may traverse complete, authenticated data before local
         // GRBC delivery. This experimental early path assumes no equivocation;
         // voting still waits for the DAG dependency checks below.
@@ -227,7 +231,13 @@ impl Core {
         self.store
             .write(local_votes_key(&digest), bincode::serialize(votes)?)
             .await;
-        self.vote_outbox.push(vote);
+        self.tx_votes
+            .send(VoteDispatch {
+                requestor: None,
+                votes: vec![vote],
+            })
+            .await
+            .expect("Failed to enqueue GRBC vote");
         Ok(())
     }
 
@@ -263,25 +273,25 @@ impl Core {
         leader: PublicKey,
         requestor: PublicKey,
     ) -> DagResult<()> {
-        let address = match self.committee.primary(&requestor) {
-            Ok(address) => address.primary_to_primary,
-            Err(_) => return Ok(()),
-        };
-        for header in self.leader_headers(round, leader) {
-            let proposal = assemble_proposal(&mut self.store, header).await?;
-            let digest = proposal.block().digest();
-            let message = PrimaryMessage::Proposal(proposal);
-            let bytes = bincode::serialize(&message)?;
-            let handler = self
-                .proposal_network
-                .send(address, Bytes::from(bytes))
-                .await;
-            self.cancel_handlers.entry(round).or_default().push(handler);
-            for vote in self.local_votes.get(&digest).cloned().unwrap_or_default() {
-                let bytes = bincode::serialize(&PrimaryMessage::GrbcVote(vote))?;
-                let handler = self.network.send(address, Bytes::from(bytes)).await;
-                self.cancel_handlers.entry(round).or_default().push(handler);
-            }
+        if self.committee.primary(&requestor).is_err() {
+            return Ok(());
+        }
+        let digests: Vec<_> = self
+            .leader_headers(round, leader)
+            .into_iter()
+            .map(|header| {
+                Certificate {
+                    header,
+                    votes: Vec::new(),
+                }
+                .digest()
+            })
+            .collect();
+        if !digests.is_empty() {
+            self.tx_cert_requests
+                .send((digests, requestor))
+                .await
+                .expect("Failed to enqueue leader repair");
         }
         Ok(())
     }
@@ -306,41 +316,6 @@ impl Core {
             .filter(|h| h.round == round && h.author == leader)
             .cloned()
             .collect()
-    }
-
-    async fn process_own_header(&mut self, header: Header) -> DagResult<()> {
-        let proposal = self.broadcast_own_header(header).await?;
-        // Network connections can transmit while the local atomic write waits.
-        self.process_verified_proposal(proposal).await
-    }
-
-    async fn broadcast_own_header(&mut self, header: Header) -> DagResult<Proposal> {
-        self.sanitize_header(&header)?;
-        self.current_header = header.clone();
-        let proposal = assemble_proposal(&mut self.store, header).await?;
-        proposal.verify(&self.committee)?;
-        // Move the payload into the wire wrapper instead of cloning every batch.
-        let round = proposal.header.round;
-        let message = PrimaryMessage::Proposal(proposal);
-        let bytes = bincode::serialize(&message)?;
-        let addresses = self
-            .committee
-            .others_primaries(&self.name)
-            .iter()
-            .map(|(_, a)| a.primary_to_primary)
-            .collect();
-        let handlers = self
-            .proposal_network
-            .broadcast(addresses, Bytes::from(bytes))
-            .await;
-        self.cancel_handlers
-            .entry(round)
-            .or_default()
-            .extend(handlers);
-        match message {
-            PrimaryMessage::Proposal(proposal) => Ok(proposal),
-            _ => unreachable!(),
-        }
     }
 
     #[async_recursion]
@@ -456,11 +431,17 @@ impl Core {
                     return Ok(());
                 }
                 pending.push(vote.clone());
-                // A vote may overtake data on the independent connection.
-                // Repeated votes never reset this deadline or issue extra requests.
-                self.missing_proposals
-                    .entry(digest)
-                    .or_insert_with(|| PendingRepair::new(&vote, Instant::now()));
+                if self
+                    .missing_proposals
+                    .insert(digest.clone(), vote.round)
+                    .is_none()
+                {
+                    self.broadcast_grbc_batch(
+                        PrimaryMessage::CertificatesRequest(vec![digest], self.name),
+                        vote.round,
+                    )
+                    .await;
+                }
                 return Ok(());
             }
         };
@@ -495,10 +476,10 @@ impl Core {
             )
             .await;
             self.record_vote(&vote, header)?;
-            self.save_local_vote(vote.into_vote()).await?;
-            // Deliver grade 1 before publishing our READY outbox. Neither event
-            // implies FINISH, and one incoming vote can never create grade 1.
+            // Publish local READY before enqueueing the outbound vote. The
+            // independent sender needs no later Core iteration to flush it.
             self.deliver_grade_one(header).await?;
+            self.save_local_vote(vote.into_vote()).await?;
         }
         let finished = self
             .votes_aggregators
@@ -543,6 +524,8 @@ impl Core {
     async fn process_certificate(&mut self, block: Certificate) -> DagResult<()> {
         // This legacy-named function accepts LOCAL completion records only.
         // All callers, including waiter loopbacks, must satisfy our own READY count.
+        // Compare the entire cached authenticated header, including its body.
+        // ID-only matching would allow a mutated internal record to bypass checks.
         ensure!(
             self.proposal_headers.get(&block.header.id) == Some(&block.header),
             DagError::MalformedHeader(block.header.id.clone())
@@ -571,21 +554,6 @@ impl Core {
         Ok(())
     }
 
-    async fn flush_grbc_outboxes(&mut self) {
-        let mut grouped = BTreeMap::<(Round, GrbcPhase), Vec<GrbcVote>>::new();
-        for vote in std::mem::take(&mut self.vote_outbox) {
-            grouped
-                .entry((vote.round, vote.phase))
-                .or_default()
-                .push(vote);
-        }
-        for ((round, _), votes) in grouped {
-            let batch = GrbcVoteBatch::from_votes(votes).expect("Mixed local GRBC votes");
-            self.broadcast_grbc_batch(PrimaryMessage::GrbcVoteBatch(batch), round)
-                .await;
-        }
-    }
-
     async fn broadcast_grbc_batch(&mut self, message: PrimaryMessage, round: Round) {
         let addresses = self
             .committee
@@ -594,12 +562,7 @@ impl Core {
             .map(|(_, authority)| authority.primary_to_primary)
             .collect();
         let bytes = bincode::serialize(&message).expect("Failed to serialize GRBC batch");
-        let network = if matches!(&message, PrimaryMessage::Proposal(_)) {
-            &mut self.proposal_network
-        } else {
-            &mut self.network
-        };
-        let handlers = network.broadcast(addresses, Bytes::from(bytes)).await;
+        let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
         self.cancel_handlers
             .entry(round)
             .or_default()
@@ -679,21 +642,9 @@ impl Core {
         Ok(())
     }
 
-    fn sanitize_header(&mut self, header: &Header) -> DagResult<()> {
-        ensure!(
-            self.gc_round <= header.round,
-            DagError::TooOld(header.id.clone(), header.round)
-        );
-
-        // Full Proposal verification authenticates the header exactly once.
-
-        // TODO [issue #3]: Prevent bad nodes from sending junk headers with high round numbers.
-
-        Ok(())
-    }
-
     async fn process_primary_message(&mut self, message: PrimaryMessage) -> DagResult<()> {
         match message {
+            #[cfg(test)]
             PrimaryMessage::Proposal(proposal) => self.process_proposal(proposal).await,
             PrimaryMessage::GrbcVote(vote) => self.process_grbc_vote(vote).await,
             PrimaryMessage::GrbcVoteBatch(batch) => {
@@ -724,61 +675,14 @@ impl Core {
         }
     }
 
-    async fn process_input(&mut self, input: PrimaryInput) -> DagResult<()> {
-        let PrimaryInput { message, guard } = input;
-        let result = self.process_primary_message(message).await;
-        drop(guard);
-        result
-    }
-
-    async fn repair_missing_proposals(&mut self, now: Instant) -> DagResult<()> {
-        let tracker = &self.proposal_tracker;
-        let requests: Vec<_> = self
-            .missing_proposals
-            .iter_mut()
-            .filter_map(|(digest, repair)| {
-                repair
-                    .due(tracker, now)
-                    .map(|peer| (digest.clone(), repair.round, peer))
-            })
-            .collect();
-        for (digest, round, peer) in requests {
-            debug!(
-                "Requesting missing proposal {} (round {}) from {:?}",
-                digest, round, peer
-            );
-            let message = PrimaryMessage::CertificatesRequest(vec![digest], self.name);
-            if let Some(peer) = peer.filter(|peer| *peer != self.name) {
-                let address = self
-                    .committee
-                    .primary(&peer)
-                    .expect("Verified voter outside committee")
-                    .primary_to_primary;
-                let handler = self
-                    .network
-                    .send(address, Bytes::from(bincode::serialize(&message)?))
-                    .await;
-                self.cancel_handlers.entry(round).or_default().push(handler);
-            } else {
-                self.broadcast_grbc_batch(message, round).await;
-            }
-        }
-        Ok(())
-    }
-
     // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
+        let mut repair = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
-            let repair_deadline = self
-                .missing_proposals
-                .values()
-                .map(|r| r.deadline)
-                .min()
-                .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
             let result = tokio::select! {
                 // We receive here messages from other primaries.
                 Some(message) = self.rx_primaries.recv() => {
-                    let mut result = self.process_input(message).await;
+                    let mut result = self.process_primary_message(message).await;
                     // Drain a bounded burst while the channel is already hot.
                     // This amortizes scheduler/select overhead without starving
                     // proposer, waiter, or consensus-command channels.
@@ -787,7 +691,7 @@ impl Core {
                             break;
                         }
                         match self.rx_primaries.try_recv() {
-                            Ok(message) => result = self.process_input(message).await,
+                            Ok(message) => result = self.process_primary_message(message).await,
                             Err(_) => break,
                         }
                     }
@@ -803,11 +707,15 @@ impl Core {
                 // processing.
                 Some(certificate) = self.rx_certificate_waiter.recv() => self.process_certificate(certificate).await,
 
-                // We also receive here our new headers created by the `Proposer`.
-                Some(header) = self.rx_proposer.recv() => self.process_own_header(header).await,
+                // Payload validation, hashing, storage and broadcasting run outside Core.
+                Some(header) = self.rx_proposals.recv() => self.process_stored_proposal(header).await,
                 Some(command) = self.rx_consensus.recv() => self.process_consensus_command(command).await,
-                _ = sleep_until(repair_deadline), if !self.missing_proposals.is_empty() => {
-                    self.repair_missing_proposals(Instant::now()).await
+                _ = repair.tick() => {
+                    let pending: Vec<_> = self.missing_proposals.iter().map(|(d, r)| (d.clone(), *r)).collect();
+                    for (digest, round) in pending {
+                        self.broadcast_grbc_batch(PrimaryMessage::CertificatesRequest(vec![digest], self.name), round).await;
+                    }
+                    Ok(())
                 },
             };
             match result {
@@ -819,7 +727,6 @@ impl Core {
                 Err(e @ DagError::TooOld(..)) => debug!("{}", e),
                 Err(e) => warn!("{}", e),
             }
-            self.flush_grbc_outboxes().await;
 
             // Cleanup internal state.
             let round = self.consensus_round.load(Ordering::Relaxed);
@@ -831,8 +738,7 @@ impl Core {
                 let proposal_headers = &self.proposal_headers;
                 self.validated
                     .retain(|id| proposal_headers.contains_key(id));
-                self.missing_proposals
-                    .retain(|_, repair| repair.round >= gc_round);
+                self.missing_proposals.retain(|_, round| *round >= gc_round);
                 self.local_votes
                     .retain(|_, votes| votes.first().map_or(false, |v| v.round >= gc_round));
                 self.processing.retain(|k, _| k >= &gc_round);
