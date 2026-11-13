@@ -212,10 +212,19 @@ fn finds_paths_over_strong_and_weak_edges() {
     .cloned()
     .collect();
 
-    assert!(consensus.linked_by_strong_or_weak(&leader, &target, &dag));
+    let mut state = State::new(Certificate::genesis(&consensus.committee));
+    for (_, block) in dag.values().flat_map(|round| round.values()) {
+        state.promote_to_dag(block.clone());
+    }
+    let ordered = consensus.order_dag(&leader, &state);
+    assert!(ordered
+        .iter()
+        .any(|block| block.digest() == target.digest()));
 
     let (_, unreachable) = mock_certificate(authorities[3], 2, BTreeSet::new());
-    assert!(!consensus.linked_by_strong_or_weak(&leader, &unreachable, &dag));
+    assert!(!ordered
+        .iter()
+        .any(|block| block.digest() == unreachable.digest()));
 }
 
 #[test]
@@ -353,6 +362,24 @@ fn commit_rule_two_counts_strong_and_two_hop_virtual_paths() {
     assert_eq!(
         consensus.rule_two_support_stake(3, &leader_digest, &mut state),
         (0, 0, 3)
+    );
+    // A fourth authority supports the same leader through both kinds of path.
+    // Its weight must contribute only once to the combined condition.
+    let (strong_digest, strong) = mock_certificate(
+        authorities[2],
+        2,
+        [leader_digest.clone()].iter().cloned().collect(),
+    );
+    state.observe(strong.clone());
+    state.promote_to_dag(strong);
+    let mut both_parents = parents;
+    both_parents.insert(strong_digest);
+    let both = mock_certificate(authorities[3], 3, both_parents).1;
+    state.observe(both.clone());
+    state.promote_to_dag(both);
+    assert_eq!(
+        consensus.rule_two_support_stake(3, &leader_digest, &state),
+        (1, 1, 4)
     );
 }
 

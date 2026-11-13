@@ -3,7 +3,6 @@
 mod error;
 pub mod adversary;
 mod aggregators;
-mod certificate_waiter;
 mod core;
 mod garbage_collector;
 mod header_waiter;

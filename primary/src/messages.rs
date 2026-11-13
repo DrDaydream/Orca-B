@@ -187,6 +187,7 @@ pub fn batch_key(digest: &Digest) -> Vec<u8> {
     [b"orca-batch-v2/".as_ref(), digest.as_ref()].concat()
 }
 
+#[cfg(test)] // Retired storage key, used only to check compatibility in tests.
 pub fn grade_one_key(digest: &Digest) -> Vec<u8> {
     [b"orca-ready-v2/".as_ref(), digest.as_ref()].concat()
 }

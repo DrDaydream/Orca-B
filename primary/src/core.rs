@@ -12,7 +12,6 @@ use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
 use crate::verified_vote::VerifiedGrbcVote;
 use crate::vote_sender::VoteDispatch;
-use async_recursion::async_recursion;
 use bytes::Bytes;
 use config::{Committee, Stake};
 use crypto::Hash as _;
@@ -31,7 +30,6 @@ use tokio::sync::mpsc::{Receiver, Sender};
 pub mod core_tests;
 
 const CORE_WORK_BUDGET: usize = 32;
-const PROPOSAL_SERVICE_INTERVAL: usize = 32;
 // Unverified arrivals may defer repair only for a bounded time after the first
 // authenticated vote. Repeated arrivals/votes cannot extend this deadline.
 const PROPOSAL_REPAIR_GRACE: Duration = Duration::from_secs(2);
@@ -59,8 +57,6 @@ pub struct Core {
     rx_primaries: Receiver<PrimaryMessage>,
     /// Receives loopback headers from the `HeaderWaiter`.
     rx_header_waiter: Receiver<Header>,
-    /// Receives loopback certificates from the `CertificateWaiter`.
-    rx_certificate_waiter: Receiver<Certificate>,
     /// Compact metadata delivered after full proposal validation and storage.
     rx_proposals: Receiver<StoredProposalHeader>,
     in_flight: ProposalTracker,
@@ -80,10 +76,7 @@ pub struct Core {
     gc_round: Round,
     /// The authors of the last voted headers.
     last_voted: HashMap<Round, HashSet<PublicKey>>,
-    /// The set of headers we are currently processing.
-    processing: HashMap<Round, HashSet<Digest>>,
     votes_aggregators: HashMap<Digest, GrbcVotesAggregator>,
-    observed_headers: HashMap<Digest, Header>,
     /// Metadata of complete proposals; payload bytes live only in batch storage.
     proposal_headers: HashMap<Digest, Header>,
     validated: HashSet<Digest>,
@@ -95,8 +88,6 @@ pub struct Core {
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>,
     /// Local records delivered after the ECHO quorum or READY relay threshold.
     grade_one_certificates: HashMap<Digest, Certificate>,
-    /// Local dependency completion, from a READY quorum or actual local commit.
-    completed_certificates: HashMap<Digest, Certificate>,
     /// Header IDs whose broadcast no longer needs local processing.
     completed: HashSet<Digest>,
     round_advance_pending: HashMap<Digest, Certificate>,
@@ -120,7 +111,6 @@ impl Core {
         gc_depth: Round,
         rx_primaries: Receiver<PrimaryMessage>,
         rx_header_waiter: Receiver<Header>,
-        rx_certificate_waiter: Receiver<Certificate>,
         rx_proposals: Receiver<StoredProposalHeader>,
         in_flight: ProposalTracker,
         tx_votes: Sender<VoteDispatch>,
@@ -143,7 +133,6 @@ impl Core {
                 gc_depth,
                 rx_primaries,
                 rx_header_waiter,
-                rx_certificate_waiter,
                 rx_proposals,
                 in_flight,
                 vote_batch: Vec::new().into_iter(),
@@ -155,9 +144,7 @@ impl Core {
                 tx_cleanup,
                 gc_round: 0,
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
-                processing: HashMap::with_capacity(2 * gc_depth as usize),
                 votes_aggregators: HashMap::new(),
-                observed_headers: HashMap::new(),
                 proposal_headers: HashMap::new(),
                 validated: HashSet::new(),
                 last_ready: HashMap::new(),
@@ -166,7 +153,6 @@ impl Core {
                 pending_votes: HashMap::new(),
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 grade_one_certificates: HashMap::new(),
-                completed_certificates: HashMap::new(),
                 completed: HashSet::new(),
                 round_advance_pending: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
@@ -176,19 +162,6 @@ impl Core {
             .run()
             .await;
         });
-    }
-
-    async fn observe_header(&mut self, header: &Header) {
-        if self
-            .observed_headers
-            .insert(header.id.clone(), header.clone())
-            .is_none()
-        {
-            self.tx_consensus
-                .send(ConsensusMessage::Observed(header.clone()))
-                .await
-                .expect("Failed to send observed proposal");
-        }
     }
 
     #[cfg(test)]
@@ -219,13 +192,18 @@ impl Core {
         }
         .digest();
         self.missing_proposals.remove(&digest);
-        self.proposal_headers
-            .entry(header.id.clone())
-            .or_insert_with(|| header.clone());
         // Consensus may traverse complete, authenticated data before local
         // GRBC delivery. This experimental early path assumes no equivocation;
         // voting still waits for the DAG dependency checks below.
-        self.observe_header(&header).await;
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.proposal_headers.entry(header.id.clone())
+        {
+            entry.insert(header.clone());
+            self.tx_consensus
+                .send(ConsensusMessage::Observed(header.clone()))
+                .await
+                .expect("Failed to send observed proposal");
+        }
         if let Some(votes) = self.pending_votes.remove(&header.id) {
             for vote in votes {
                 // Arrival resolves this header ID, including repair requests
@@ -329,7 +307,16 @@ impl Core {
             let digest = block.digest();
             // Usually Core already observed this header. The store fallback
             // also covers a stored result still waiting for Core registration.
-            if !self.proposal_headers.contains_key(&header.id) {
+            ensure!(
+                block.votes.is_empty(),
+                DagError::MalformedHeader(header.id.clone())
+            );
+            if let Some(stored) = self.proposal_headers.get(&header.id) {
+                ensure!(
+                    stored == header,
+                    DagError::MalformedHeader(header.id.clone())
+                );
+            } else {
                 let bytes = self
                     .store
                     .read(crate::messages::proposal_header_key(&digest))
@@ -340,12 +327,17 @@ impl Core {
                     stored == *header,
                     DagError::MalformedHeader(header.id.clone())
                 );
-                self.proposal_headers.insert(header.id.clone(), stored);
+                if header.round >= self.gc_round {
+                    self.proposal_headers.insert(header.id.clone(), stored);
+                }
             }
-            ensure!(
-                self.proposal_headers.get(&header.id) == Some(header) && block.votes.is_empty(),
-                DagError::MalformedHeader(header.id.clone())
-            );
+            notifications.push((digest.clone(), header.id.clone()));
+            // Old committed history still releases disk-backed dependencies,
+            // but must not repopulate state below an unchanged GC boundary.
+            if header.round < self.gc_round {
+                self.record_completed(block).await?;
+                continue;
+            }
             // Commitment also closes this author's voting slot; it must not
             // permit a later conflicting variant to elicit a fresh local vote.
             self.last_voted
@@ -365,7 +357,6 @@ impl Core {
                 }
                 completed.push(block);
             }
-            notifications.push((digest, header.id.clone()));
         }
         // Publish the entire causal sequence before checking round advancement,
         // so descendants see the committed ancestors in the same batch.
@@ -432,7 +423,6 @@ impl Core {
             .collect()
     }
 
-    #[async_recursion]
     async fn process_header(&mut self, header: &Header) -> DagResult<()> {
         debug!("Processing {:?}", header);
         if self.completed.contains(&header.id) || !self.proposal_headers.contains_key(&header.id) {
@@ -441,12 +431,6 @@ impl Core {
         if self.validated.contains(&header.id) {
             return self.evaluate_grbc(header).await;
         }
-        // Indicate that we are processing this header.
-        self.processing
-            .entry(header.round)
-            .or_insert_with(HashSet::new)
-            .insert(header.id.clone());
-
         // Ensure we have the parents. If at least one parent is missing, the synchronizer returns an empty
         // vector; it will gather the missing parents (as well as all ancestors) from other nodes and then
         // reschedule processing of this header.
@@ -503,9 +487,6 @@ impl Core {
 
         // Proposal verification has already checked and stored every payload byte.
         self.validated.insert(header.id.clone());
-        self.store
-            .write(header.id.to_vec(), bincode::serialize(header)?)
-            .await;
         if self
             .last_voted
             .entry(header.round)
@@ -522,9 +503,7 @@ impl Core {
             self.record_vote(&vote)?;
             self.save_local_vote(vote.into_vote()).await?;
         }
-        self.evaluate_grbc(header).await?;
-        self.retry_round_advance_pending().await?;
-        Ok(())
+        self.evaluate_grbc(header).await
     }
 
     async fn process_grbc_vote(&mut self, vote: GrbcVote) -> DagResult<()> {
@@ -626,12 +605,6 @@ impl Core {
         };
         let digest = block.digest();
         if !self.grade_one_certificates.contains_key(&digest) {
-            self.store
-                .write(
-                    crate::messages::grade_one_key(&digest),
-                    bincode::serialize(&block)?,
-                )
-                .await;
             self.grade_one_certificates.insert(digest, block.clone());
             self.tx_consensus
                 .send(ConsensusMessage::GradeOne(block))
@@ -643,7 +616,7 @@ impl Core {
 
     async fn process_certificate(&mut self, block: Certificate) -> DagResult<()> {
         // This legacy-named function accepts LOCAL completion records only.
-        // All callers, including waiter loopbacks, must satisfy our own READY count.
+        // Completion must satisfy our own READY count.
         // Compare the entire cached authenticated header, including its body.
         // ID-only matching would allow a mutated internal record to bypass checks.
         ensure!(
@@ -698,10 +671,10 @@ impl Core {
         self.store
             .write(digest.to_vec(), bincode::serialize(block)?)
             .await;
-        self.completed_certificates
-            .insert(digest.clone(), block.clone());
-        self.completed.insert(block.header.id.clone());
-        self.weak_edge_candidates.insert(digest, block.round());
+        if block.round() >= self.gc_round {
+            self.completed.insert(block.header.id.clone());
+            self.weak_edge_candidates.insert(digest, block.round());
+        }
         Ok(true)
     }
 
@@ -788,23 +761,21 @@ impl Core {
     /// Budget actual votes, not just envelopes. Keep the remainder of a large
     /// vector in place and preserve FIFO order across bursts.
     async fn process_primary_burst(&mut self, mut first: Option<PrimaryMessage>) -> DagResult<()> {
-        for work in 0..CORE_WORK_BUDGET {
-            if work % PROPOSAL_SERVICE_INTERVAL == 0 {
-                if let Ok(command) = self.rx_consensus.try_recv() {
-                    match self.process_consensus_command(command).await {
-                        Err(error @ DagError::StoreError(_)) => return Err(error),
-                        Err(error) => warn!("Ignoring consensus command: {}", error),
-                        Ok(()) => (),
-                    }
-                }
-                if let Ok(stored) = self.rx_proposals.try_recv() {
-                    match self.process_stored_proposal(stored).await {
-                        Err(error @ DagError::StoreError(_)) => return Err(error),
-                        Err(error) => warn!("Ignoring stored proposal: {}", error),
-                        Ok(()) => (),
-                    }
-                }
+        if let Ok(command) = self.rx_consensus.try_recv() {
+            match self.process_consensus_command(command).await {
+                Err(error @ DagError::StoreError(_)) => return Err(error),
+                Err(error) => warn!("Ignoring consensus command: {}", error),
+                Ok(()) => (),
             }
+        }
+        if let Ok(stored) = self.rx_proposals.try_recv() {
+            match self.process_stored_proposal(stored).await {
+                Err(error @ DagError::StoreError(_)) => return Err(error),
+                Err(error) => warn!("Ignoring stored proposal: {}", error),
+                Ok(()) => (),
+            }
+        }
+        for _ in 0..CORE_WORK_BUDGET {
             let message = match self.vote_batch.next() {
                 Some(vote) => PrimaryMessage::GrbcVote(vote),
                 None => match first.take().or_else(|| self.rx_primaries.try_recv().ok()) {
@@ -861,11 +832,6 @@ impl Core {
                 // execution (we were missing some of their dependencies) and we are now ready to resume processing.
                 Some(header) = self.rx_header_waiter.recv() => self.process_header(&header).await,
 
-                // We receive here loopback certificates from the `CertificateWaiter`. Those are certificates for which
-                // we interrupted execution (we were missing some of their ancestors) and we are now ready to resume
-                // processing.
-                Some(certificate) = self.rx_certificate_waiter.recv() => self.process_certificate(certificate).await,
-
                 // Payload validation, hashing, storage and broadcasting run outside Core.
                 Some(header) = self.rx_proposals.recv() => self.process_stored_proposal(header).await,
                 Some(command) = self.rx_consensus.recv() => self.process_consensus_command(command).await,
@@ -884,43 +850,41 @@ impl Core {
                 Err(e) => warn!("{}", e),
             }
 
-            // Cleanup internal state.
-            let round = self.consensus_round.load(Ordering::Relaxed);
-            if round > self.gc_depth {
-                let gc_round = round - self.gc_depth;
-                self.last_voted.retain(|k, _| k >= &gc_round);
-                self.last_ready.retain(|k, _| k >= &gc_round);
-                self.proposal_headers.retain(|_, h| h.round >= gc_round);
-                let proposal_headers = &self.proposal_headers;
-                self.validated
-                    .retain(|id| proposal_headers.contains_key(id));
-                self.missing_proposals
-                    .retain(|_, (round, _)| *round >= gc_round);
-                self.local_votes
-                    .retain(|_, votes| votes.first().map_or(false, |v| v.round >= gc_round));
-                self.processing.retain(|k, _| k >= &gc_round);
-                self.observed_headers
-                    .retain(|_, header| header.round >= gc_round);
-                let live_headers: HashSet<_> = self.observed_headers.keys().cloned().collect();
-                self.votes_aggregators
-                    .retain(|digest, _| live_headers.contains(digest));
-                self.pending_votes
-                    .retain(|_, votes| votes.first().map_or(false, |vote| vote.round >= gc_round));
-                self.certificates_aggregators.retain(|k, _| k >= &gc_round);
-                self.grade_one_certificates
-                    .retain(|_, certificate| certificate.round() >= gc_round);
-                self.completed_certificates
-                    .retain(|_, x| x.round() >= gc_round);
-                let live: HashSet<_> = self.completed_certificates.keys().cloned().collect();
-                self.completed
-                    .retain(|id| proposal_headers.contains_key(id));
-                self.round_advance_pending
-                    .retain(|digest, _| live.contains(digest));
-                self.weak_edge_candidates
-                    .retain(|_, round| *round >= gc_round);
-                self.cancel_handlers.retain(|k, _| k >= &gc_round);
-                self.gc_round = gc_round;
-            }
+            self.cleanup();
         }
+    }
+
+    fn cleanup(&mut self) {
+        let gc_round = self
+            .consensus_round
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.gc_depth);
+        if gc_round <= self.gc_round {
+            return;
+        }
+        self.last_voted.retain(|round, _| *round >= gc_round);
+        self.last_ready.retain(|round, _| *round >= gc_round);
+        self.proposal_headers.retain(|_, h| h.round >= gc_round);
+        let headers = &self.proposal_headers;
+        self.validated.retain(|id| headers.contains_key(id));
+        self.completed.retain(|id| headers.contains_key(id));
+        self.votes_aggregators
+            .retain(|id, _| headers.contains_key(id));
+        self.missing_proposals
+            .retain(|_, (round, _)| *round >= gc_round);
+        self.local_votes
+            .retain(|_, votes| votes.first().map_or(false, |v| v.round >= gc_round));
+        self.pending_votes
+            .retain(|_, votes| votes.first().map_or(false, |v| v.round >= gc_round));
+        self.certificates_aggregators
+            .retain(|round, _| *round >= gc_round);
+        self.grade_one_certificates
+            .retain(|_, c| c.round() >= gc_round);
+        self.round_advance_pending
+            .retain(|_, c| c.round() >= gc_round);
+        self.weak_edge_candidates
+            .retain(|_, round| *round >= gc_round);
+        self.cancel_handlers.retain(|round, _| *round >= gc_round);
+        self.gc_round = gc_round;
     }
 }
