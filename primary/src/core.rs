@@ -538,11 +538,10 @@ impl Core {
                 std::collections::hash_map::Entry::Occupied(_) => false,
             };
             if first && !self.in_flight.contains(&digest) {
-                self.broadcast_grbc_batch(
-                    PrimaryMessage::CertificatesRequest(vec![digest], self.name),
-                    vote.round,
-                )
-                .await;
+                // A correct voter already has the complete proposal. Try it
+                // first; the existing retry path still queries every peer.
+                self.request_proposal(digest, vote.round, Some(vote.author))
+                    .await;
             }
             return Ok(());
         }
@@ -651,14 +650,16 @@ impl Core {
         Ok(())
     }
 
-    async fn broadcast_grbc_batch(&mut self, message: PrimaryMessage, round: Round) {
+    async fn request_proposal(&mut self, digest: Digest, round: Round, peer: Option<PublicKey>) {
         let addresses = self
             .committee
             .others_primaries(&self.name)
             .iter()
+            .filter(|(name, _)| peer.map_or(true, |peer| peer == *name))
             .map(|(_, authority)| authority.primary_to_primary)
             .collect();
-        let bytes = bincode::serialize(&message).expect("Failed to serialize GRBC batch");
+        let message = PrimaryMessage::CertificatesRequest(vec![digest], self.name);
+        let bytes = bincode::serialize(&message).expect("Failed to serialize proposal request");
         let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
         self.cancel_handlers
             .entry(round)
@@ -812,11 +813,7 @@ impl Core {
             .map(|(digest, (round, _))| (digest.clone(), *round))
             .collect();
         for (digest, round) in pending {
-            self.broadcast_grbc_batch(
-                PrimaryMessage::CertificatesRequest(vec![digest], self.name),
-                round,
-            )
-            .await;
+            self.request_proposal(digest, round, None).await;
         }
     }
 
