@@ -313,6 +313,26 @@ these runs end with zero round lag. Ten nodes retain a 1063-block common prefix
 and recent progress at every node, with a four-round maximum lag at shutdown.
 These are functional checks; Ubuntu throughput and latency remain unmeasured.
 
+## Bounded strong-path indexing
+
+Rule 2 and the r+2 ABA input query strong paths from round r+2 to round r.
+Validated strong edges go back exactly one round, so the support index now
+stores only two-hop ancestors. It no longer copies the full transitive history
+into every new block. A late intermediate updates its immediate children,
+including children already admitted to Dag. Commit-history traversal and
+distinct-author support counting retain their existing semantics.
+
+The regression suite passes 103 workspace unit tests with all features; a
+separate manual index probe is ignored by default. Five alternating Windows
+release measurements on a synthetic 10-authority, 80-round graph reduced the
+median observe/promote time from 171.25 ms to 8.14 ms. Each support map contained
+780 keys instead of 31,600. This measures index overhead only, not throughput
+or end-to-end latency. Run the probe with:
+
+```sh
+cargo test -p consensus --release measure_strong_support_index -- --ignored --nocapture
+```
+
 ## Reproduce validation
 
 ```sh
