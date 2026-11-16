@@ -188,6 +188,12 @@ cargo test --workspace --all-features --locked -- --test-threads=1
 
 Use FINAL ORDERED COMPARISON and logs/comparison.json, not the preceding legacy
 SUMMARY. The window is [earliest client Start, Start + 20 seconds).
+The pinned baseline logs worker digests as `Ok(digest)` and primary digests as
+`digest`; the shared parser normalizes the worker wrapper for both byte counts
+and sampled transactions. Older comparison runs with the error `Final commit is
+missing its batch size or proposal` can be reparsed from their saved logs after
+updating this Python parser. Preserve the original exit status and record the
+parser revision separately; a parsing repair is not a new benchmark run.
 TPS always divides by 20 seconds. Final consensus latency starts at proposal
 creation; final E2E starts at sampled client submission. Both stop at the first
 observed replica's final ordered commit, not application execution or completion

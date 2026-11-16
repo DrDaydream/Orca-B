@@ -63,6 +63,13 @@ class ComparisonMetricsTests(unittest.TestCase):
         with self.assertRaises(ParseError):
             parser.comparison_metrics(20)
 
+    def test_missing_metadata_does_not_silently_drop_committed_batches(self):
+        for field in ['sizes', 'proposals']:
+            parser = self.parser()
+            del getattr(parser, field)['a']
+            with self.subTest(field=field), self.assertRaises(ParseError):
+                parser.comparison_metrics(20)
+
     def test_native_bullshark_logs_use_actual_ordered_commit(self):
         parser = LogParser.__new__(LogParser)
         client = '''2026-11-16T01:00:00.000Z INFO client: Transactions size: 512 B
@@ -87,16 +94,22 @@ class ComparisonMetricsTests(unittest.TestCase):
 '''
         size, rate, start, _, sent = parser._parse_clients(client)
         proposals, commits, final, *rest = parser._parse_primaries(primary)
-        sizes, received, worker_ip = parser._parse_workers(worker)
         parser.start, parser.size, parser.rate = [start], [size], [rate]
         parser.proposals, parser.commits, parser.final_commits = proposals, commits, final
-        parser.sizes = sizes
-        parser.sent_samples, parser.received_samples = [sent], [received]
-        result = parser.comparison_metrics(20)
-        self.assertEqual(result['final_tps'], 0.5)
-        self.assertEqual(result['final_consensus_mean_ms'], 2000)
-        self.assertEqual(result['final_e2e_mean_ms'], 3000)
-        self.assertEqual(rest[-1], worker_ip)
+        # Narwhal 3257759 logs Result<Digest> in workers, but bare digests in primaries.
+        for digest in ['batch=', 'Ok(batch=)']:
+            with self.subTest(worker_digest=digest):
+                sizes, received, worker_ip = parser._parse_workers(
+                    worker.replace('Batch batch=', f'Batch {digest}')
+                )
+                parser.sizes = sizes
+                parser.sent_samples, parser.received_samples = [sent], [received]
+                result = parser.comparison_metrics(20)
+                self.assertEqual(result['final_tps'], 0.5)
+                self.assertEqual(result['final_consensus_mean_ms'], 2000)
+                self.assertEqual(result['final_e2e_mean_ms'], 3000)
+                self.assertEqual(result['sample_completed'], 1)
+                self.assertEqual(rest[-1], worker_ip)
 
     def test_uppercase_runtime_errors_reject_incomplete_measurements(self):
         parser = LogParser.__new__(LogParser)
