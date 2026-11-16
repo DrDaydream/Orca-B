@@ -6,6 +6,133 @@ use crypto::{Hash as _, Signature};
 use tokio::net::TcpListener;
 
 #[tokio::test]
+async fn dependency_repair_with_local_payload_does_not_download_it_again() {
+    use crate::header_waiter::{HeaderWaiter, WaiterMessage};
+    use crate::messages::local_votes_key;
+    use crate::proposal_store::store_verified_proposal;
+    use futures::{SinkExt, StreamExt};
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    let mut c = committee();
+    let name = keys()[0].0;
+    let peer = keys()[1].0;
+    let replies = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let requests = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    c.authorities
+        .get_mut(&name)
+        .unwrap()
+        .primary
+        .primary_to_primary = replies.local_addr().unwrap();
+    c.authorities
+        .get_mut(&peer)
+        .unwrap()
+        .primary
+        .primary_to_primary = requests.local_addr().unwrap();
+    let mut p = proposal();
+    let payload = vec![7; 512 * 1024];
+    let batch = batch_digest(&payload);
+    p.header.payload.insert(batch.clone(), 0);
+    p.batches.insert(batch, payload);
+    p.header.id = p.header.digest();
+    p.header.signature = Signature::new(&p.header.id, &keys().pop().unwrap().1);
+    p.verify(&committee()).unwrap();
+    let digest = p.block().digest();
+    let mut local =
+        Store::new(&format!(".db_test_vote_only_local_{}", std::process::id())).unwrap();
+    let mut remote =
+        Store::new(&format!(".db_test_vote_only_remote_{}", std::process::id())).unwrap();
+    store_verified_proposal(&mut local, p.clone())
+        .await
+        .unwrap();
+    store_verified_proposal(&mut remote, p.clone())
+        .await
+        .unwrap();
+    let vote = votes(&p.header, GrbcPhase::Echo).remove(1);
+    remote
+        .write(
+            local_votes_key(&digest),
+            bincode::serialize(&vec![vote.clone()]).unwrap(),
+        )
+        .await;
+    let (tx_cert_requests, rx_requests) = channel(10);
+    let (tx_votes, rx_votes) = channel(10);
+    spawn_vote_sender(peer, c.clone(), Arc::new(AtomicU64::new(0)), 50, rx_votes);
+    crate::helper::Helper::spawn(c.clone(), remote, rx_requests, tx_votes);
+    let handler = PrimaryReceiverHandler {
+        tx_primary_messages: channel(10).0,
+        tx_remote_proposals: channel(10).0,
+        in_flight: ProposalTracker::default(),
+        tx_cert_requests,
+    };
+    let ingress = tokio::spawn(async move {
+        let (socket, _) = requests.accept().await.unwrap();
+        let (mut writer, mut reader) = Framed::new(socket, LengthDelimitedCodec::new()).split();
+        while let Some(Ok(bytes)) = reader.next().await {
+            handler.dispatch(&mut writer, bytes.freeze()).await.unwrap();
+        }
+    });
+    let (tx_sync, rx_sync) = channel(10);
+    let (tx_core, mut rx_core) = channel(10);
+    HeaderWaiter::spawn(
+        name,
+        c,
+        local.clone(),
+        Arc::new(AtomicU64::new(0)),
+        50,
+        10_000,
+        3,
+        rx_sync,
+        tx_core,
+    );
+    let mut child = proposal().header;
+    child.author = peer;
+    child.parents = [digest.clone()].iter().cloned().collect();
+    tx_sync
+        .send(WaiterMessage::SyncParents(
+            vec![digest.clone()],
+            Vec::new(),
+            child.clone(),
+        ))
+        .await
+        .unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(5), async {
+        let (socket, _) = replies.accept().await.unwrap();
+        let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
+        let bytes = stream.next().await.unwrap().unwrap();
+        stream.send(Bytes::from_static(b"Ack")).await.unwrap();
+        (
+            bincode::deserialize::<PrimaryMessage>(&bytes).unwrap(),
+            stream,
+        )
+    })
+    .await
+    .unwrap();
+    let (message, _keep_connection_alive) = received;
+    match message {
+        PrimaryMessage::GrbcVoteBatch(batch) => assert_eq!(batch.into_votes(), vec![vote]),
+        _ => panic!("A node with complete payload must only receive repair votes"),
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), replies.accept())
+            .await
+            .is_err(),
+        "Dependency repair must not open a second connection to resend the full proposal"
+    );
+    assert!(
+        rx_core.try_recv().is_err(),
+        "Payload presence alone must not satisfy FINISH"
+    );
+    local.write(digest.to_vec(), vec![1]).await;
+    let resumed = tokio::time::timeout(Duration::from_secs(2), rx_core.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed.id, child.id);
+    ingress.abort();
+}
+
+#[tokio::test]
 async fn echo_and_ready_bypass_a_blocked_proposal_connection() {
     let mut c = committee();
     let peer = keys()[1].0;

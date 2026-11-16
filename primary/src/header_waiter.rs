@@ -10,7 +10,9 @@ use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
 use network::SimpleSender;
+use rand::seq::SliceRandom;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,6 +38,98 @@ mod tests {
     use super::*;
     use crate::common::{committee, header, keys};
     use crate::messages::proposal_header_key;
+
+    #[tokio::test]
+    async fn repair_retry_switches_to_votes_only_after_complete_proposal_arrives() {
+        use crate::common::proposal;
+        use crate::messages::grade_one_key;
+        use crate::proposal_store::store_verified_proposal;
+        use crypto::Hash as _;
+        use futures::SinkExt;
+        use tokio::net::TcpListener;
+        use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+        let p = proposal();
+        let digest = p.block().digest();
+        let mut c = committee();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // A one-peer repair fixture makes the retry destination deterministic.
+        for authority in c.authorities.values_mut() {
+            authority.primary.primary_to_primary = address;
+        }
+        let path = format!(".db_test_grbc_retry_kind_{}", std::process::id());
+        let mut store = Store::new(&path).unwrap();
+        // Grade metadata is not proof that all payload bytes are present.
+        store.write(grade_one_key(&digest), vec![1]).await;
+        let (tx_sync, rx_sync) = channel(10);
+        let (tx_core, mut rx_core) = channel(10);
+        HeaderWaiter::spawn(
+            keys()[0].0,
+            c,
+            store.clone(),
+            Arc::new(AtomicU64::new(0)),
+            50,
+            0,
+            1,
+            rx_sync,
+            tx_core,
+        );
+        let mut child = header();
+        child.parents = [digest.clone()].iter().cloned().collect();
+        tx_sync
+            .send(WaiterMessage::SyncParents(
+                vec![digest.clone()],
+                Vec::new(),
+                child.clone(),
+            ))
+            .await
+            .unwrap();
+        let (socket, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
+        let bytes = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        stream.send(Bytes::from_static(b"Ack")).await.unwrap();
+        assert!(
+            matches!(bincode::deserialize::<PrimaryMessage>(&bytes).unwrap(),
+            PrimaryMessage::CertificatesRequest(digests, _) if digests == vec![digest.clone()])
+        );
+
+        store_verified_proposal(&mut store, p).await.unwrap();
+        let bytes = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        stream.send(Bytes::from_static(b"Ack")).await.unwrap();
+        assert!(
+            matches!(bincode::deserialize::<PrimaryMessage>(&bytes).unwrap(),
+            PrimaryMessage::VotesRequest(digests, _) if digests == vec![digest.clone()])
+        );
+        assert!(
+            rx_core.try_recv().is_err(),
+            "Complete payload is not FINISH"
+        );
+
+        store.write(digest.to_vec(), vec![1]).await;
+        let resumed = tokio::time::timeout(Duration::from_secs(2), rx_core.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.id, child.id);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1100), stream.next())
+                .await
+                .is_err(),
+            "No repair frame is needed once all dependencies complete"
+        );
+    }
 
     #[tokio::test]
     async fn mixed_dependencies_resume_only_after_finish_and_proposal_arrive() {
@@ -176,6 +270,56 @@ impl HeaderWaiter {
         }
     }
 
+    async fn request_parents(
+        &mut self,
+        digests: Vec<Digest>,
+        mut addresses: Vec<SocketAddr>,
+        nodes: usize,
+    ) {
+        if digests.is_empty() {
+            return;
+        }
+        // Both request kinds use one peer set, preserving the total retry fanout.
+        if addresses.len() > nodes {
+            addresses.shuffle(&mut rand::thread_rng());
+            addresses.truncate(nodes);
+        }
+        let mut proposals = Vec::new();
+        let mut votes = Vec::new();
+        for digest in digests {
+            // This marker is published atomically with all verified payload
+            // bytes. A missing FINISH needs votes, not another payload copy.
+            if self
+                .store
+                .read(crate::messages::proposal_header_key(&digest))
+                .await
+                .expect("Failed to read proposal marker")
+                .is_some()
+            {
+                if self.parent_requests.contains_key(&digest) {
+                    votes.push(digest);
+                }
+            } else {
+                proposals.push(digest);
+            }
+        }
+        for (digests, votes_only) in [(votes, true), (proposals, false)] {
+            if digests.is_empty() {
+                continue;
+            }
+            let message = if votes_only {
+                PrimaryMessage::VotesRequest(digests, self.name)
+            } else {
+                PrimaryMessage::CertificatesRequest(digests, self.name)
+            };
+            let bytes =
+                bincode::serialize(&message).expect("Failed to serialize dependency request");
+            self.network
+                .broadcast(addresses.clone(), Bytes::from(bytes))
+                .await;
+        }
+    }
+
     /// Main loop listening to the `Synchronizer` messages.
     async fn run(&mut self) {
         let mut waiting = FuturesUnordered::new();
@@ -246,10 +390,7 @@ impl HeaderWaiter {
                                     .primary(&author)
                                     .expect("Author of valid header not in the committee")
                                     .primary_to_primary;
-                                let message = PrimaryMessage::CertificatesRequest(requires_sync, self.name);
-                                let bytes = bincode::serialize(&message)
-                                    .expect("Failed to serialize dependency sync request");
-                                self.network.send(address, Bytes::from(bytes)).await;
+                                self.request_parents(requires_sync, vec![address], 1).await;
                             }
                         }
                     }
@@ -310,9 +451,7 @@ impl HeaderWaiter {
                         .iter()
                         .map(|(_, x)| x.primary_to_primary)
                         .collect();
-                    let message = PrimaryMessage::CertificatesRequest(retry, self.name);
-                    let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                    self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await;
+                    self.request_parents(retry, addresses, self.sync_retry_nodes).await;
 
                     // Reschedule the timer.
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));

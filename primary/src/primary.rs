@@ -3,7 +3,7 @@ use crate::core::Core;
 use crate::error::DagError;
 use crate::garbage_collector::GarbageCollector;
 use crate::header_waiter::HeaderWaiter;
-use crate::helper::Helper;
+use crate::helper::{Helper, RepairRequest};
 use crate::messages::{
     batch_digest, batch_key, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GrbcVote,
     GrbcVoteBatch as VoteBatch, Proposal, MAX_PROPOSAL_BYTES,
@@ -47,6 +47,8 @@ pub enum PrimaryMessage {
     Consensus(ConsensusNetworkMessage),
     LeaderRequest(Round, PublicKey, /* requestor */ PublicKey),
     CertificatesRequest(Vec<Digest>, /* requestor */ PublicKey),
+    /// Request saved ECHO/READY votes when the complete proposal is already local.
+    VotesRequest(Vec<Digest>, /* requestor */ PublicKey),
 }
 
 /// The messages sent by the primary to its workers.
@@ -347,7 +349,7 @@ struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
     tx_remote_proposals: Sender<QueuedProposal>,
     in_flight: ProposalTracker,
-    tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
+    tx_cert_requests: Sender<RepairRequest>,
 }
 
 /// Dedicated ABA ingress. Authentication and decoding happen outside Core;
@@ -401,9 +403,14 @@ impl MessageHandler for PrimaryReceiverHandler {
             }
             PrimaryMessage::CertificatesRequest(missing, requestor) => self
                 .tx_cert_requests
-                .send((missing, requestor))
+                .send(RepairRequest::Proposals(missing, requestor))
                 .await
                 .expect("Failed to send primary message"),
+            PrimaryMessage::VotesRequest(missing, requestor) => self
+                .tx_cert_requests
+                .send(RepairRequest::Votes(missing, requestor))
+                .await
+                .expect("Failed to send vote repair request"),
             request => self
                 .tx_primary_messages
                 .send(request)
