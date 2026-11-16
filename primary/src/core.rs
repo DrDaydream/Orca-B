@@ -201,6 +201,7 @@ impl Core {
             self.proposal_headers.entry(header.id.clone())
         {
             entry.insert(header.clone());
+            debug!(target: "orca_latency", "stage=registered id={:?} round={}", header.id, header.round);
             self.tx_consensus
                 .send(ConsensusMessage::Observed(header.clone()))
                 .await
@@ -261,6 +262,8 @@ impl Core {
         self.store
             .write(local_votes_key(&digest), bincode::serialize(votes)?)
             .await;
+        debug!(target: "orca_latency", "stage=vote_queued id={:?} round={} phase={:?}",
+            vote.id, vote.round, vote.phase);
         self.tx_votes
             .send(VoteDispatch {
                 requestor: None,
@@ -441,6 +444,7 @@ impl Core {
             .get_parents(header, &self.grade_one_certificates, &self.completed)
             .await?;
         if referenced.is_empty() {
+            debug!(target: "orca_latency", "stage=parents_wait id={:?} round={}", header.id, header.round);
             debug!("Processing of {} suspended: missing parent(s)", header.id);
             return Ok(());
         }
@@ -492,6 +496,7 @@ impl Core {
 
         // Proposal verification has already checked and stored every payload byte.
         self.validated.insert(header.id.clone());
+        debug!(target: "orca_latency", "stage=parents_valid id={:?} round={}", header.id, header.round);
         if self
             .last_voted
             .entry(header.round)
@@ -573,6 +578,8 @@ impl Core {
                 .or_default()
                 .insert(header.author)
         {
+            debug!(target: "orca_latency", "stage=ready id={:?} round={} echoes={} readies={}",
+                header.id, header.round, state.echo_weight, state.ready_weight);
             let vote = VerifiedGrbcVote::new(
                 header,
                 self.name,
@@ -641,6 +648,7 @@ impl Core {
         }
         self.deliver_grade_one(&block.header).await?;
         if self.record_completed(&block).await? {
+            debug!(target: "orca_latency", "stage=finish id={:?} round={}", block.header.id, block.round());
             debug!("GRBC grade 2 delivered for {:?}", block);
             self.tx_consensus
                 .send(ConsensusMessage::GradeTwo(block.clone()))
@@ -722,6 +730,7 @@ impl Core {
             for digest in &weak_edges {
                 self.weak_edge_candidates.remove(digest);
             }
+            debug!(target: "orca_latency", "stage=round_advance round={}", round + 1);
             self.tx_consensus
                 .send(ConsensusMessage::RoundAdvanced(round + 1))
                 .await

@@ -381,6 +381,8 @@ impl MessageHandler for AbaReceiverHandler {
 #[async_trait]
 impl MessageHandler for PrimaryReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+        let received_at = log::log_enabled!(target: "orca_latency", log::Level::Debug)
+            .then(std::time::Instant::now);
         // Reply with an ACK.
         let _ = writer.send(Bytes::from("Ack")).await;
 
@@ -394,6 +396,11 @@ impl MessageHandler for PrimaryReceiverHandler {
         };
         match message {
             PrimaryMessage::Proposal(proposal) => {
+                if let Some(started) = received_at {
+                    log::debug!(target: "orca_latency",
+                        "stage=decoded id={:?} round={} ack_and_decode_us={}",
+                        proposal.header.id, proposal.header.round, started.elapsed().as_micros());
+                }
                 // Register before waiting for space in the bounded bulk queue.
                 let guard = self.in_flight.track(&proposal.header);
                 self.tx_remote_proposals
@@ -443,6 +450,7 @@ impl MessageHandler for WorkerReceiverHandler {
                 store
                     .write_batch_if_absent(std::iter::once((batch_key(&digest), batch)).collect())
                     .await?;
+                log::debug!(target: "orca_latency", "stage=batch_available id={:?} bytes={}", digest, size);
                 self.tx_our_digests
                     .send((digest, worker_id, size))
                     .await
