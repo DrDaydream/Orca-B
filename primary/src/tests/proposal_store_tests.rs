@@ -257,7 +257,9 @@ async fn helper_recovers_complete_proposal_before_local_ready() {
         rx_votes,
     );
     crate::helper::Helper::spawn(c, store, rx, tx_votes);
-    tx.send((vec![digest], requestor)).await.unwrap();
+    tx.send(crate::helper::RepairRequest::Proposals(vec![digest], requestor))
+        .await
+        .unwrap();
     let frames = tokio::time::timeout(std::time::Duration::from_secs(5), receiver)
         .await
         .unwrap()

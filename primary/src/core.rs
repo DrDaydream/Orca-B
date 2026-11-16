@@ -63,7 +63,7 @@ pub struct Core {
     /// Unconsumed votes from one wire batch, retained across bounded bursts.
     vote_batch: std::vec::IntoIter<GrbcVote>,
     tx_votes: Sender<VoteDispatch>,
-    tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
+    tx_cert_requests: Sender<crate::helper::RepairRequest>,
     /// Output all certificates to the consensus layer.
     tx_consensus: Sender<ConsensusMessage>,
     /// Send valid a quorum of certificates' ids to the `Proposer` (along with their round).
@@ -114,7 +114,7 @@ impl Core {
         rx_proposals: Receiver<StoredProposalHeader>,
         in_flight: ProposalTracker,
         tx_votes: Sender<VoteDispatch>,
-        tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
+        tx_cert_requests: Sender<crate::helper::RepairRequest>,
         tx_consensus: Sender<ConsensusMessage>,
         tx_proposer: Sender<ProposerMessage>,
         rx_consensus: Receiver<ConsensusCommand>,
@@ -394,7 +394,7 @@ impl Core {
             .collect();
         if !digests.is_empty() {
             self.tx_cert_requests
-                .send((digests, requestor))
+                .send(crate::helper::RepairRequest::Proposals(digests, requestor))
                 .await
                 .expect("Failed to enqueue leader repair");
         }

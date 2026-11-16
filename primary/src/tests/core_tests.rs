@@ -10,7 +10,7 @@ struct Harness {
     core: Core,
     events: Receiver<ConsensusMessage>,
     outgoing: Receiver<VoteDispatch>,
-    _repairs: Receiver<(Vec<Digest>, PublicKey)>,
+    _repairs: Receiver<crate::helper::RepairRequest>,
     _parents: Receiver<ProposerMessage>,
     _headers: Receiver<crate::header_waiter::WaiterMessage>,
     cleanup: Receiver<Vec<Certificate>>,

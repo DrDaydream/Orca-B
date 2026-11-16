@@ -11,6 +11,11 @@ use network::SimpleSender;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
+pub(crate) enum RepairRequest {
+    Proposals(Vec<Digest>, PublicKey),
+    Votes(Vec<Digest>, PublicKey),
+}
+
 /// A task dedicated to help other authorities by replying to their certificates requests.
 pub struct Helper {
     /// The committee information.
@@ -18,7 +23,7 @@ pub struct Helper {
     /// The persistent storage.
     store: Store,
     /// Input channel to receive certificates requests.
-    rx_primaries: Receiver<(Vec<Digest>, PublicKey)>,
+    rx_primaries: Receiver<RepairRequest>,
     /// A network sender to reply to the sync requests.
     network: SimpleSender,
     tx_votes: Sender<VoteDispatch>,
@@ -28,7 +33,7 @@ impl Helper {
     pub fn spawn(
         committee: Committee,
         store: Store,
-        rx_primaries: Receiver<(Vec<Digest>, PublicKey)>,
+        rx_primaries: Receiver<RepairRequest>,
         tx_votes: Sender<VoteDispatch>,
     ) {
         tokio::spawn(async move {
@@ -45,7 +50,11 @@ impl Helper {
     }
 
     async fn run(&mut self) {
-        while let Some((digests, origin)) = self.rx_primaries.recv().await {
+        while let Some(request) = self.rx_primaries.recv().await {
+            let (digests, origin, include_payload) = match request {
+                RepairRequest::Proposals(digests, origin) => (digests, origin, true),
+                RepairRequest::Votes(digests, origin) => (digests, origin, false),
+            };
             // TODO [issue #195]: Do some accounting to prevent bad nodes from monopolizing our resources.
 
             // get the requestors address.
@@ -76,6 +85,9 @@ impl Helper {
                         })
                         .await
                         .expect("Failed to enqueue repair votes");
+                }
+                if !include_payload {
+                    continue;
                 }
                 match load_proposal(&mut self.store, &digest).await {
                     Ok(Some(proposal)) => {
