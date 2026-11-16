@@ -104,7 +104,12 @@ impl Connection {
     async fn run(&mut self) {
         // Try to connect to the peer.
         let (mut writer, mut reader) = match TcpStream::connect(self.address).await {
-            Ok(stream) => Framed::new(stream, LengthDelimitedCodec::new()).split(),
+            Ok(stream) => {
+                if let Err(e) = stream.set_nodelay(true) {
+                    warn!("Failed to enable TCP_NODELAY for {}: {}", self.address, e);
+                }
+                Framed::new(stream, LengthDelimitedCodec::new()).split()
+            }
             Err(e) => {
                 warn!(
                     "{}",

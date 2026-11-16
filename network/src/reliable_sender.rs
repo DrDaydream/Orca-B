@@ -143,6 +143,11 @@ impl Connection {
         loop {
             match TcpStream::connect(self.address).await {
                 Ok(stream) => {
+                    // GRBC already batches votes; release small frames promptly
+                    // even while earlier TCP data is awaiting acknowledgement.
+                    if let Err(e) = stream.set_nodelay(true) {
+                        warn!("Failed to enable TCP_NODELAY for {}: {}", self.address, e);
+                    }
                     info!("Outgoing connection established with {}", self.address);
 
                     // Reset the delay.

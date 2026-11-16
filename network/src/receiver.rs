@@ -67,6 +67,10 @@ impl<Handler: MessageHandler> Receiver<Handler> {
     /// using the provided handler.
     async fn spawn_runner(socket: TcpStream, peer: SocketAddr, handler: Handler) {
         tokio::spawn(async move {
+            // Application ACKs are small frames too.
+            if let Err(e) = socket.set_nodelay(true) {
+                warn!("Failed to enable TCP_NODELAY for {}: {}", peer, e);
+            }
             let transport = Framed::new(socket, LengthDelimitedCodec::new());
             let (mut writer, mut reader) = transport.split();
             while let Some(frame) = reader.next().await {
