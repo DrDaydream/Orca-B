@@ -1,0 +1,22 @@
+{
+    "key": {
+        "name": "orca-amazon",
+        "path": "/home/ubuntu/.ssh/orca-amazon.pem"
+    },
+    "port": 3000,
+    "repo": {
+        "name": "Orca-B",
+        "url": "https://github.com/DrDaydream/Orca-B.git",
+        "branch": "orca-b-preparsed-vote-keys"
+    },
+    "instances": {
+        "type": "m5.8xlarge",
+        "regions": [
+            "us-east-1",
+            "eu-north-1",
+            "ap-southeast-2",
+            "us-west-1",
+            "ap-northeast-1"
+        ]
+    }
+}

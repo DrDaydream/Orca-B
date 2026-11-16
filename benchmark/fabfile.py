@@ -90,23 +90,24 @@ def install(ctx):
         Bench(ctx).install()
     except BenchError as e:
         Print.error(e)
+        raise
 
 
 @task
 def remote(ctx, debug=False):
-    ''' Run benchmarks on AWS '''
+    ''' Prepare the AWS testbed and run one benchmark '''
     bench_params = {
-        'faults': 3,
-        'nodes': [10],
+        'faults': 0,
+        'nodes': [20],
         'workers': 1,
         'collocate': True,
-        'rate': [10_000, 110_000],
+        'rate': [50_000],
         'tx_size': 512,
-        'duration': 300,
-        'runs': 2,
+        'duration': 80,
+        'runs': 1,
     }
     node_params = {
-        'header_size': 1_000,  # bytes
+        'header_size': 20,  # bytes
         'max_header_delay': 200,  # ms
         'gc_depth': 50,  # rounds
         'sync_retry_delay': 10_000,  # ms
@@ -118,6 +119,7 @@ def remote(ctx, debug=False):
         Bench(ctx).run(bench_params, node_params, debug)
     except BenchError as e:
         Print.error(e)
+        raise
 
 
 @task
