@@ -1,13 +1,13 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 import subprocess
 from math import ceil
-from os.path import basename, splitext
 from time import sleep
 
 from benchmark.commands import CommandMaker
 from benchmark.adversary_schedule import build_client_schedules, client_silence_slot_ms
 from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameters, ConfigError
 from benchmark.logs import LogParser, ParseError
+from benchmark.local_processes import LocalProcesses
 from benchmark.utils import Print, BenchError, PathMaker
 
 
@@ -15,6 +15,7 @@ class LocalBench:
     BASE_PORT = 3000
 
     def __init__(self, bench_parameters_dict, node_parameters_dict):
+        self.processes = LocalProcesses()
         try:
             self.bench_parameters = BenchParameters(bench_parameters_dict)
             self.node_parameters = NodeParameters(node_parameters_dict)
@@ -25,16 +26,10 @@ class LocalBench:
         return getattr(self.bench_parameters, attr)
 
     def _background_run(self, command, log_file):
-        name = splitext(basename(log_file))[0]
-        cmd = f'{command} 2> {log_file}'
-        subprocess.run(['tmux', 'new', '-d', '-s', name, cmd], check=True)
+        self.processes.start(command, log_file)
 
     def _kill_nodes(self):
-        try:
-            cmd = CommandMaker.kill().split()
-            subprocess.run(cmd, stderr=subprocess.DEVNULL)
-        except subprocess.SubprocessError as e:
-            raise BenchError('Failed to kill testbed', e)
+        self.processes.stop()
 
     def run(self, debug=False):
         assert isinstance(debug, bool)
@@ -125,13 +120,14 @@ class LocalBench:
 
             # Wait for all transactions to be processed.
             Print.info(f'Running benchmark ({self.duration} sec)...')
-            sleep(self.duration)
+            self.processes.wait(self.duration)
             self._kill_nodes()
 
             # Parse logs and return the parser.
             Print.info('Parsing logs...')
             return LogParser.process(PathMaker.logs_path(), faults=self.faults)
 
-        except (subprocess.SubprocessError, ParseError) as e:
-            self._kill_nodes()
+        except (OSError, subprocess.SubprocessError, ParseError, RuntimeError) as e:
             raise BenchError('Failed to run benchmark', e)
+        finally:
+            self._kill_nodes()

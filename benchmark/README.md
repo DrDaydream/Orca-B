@@ -2,6 +2,10 @@
 This document explains how to benchmark the codebase and read benchmarks' results. It also provides a step-by-step tutorial to run benchmarks on [Amazon Web Services (AWS)](https://aws.amazon.com) accross multiple data centers (WAN).
 
 ## Local Benchmarks
+For the fixed MystenLabs/narwhal comparison, use [COMPARISON.md](COMPARISON.md).
+Both runners accept `fab local --nodes 20 --header-size 20 --duration 20`
+and report final ordered commits in the same fixed measurement window.
+
 When running benchmarks, the codebase is automatically compiled with the feature flag `benchmark`. This enables the node to print some special log entries that are then read by the python scripts and used to compute performance. These special log entries are clearly indicated with comments in the code: make sure to not alter them (otherwise the benchmark scripts will fail to interpret the logs).
 
 ### Parametrize the benchmark
