@@ -5,6 +5,127 @@ use crate::vote_sender::VoteDispatch;
 use crypto::{Hash as _, Signature};
 use tokio::net::TcpListener;
 
+#[test]
+fn proposal_header_is_tracked_while_bulk_decode_is_waiting() {
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpStream;
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // Occupy the validation pool until this scope exits, including on a
+        // failed assertion. Receiving a complete frame must still make progress.
+        let (_release, blocked) = std::sync::mpsc::channel::<()>();
+        let (started, running) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = blocked.recv();
+        });
+        running.await.unwrap();
+
+        let in_flight = ProposalTracker::default();
+        let (tx_remote_proposals, mut rx_bulk) = channel(1);
+        let handler = PrimaryReceiverHandler {
+            tx_primary_messages: channel(1).0,
+            tx_remote_proposals,
+            tx_cert_requests: channel(1).0,
+            in_flight: in_flight.clone(),
+        };
+        let mut p = proposal();
+        let batch = vec![42; MAX_PROPOSAL_BYTES];
+        let digest = batch_digest(&batch);
+        p.header.payload.clear();
+        p.batches.clear();
+        p.header.payload.insert(digest.clone(), 0);
+        p.batches.insert(digest, batch);
+        p.header.id = p.header.digest();
+        p.header.signature = Signature::new(&p.header.id, &keys().pop().unwrap().1);
+        p.verify(&committee()).unwrap();
+        let wire = Bytes::from(bincode::serialize(&PrimaryMessage::Proposal(p.clone())).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (mut writer, _) = Framed::new(server, LengthDelimitedCodec::new()).split();
+        let mut client = Framed::new(client, LengthDelimitedCodec::new());
+        let ingress = tokio::spawn(async move {
+            handler.dispatch(&mut writer, wire).await.unwrap();
+            writer.close().await.unwrap();
+        });
+        let ack = tokio::time::timeout(Duration::from_secs(2), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&ack[..], b"Ack");
+        assert!(
+            in_flight.contains(&p.block().digest()),
+            "A received proposal must be tracked before its ACK even while validation is busy"
+        );
+        assert!(
+            rx_bulk.try_recv().is_err(),
+            "Bulk decoding must remain outside the runtime"
+        );
+        drop(_release);
+        let (decoded, guard) = tokio::time::timeout(Duration::from_secs(2), rx_bulk.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.header, p.header);
+        assert_eq!(decoded.batches, p.batches);
+        drop(guard);
+        assert!(!in_flight.contains(&p.block().digest()));
+        ingress.await.unwrap();
+    });
+}
+
+#[tokio::test]
+async fn malformed_proposal_releases_ingress_tracking_without_delivery() {
+    use futures::StreamExt;
+    use tokio::net::TcpStream;
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    let in_flight = ProposalTracker::default();
+    let (tx_remote_proposals, mut rx_bulk) = channel(1);
+    let handler = PrimaryReceiverHandler {
+        tx_primary_messages: channel(1).0,
+        tx_remote_proposals,
+        tx_cert_requests: channel(1).0,
+        in_flight: in_flight.clone(),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let _client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let (mut writer, _) = Framed::new(server, LengthDelimitedCodec::new()).split();
+    for size in [1, 128 * 1024] {
+        let mut p = proposal();
+        p.batches = std::iter::once((Digest([42; 32]), vec![42; size])).collect();
+        let mut wire = bincode::serialize(&PrimaryMessage::Proposal(p.clone())).unwrap();
+        wire.pop(); // Preserve the header, but truncate the last batch.
+        assert!(handler
+            .dispatch(&mut writer, Bytes::from(wire))
+            .await
+            .is_err());
+        assert!(!in_flight.contains(&p.block().digest()));
+        assert!(rx_bulk.try_recv().is_err());
+    }
+    // A tiny frame cannot justify allocating its claimed author-string length.
+    let mut malformed = 0u32.to_le_bytes().to_vec();
+    malformed.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert!(handler
+        .dispatch(&mut writer, Bytes::from(malformed))
+        .await
+        .is_err());
+    assert!(rx_bulk.try_recv().is_err());
+}
+
 #[tokio::test]
 async fn dependency_repair_with_local_payload_does_not_download_it_again() {
     use crate::header_waiter::{HeaderWaiter, WaiterMessage};
@@ -194,15 +315,7 @@ async fn echo_and_ready_bypass_a_blocked_proposal_connection() {
         .await
         .unwrap()
         .unwrap();
-    // ACK precedes blocking-task decoding. Wait for decoded ingress so this
-    // checks the full-queue case, not an incidental decoding/transport race.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !in_flight.contains(&p.block().digest()) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    assert!(in_flight.contains(&p.block().digest()));
     let (tx_votes, rx_votes) = channel(10);
     spawn_vote_sender(keys()[0].0, c, Arc::new(AtomicU64::new(0)), 50, rx_votes);
     for phase in [GrbcPhase::Echo, GrbcPhase::Ready] {

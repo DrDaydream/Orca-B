@@ -14,6 +14,7 @@ use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
 use crate::vote_sender::spawn_vote_sender;
 use async_trait::async_trait;
+use bincode::Options as _;
 use bytes::Bytes;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
@@ -381,8 +382,48 @@ impl MessageHandler for AbaReceiverHandler {
 #[async_trait]
 impl MessageHandler for PrimaryReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+        // Proposal is variant zero in the existing fixed-int bincode format.
+        // Parse its header once, before ACK I/O or blocking-pool scheduling.
+        // Tracking only suppresses repair; validation still precedes ECHO.
+        let proposal = if serialized.starts_with(&0u32.to_le_bytes()) {
+            let mut remaining = &serialized[4..];
+            let header = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .with_limit(remaining.len() as u64)
+                .deserialize_from(&mut remaining)
+                .map_err(DagError::SerializationError)?;
+            let guard = self.in_flight.track(&header);
+            let batches = serialized.slice(serialized.len() - remaining.len()..);
+            Some((header, guard, batches))
+        } else {
+            None
+        };
+
         // Reply with an ACK.
         let _ = writer.send(Bytes::from("Ack")).await;
+
+        if let Some((header, guard, bytes)) = proposal {
+            let large = serialized.len() > 64 * 1024;
+            drop(serialized); // Release the full frame when the decoder finishes.
+            let decode = move || {
+                crate::batch_bytes::deserialize(&mut bincode::Deserializer::from_slice(
+                    &bytes,
+                    bincode::DefaultOptions::new()
+                        .with_fixint_encoding()
+                        .allow_trailing_bytes(),
+                ))
+            };
+            let batches = if large {
+                tokio::task::spawn_blocking(decode).await??
+            } else {
+                decode().map_err(DagError::SerializationError)?
+            };
+            self.tx_remote_proposals
+                .send((Proposal { header, batches }, guard))
+                .await
+                .expect("Failed to enqueue remote proposal");
+            return Ok(());
+        }
 
         // Large frames decode away from runtime threads. Independent TCP
         // connections and queues let votes bypass a full bulk proposal queue.
@@ -393,14 +434,7 @@ impl MessageHandler for PrimaryReceiverHandler {
             bincode::deserialize(&serialized).map_err(DagError::SerializationError)?
         };
         match message {
-            PrimaryMessage::Proposal(proposal) => {
-                // Register before waiting for space in the bounded bulk queue.
-                let guard = self.in_flight.track(&proposal.header);
-                self.tx_remote_proposals
-                    .send((proposal, guard))
-                    .await
-                    .expect("Failed to enqueue remote proposal");
-            }
+            PrimaryMessage::Proposal(_) => unreachable!("Proposal was decoded above"),
             PrimaryMessage::CertificatesRequest(missing, requestor) => self
                 .tx_cert_requests
                 .send(RepairRequest::Proposals(missing, requestor))
