@@ -1,4 +1,5 @@
 *.json
+!benchmark/settings.example.json
 .DS_Store
 .storage_*
 .*storage*

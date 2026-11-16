@@ -111,137 +111,102 @@ This command first recompiles your code in `release` mode (and with the `benchma
 The 'Consensus TPS' and 'Consensus latency' respectively report the average throughput and latency without considering the client. The consensus latency thus refers to the time elapsed between the block's creation and its commit. In contrast, 'End-to-end TPS' and 'End-to-end latency' report the performance of the whole system, starting from when the client submits the transaction. The end-to-end latency is often called 'client-perceived latency'. To accurately measure this value without degrading performance, the client periodically submits 'sample' transactions that are tracked across all the modules until they get committed into a block; the benchmark scripts use sample transactions to estimate the end-to-end latency.
 
 ## AWS Benchmarks
-This repo integrates various python scripts to deploy and benchmark the codebase on [Amazon Web Services (AWS)](https://aws.amazon.com). They are particularly useful to run benchmarks in the WAN, across multiple data centers. This section provides a step-by-step tutorial explaining how to use them.
 
-### Step 1. Set up your AWS credentials
-Set up your AWS credentials to enable programmatic access to your account from your local machine. These credentials will authorize your machine to create, delete, and edit instances on your AWS account programmatically. First of all, [find your 'access key id' and 'secret access key'](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-quickstart.html#cli-configure-quickstart-creds). Then, create a file `~/.aws/credentials` with the following content:
-```
-[default]
-aws_access_key_id = YOUR_ACCESS_KEY_ID
-aws_secret_access_key = YOUR_SECRET_ACCESS_KEY
-```
-Do not specify any AWS region in that file as the python scripts will allow you to handle multiple regions programmatically.
+### Ubuntu 24.04 controller and testbed
 
-### Step 2. Add your SSH public key to your AWS account
-You must now [add your SSH public key to your AWS account](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-key-pairs.html). This operation is manual (AWS exposes little APIs to manipulate keys) and needs to be repeated for each AWS region that you plan to use. Upon importing your key, AWS requires you to choose a 'name' for your key; ensure you set the same name on all AWS regions. This SSH key will be used by the python scripts to execute commands and upload/download files to your AWS instances.
-If you don't have an SSH key, you can create one using [ssh-keygen](https://www.ssh.com/ssh/keygen/):
-```
-$ ssh-keygen -f ~/.ssh/aws
+Run Fabric from the outer `benchmark` directory containing `fabfile.py`.
+The controller needs the Python packages in `requirements.txt`, an RSA SSH
+private key, and AWS API credentials. An attached EC2 IAM role works through
+Boto3's normal credential lookup; a named AWS profile is only needed if it
+actually exists on the controller. An SSH key pair name is independent of an
+AWS credential profile name.
+
+The checked-in `settings.example.json` configures `orca-amazon`, its private key
+path, the Orca-B development branch, and `m5.8xlarge` in five regions. Copy it
+once to create the local configuration:
+
+```bash
+cd /home/ubuntu/experiments/Orca-B-grbc/benchmark
+cp -n settings.example.json settings.json
 ```
 
-### Step 3. Configure the testbed
-The file [settings.json](https://github.com/asonnino/narwhal/blob/master/benchmark/settings.json) (located in [narwhal/benchmarks](https://github.com/asonnino/narwhal/blob/master/benchmark)) contains all the configuration parameters of the testbed to deploy. Its content looks as follows:
-```json
-{
-    "key": {
-        "name": "aws",
-        "path": "/absolute/key/path"
-    },
-    "port": 5000,
-    "repo": {
-        "name": "narwhal",
-        "url": "https://github.com/asonnino/narwhal.git",
-        "branch": "master"
-    },
-    "instances": {
-        "type": "m5d.8xlarge",
-        "regions": ["us-east-1", "eu-north-1", "ap-southeast-2", "us-west-1", "ap-northeast-1"]
-    }
-}
-```
-The first block (`key`) contains information regarding your SSH key:
-```json
-"key": {
-    "name": "aws",
-    "path": "/absolute/key/path"
-},
-```
-Enter the name of your SSH key; this is the name you specified in the AWS web console in step 2. Also, enter the absolute path of your SSH private key (using a relative path won't work). 
+Edit the private key path and other settings for your environment. The local
+`settings.json` is ignored by Git. Import the same RSA public key under the name
+`orca-amazon` in every configured region; keep the private key on the controller.
+Use Ubuntu 24.04 x86_64 instances with public IPv4 connectivity. The instance
+manager discovers the latest available Canonical Ubuntu 24.04 image in each region.
 
+For this EC2 controller, using the attached IAM role:
 
-The second block (`ports`) specifies the TCP ports to use:
-```json
-"port": 5000,
+```bash
+cd /home/ubuntu/experiments/Orca-B-grbc/benchmark
+unset AWS_PROFILE AWS_DEFAULT_PROFILE
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+fab info
 ```
-Narwhal requires a number of TCP ports, depening on the number of workers per node, Each primary requires 2 ports (one to receive messages from other primaties and one to receive messages from its workers), and each worker requires 3 ports (one to receive client transactions, one to receive messages from its primary, and one to receive messages from other workers). Note that the script will open a large port range (5000-7000) to the WAN on all your AWS instances. 
 
-The third block (`repo`) contains the information regarding the repository's name, the URL of the repo, and the branch containing the code to deploy: 
-```json
-"repo": {
-    "name": "narwhal",
-    "url": "https://github.com/asonnino/narwhal.git",
-    "branch": "master"
-},
-```
-Remember to update the `url` field to the name of your repo. Modifying the branch name is particularly useful when testing new functionalities without having to checkout the code locally. 
+### Create the testbed
 
-The the last block (`instances`) specifies the [AWS instance type](https://aws.amazon.com/ec2/instance-types) and the [AWS regions](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html#concepts-available-regions) to use:
-```json
-"instances": {
-    "type": "m5d.8xlarge",
-    "regions": ["us-east-1", "eu-north-1", "ap-southeast-2", "us-west-1", "ap-northeast-1"]
-}
-```
-The instance type selects the hardware on which to deploy the testbed. For example, `m5d.8xlarge` instances come with 32 vCPUs (16 physical cores), 128 GB of RAM, and guarantee 10 Gbps of bandwidth. The python scripts will configure each instance with 300 GB of SSD hard drive. The `regions` field specifies the data centers to use. If you require more nodes than data centers, the python scripts will distribute the nodes as equally as possible amongst the data centers. All machines run a fresh install of Ubuntu Server 20.04.
+If the testbed has not been created, the following creates four instances in
+**each** of the five regions, for 20 instances total:
 
-### Step 4. Create a testbed
-The AWS instances are orchestrated with [Fabric](http://www.fabfile.org) from the file [fabfile.py](https://github.com/asonnino/narwhal/blob/master/benchmark/fabfile.pyy) (located in [narwhal/benchmarks](https://github.com/asonnino/narwhal/blob/master/benchmark)); you can list all possible commands as follows:
+```bash
+cd /home/ubuntu/experiments/Orca-B-grbc/benchmark
+fab create --nodes 4
+fab info
 ```
-$ cd narwhal/benchmark
-$ fab --list
-```
-The command `fab create` creates new AWS instances; open [fabfile.py](https://github.com/asonnino/narwhal/blob/master/benchmark/fabfile.py) and locate the `create` task:
-```python
-@task
-def create(ctx, nodes=2):
-    ...
-```
-The parameter `nodes` determines how many instances to create in *each* AWS region. That is, if you specified 5 AWS regions as in the example of step 3, setting `nodes=2` will creates a total of 10 machines:
-```
-$ fab create
 
-Creating 10 instances |██████████████████████████████| 100.0% 
-Waiting for all instances to boot...
-Successfully created 10 new instances
-```
-You can then clone the repo and install rust on the remote instances with `fab install`:
-```
-$ fab install
+Each instance has a 200 GiB gp2 root volume. Creation adds instances on each
+invocation; inspect partial results before retrying a failed creation. The
+manager identifies instances by `Name=dag-node`, so keep the controller and
+unrelated instances outside that tag. The default `dag` security group opens SSH
+and the benchmark's TCP port range; restrict access to your deployment's sources.
 
-Installing rust and cloning the repo...
-Initialized testbed of 10 nodes
-```
-This may take a long time as the command will first update all instances.
-The commands `fab stop` and `fab start` respectively stop and start the testbed without destroying it (it is good practice to stop the testbed when not in use as AWS can be quite expensive); and `fab destroy` terminates all instances and destroys the testbed. Note that, depending on the instance types, AWS instances may take up to several minutes to fully start or stop. The command `fab info` displays a nice summary of all available machines and information to manually connect to them (for debug).
+### Run directly with Fabric
 
-### Step 5. Run a benchmark
-After setting up the testbed, running a benchmark on AWS is similar to running it locally (see [Run Local Benchmarks](https://github.com/asonnino/narwhal/tree/master/benchmark#local-benchmarks)). Locate the task `remote` in [fabfile.py](https://github.com/asonnino/narwhal/blob/master/benchmark/fabfile.py):
-```python
-@task
-def remote(ctx):
-    ...
-```
-The benchmark parameters are similar to [local benchmarks](https://github.com/asonnino/narwhal/tree/master/benchmark#local-benchmarks) but allow to specify the number of nodes and the input rate as arrays to automate multiple benchmarks with a single command. The parameter `runs` specifies the number of times to repeat each benchmark (to later compute the average and stdev of the results), and the parameter `collocate` specifies whether to collocate all the node's workers and the primary on the same machine. If `collocate` is set to `False`, the script will run one node per data center (AWS region), with its primary and each of its worker running on a dedicated instance.
-```python
-bench_params = {
-    'nodes': [10, 20, 30],
-    'workers: 2,
-    'collocate': True,
-    'rate': [20_000, 30_000, 40_000],
-    'tx_size': 512,
-    'faults': 0,
-    'duration': 300,
-    'runs': 2,
-}
-```
-Similarly to local benchmarks, the scripts will deploy as many clients as workers and divide the input rate equally amongst each client. Each client is colocated with a worker, and only submit transactions to the worker with whom they share the machine.
+Once the instances exist, run:
 
-Once you specified both `bench_params` and `node_params` as desired, run:
+```bash
+cd /home/ubuntu/experiments/Orca-B-grbc/benchmark
+fab remote
 ```
-$ fab remote
-```
-This command first updates all machines with the latest commit of the GitHub repo and branch specified in your file [settings.json](https://github.com/asonnino/narwhal/blob/master/benchmark/settings.json) (step 3); this ensures that benchmarks are always run with the latest version of the code. It then generates and uploads the configuration files to each machine, runs the benchmarks with the specified parameters, and downloads the logs. It finally parses the logs and prints the results into a folder called `results` (which is automatically created if it doesn't already exists). You can run `fab remote` multiple times without fearing to override previous results, the command either appends new results to a file containing existing ones or prints them in separate files. If anything goes wrong during a benchmark, you can always stop it by running `fab kill`.
- 
+
+`fab remote` checks the controller and selected instances for the native build
+dependencies, including Clang 14, libclang 14, tmux, and chrony. It installs missing
+packages and Rust 1.85.0, waits for clock synchronization, and clones the configured
+repository on new instances. Existing packages and the installed Rust toolchain
+are reused. `fab install` remains available to prepare the environment separately.
+Both commands require sudo access for system packages and services.
+
+All selected instances then fetch the configured branch and check out the
+controller's current **HEAD commit**, rather than independently choosing the
+latest branch tip. Update the controller first when testing a newer commit. That
+commit must be available in the configured remote repository; uncommitted Rust
+changes on the controller are not deployed. A reused testbed checkout with
+uncommitted tracked changes is rejected before compilation; save or revert those
+changes before retrying. The runner uses Rust 1.85.0 and the
+repository's Cargo configuration, clearing environment overrides for Rust flags
+and Tokio worker threads. This enables the configured hardware CRC32C build on
+compatible x86_64 CPUs.
+
+The default remote experiment uses 20 nodes, one collocated worker per node,
+`faults=0`, a total input rate of 50,000 tx/s, 512-byte transactions, an 80-second
+runtime parameter, one run, and a 20-byte header size. Set the desired parameters
+in `remote()` in `fabfile.py`. Keep one node count, one input rate, and `runs=1`
+per invocation to avoid reusing committee or database state between configurations.
+The runtime parameter excludes dependency preparation, compilation, and log transfer.
+
+Results are printed in the terminal and appended under `results/`; downloaded
+raw logs are placed under `logs/`. Save raw logs and the controller commit before
+another run because the runner replaces `logs/`. A failed installation, build,
+or benchmark is reported as an error to the calling shell.
+
+`fab kill` stops benchmark processes; it does not stop EC2 instances. `fab stop`
+stops the testbed, `fab start --max 4` starts up to four instances per region, and
+`fab destroy` terminates the tagged instances. These commands operate on the
+`Name=dag-node` instances in all configured regions. Stopped instances retain
+their EBS volumes.
+
 ### Step 6. Plot the results
 Once you have enough results, you can aggregate and plot them:
 ```

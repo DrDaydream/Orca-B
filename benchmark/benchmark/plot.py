@@ -54,7 +54,7 @@ class Ploter:
 
     def _natural_keys(self, text):
         def try_cast(text): return int(text) if text.isdigit() else text
-        return [try_cast(c) for c in split('(\d+)', text)]
+        return [try_cast(c) for c in split(r'(\d+)', text)]
 
     def _tps(self, data):
         values = findall(r' TPS: (\d+) \+/- (\d+)', data)
