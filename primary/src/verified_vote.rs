@@ -2,7 +2,7 @@
 use crate::error::DagResult;
 use crate::messages::{GrbcPhase, GrbcVote, Header};
 use config::Committee;
-use crypto::{PublicKey, SignatureService};
+use crypto::{PublicKey, SignatureService, SignatureVerifier};
 use std::ops::Deref;
 
 /// Not deserializable or mutable: only verification or local signing creates it.
@@ -10,8 +10,12 @@ use std::ops::Deref;
 pub(crate) struct VerifiedGrbcVote(GrbcVote);
 
 impl VerifiedGrbcVote {
-    pub(crate) fn verify(vote: GrbcVote, committee: &Committee) -> DagResult<Self> {
-        vote.verify(committee)?;
+    pub(crate) fn verify(
+        vote: GrbcVote,
+        committee: &Committee,
+        verifier: &SignatureVerifier,
+    ) -> DagResult<Self> {
+        vote.verify(committee, verifier)?;
         Ok(Self(vote))
     }
 

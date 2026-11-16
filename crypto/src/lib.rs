@@ -6,6 +6,7 @@ use rand::rngs::OsRng;
 use rand::{CryptoRng, RngCore};
 use serde::{de, ser, Deserialize, Serialize};
 use std::array::TryFromSliceError;
+use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use tokio::sync::mpsc::{channel, Sender};
@@ -198,8 +199,12 @@ impl Signature {
     }
 
     pub fn verify(&self, digest: &Digest, public_key: &PublicKey) -> Result<(), CryptoError> {
-        let signature = ed25519::signature::Signature::from_bytes(&self.flatten())?;
         let key = dalek::PublicKey::from_bytes(&public_key.0)?;
+        self.verify_with_key(digest, &key)
+    }
+
+    fn verify_with_key(&self, digest: &Digest, key: &dalek::PublicKey) -> Result<(), CryptoError> {
+        let signature = ed25519::signature::Signature::from_bytes(&self.flatten())?;
         key.verify_strict(&digest.0, &signature)
     }
 
@@ -216,6 +221,35 @@ impl Signature {
             keys.push(dalek::PublicKey::from_bytes(&key.0)?);
         }
         dalek::verify_batch(&messages[..], &signatures[..], &keys[..])
+    }
+}
+
+/// Immutable, fixed-size key set. Reuse decoded points, never verification results.
+pub struct SignatureVerifier(HashMap<PublicKey, dalek::PublicKey>);
+
+impl SignatureVerifier {
+    pub fn new(keys: impl IntoIterator<Item = PublicKey>) -> Self {
+        // An undecodable configured key must fail verification without stopping
+        // valid committee members. Missing entries always fail the lookup below.
+        Self(
+            keys.into_iter()
+                .filter_map(|key| {
+                    dalek::PublicKey::from_bytes(&key.0)
+                        .ok()
+                        .map(|parsed| (key, parsed))
+                })
+                .collect(),
+        )
+    }
+
+    pub fn verify(
+        &self,
+        signature: &Signature,
+        digest: &Digest,
+        author: &PublicKey,
+    ) -> Result<(), CryptoError> {
+        let key = self.0.get(author).ok_or_else(CryptoError::new)?;
+        signature.verify_with_key(digest, key)
     }
 }
 

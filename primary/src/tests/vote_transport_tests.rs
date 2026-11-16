@@ -222,7 +222,9 @@ async fn echo_and_ready_bypass_a_blocked_proposal_connection() {
                 assert_eq!(batch.phase, phase);
                 let votes = batch.into_votes();
                 assert_eq!(votes.len(), 1);
-                votes[0].verify(&committee()).unwrap();
+                let c = committee();
+                let verifier = crypto::SignatureVerifier::new(c.authorities.keys().copied());
+                votes[0].verify(&c, &verifier).unwrap();
             }
             _ => panic!("Expected vote over independent connection"),
         }

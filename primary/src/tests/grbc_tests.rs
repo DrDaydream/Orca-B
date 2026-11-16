@@ -2,26 +2,39 @@ use super::GrbcVotesAggregator;
 use crate::common::{committee, header, keys, proposal, votes};
 use crate::messages::{batch_digest, GrbcPhase, GrbcVoteBatch};
 use crate::verified_vote::VerifiedGrbcVote;
-use crypto::{Hash as _, Signature};
+use crypto::{Hash as _, Signature, SignatureVerifier};
 
 #[test]
 fn echo_and_ready_are_independent_and_duplicates_do_not_add_weight() {
     let h = header();
     let c = committee();
+    let verifier = SignatureVerifier::new(c.authorities.keys().copied());
     let mut state = GrbcVotesAggregator::new();
     for v in votes(&h, GrbcPhase::Echo).into_iter().take(3) {
         assert!(state
-            .append(&VerifiedGrbcVote::verify(v.clone(), &c).unwrap(), &c, &h)
+            .append(
+                &VerifiedGrbcVote::verify(v.clone(), &c, &verifier).unwrap(),
+                &c,
+                &h
+            )
             .unwrap());
         assert!(!state
-            .append(&VerifiedGrbcVote::verify(v.clone(), &c).unwrap(), &c, &h)
+            .append(
+                &VerifiedGrbcVote::verify(v.clone(), &c, &verifier).unwrap(),
+                &c,
+                &h
+            )
             .unwrap());
     }
     assert_eq!(state.echo_weight, 3);
     assert_eq!(state.ready_weight, 0);
     for v in votes(&h, GrbcPhase::Ready).into_iter().take(3) {
         state
-            .append(&VerifiedGrbcVote::verify(v.clone(), &c).unwrap(), &c, &h)
+            .append(
+                &VerifiedGrbcVote::verify(v.clone(), &c, &verifier).unwrap(),
+                &c,
+                &h,
+            )
             .unwrap();
     }
     assert_eq!(state.ready_weight, 3);
@@ -30,6 +43,8 @@ fn echo_and_ready_are_independent_and_duplicates_do_not_add_weight() {
 #[test]
 fn signatures_bind_phase_sender_instance_and_header() {
     let h = header();
+    let c = committee();
+    let verifier = SignatureVerifier::new(c.authorities.keys().copied());
     let vote = votes(&h, GrbcPhase::Echo).remove(0);
     for field in 0..5 {
         let mut forged = vote.clone();
@@ -40,14 +55,14 @@ fn signatures_bind_phase_sender_instance_and_header() {
             3 => forged.author = keys()[1].0,
             _ => forged.origin = keys()[1].0,
         }
-        assert!(forged.verify(&committee()).is_err());
+        assert!(forged.verify(&c, &verifier).is_err());
     }
     let mut other_header = h.clone();
     other_header.round += 1;
     assert!(GrbcVotesAggregator::new()
         .append(
-            &VerifiedGrbcVote::verify(vote, &committee()).unwrap(),
-            &committee(),
+            &VerifiedGrbcVote::verify(vote, &c, &verifier).unwrap(),
+            &c,
             &other_header
         )
         .is_err());
@@ -74,6 +89,29 @@ fn proposal_requires_exact_payload_and_fixed_dag_metadata() {
 }
 
 #[test]
+fn parsed_keys_do_not_override_committee_membership() {
+    let h = header();
+    let c = committee();
+    let verifier = SignatureVerifier::new(c.authorities.keys().copied());
+    let vote = votes(&h, GrbcPhase::Echo).remove(0);
+    vote.verify(&c, &verifier).unwrap();
+    for name in [vote.author, vote.origin] {
+        let mut zero_stake = c.clone();
+        zero_stake.authorities.get_mut(&name).unwrap().stake = 0;
+        assert!(matches!(
+            vote.verify(&zero_stake, &verifier),
+            Err(crate::error::DagError::UnknownAuthority(_))
+        ));
+        let mut missing = c.clone();
+        missing.authorities.remove(&name);
+        assert!(matches!(
+            vote.verify(&missing, &verifier),
+            Err(crate::error::DagError::UnknownAuthority(_))
+        ));
+    }
+}
+
+#[test]
 fn wire_vote_batch_cannot_mix_senders_or_phases() {
     let h = header();
     let echoes = votes(&h, GrbcPhase::Echo);
@@ -85,5 +123,7 @@ fn wire_vote_batch_cannot_mix_senders_or_phases() {
     .is_none());
     let batch = GrbcVoteBatch::from_votes(vec![echoes[0].clone()]).unwrap();
     let restored = batch.into_votes();
-    restored[0].verify(&committee()).unwrap();
+    let c = committee();
+    let verifier = SignatureVerifier::new(c.authorities.keys().copied());
+    restored[0].verify(&c, &verifier).unwrap();
 }

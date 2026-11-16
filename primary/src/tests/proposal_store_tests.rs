@@ -257,9 +257,12 @@ async fn helper_recovers_complete_proposal_before_local_ready() {
         rx_votes,
     );
     crate::helper::Helper::spawn(c, store, rx, tx_votes);
-    tx.send(crate::helper::RepairRequest::Proposals(vec![digest], requestor))
-        .await
-        .unwrap();
+    tx.send(crate::helper::RepairRequest::Proposals(
+        vec![digest],
+        requestor,
+    ))
+    .await
+    .unwrap();
     let frames = tokio::time::timeout(std::time::Duration::from_secs(5), receiver)
         .await
         .unwrap()
@@ -276,7 +279,9 @@ async fn helper_recovers_complete_proposal_before_local_ready() {
             PrimaryMessage::GrbcVoteBatch(batch) => {
                 let recovered = batch.into_votes();
                 assert_eq!(recovered.len(), 1);
-                recovered[0].verify(&committee()).unwrap();
+                let c = committee();
+                let verifier = crypto::SignatureVerifier::new(c.authorities.keys().copied());
+                recovered[0].verify(&c, &verifier).unwrap();
                 assert_eq!(
                     bincode::serialize(&recovered[0]).unwrap(),
                     bincode::serialize(&vote).unwrap()

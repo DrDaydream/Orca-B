@@ -77,6 +77,57 @@ fn verify_invalid_signature() {
 }
 
 #[test]
+fn fixed_key_verifier_keeps_authentication_strict() {
+    let pairs = keys();
+    let verifier = SignatureVerifier::new(pairs.iter().take(2).map(|(key, _)| *key));
+    let digest = Digest([7; 32]);
+    let signature = Signature::new(&digest, &pairs[0].1);
+
+    for _ in 0..3 {
+        verifier.verify(&signature, &digest, &pairs[0].0).unwrap();
+        assert!(verifier
+            .verify(&signature, &Digest([8; 32]), &pairs[0].0)
+            .is_err());
+        assert!(verifier.verify(&signature, &digest, &pairs[1].0).is_err());
+        assert!(verifier
+            .verify(&Signature::default(), &digest, &pairs[0].0)
+            .is_err());
+    }
+    let outsider = Signature::new(&digest, &pairs[2].1);
+    assert!(outsider.verify(&digest, &pairs[2].0).is_ok());
+    assert!(verifier.verify(&outsider, &digest, &pairs[2].0).is_err());
+
+    // A decodable point is not sufficient: keep verify_strict's rejection of
+    // small-order keys, even for an identity R with scalar zero.
+    let mut identity = [0; 32];
+    identity[0] = 1;
+    let weak_key = PublicKey(identity);
+    let weak_signature = Signature {
+        part1: identity,
+        part2: [0; 32],
+    };
+    let verifier = SignatureVerifier::new([weak_key]);
+    assert!(weak_signature.verify(&digest, &weak_key).is_err());
+    assert!(verifier
+        .verify(&weak_signature, &digest, &weak_key)
+        .is_err());
+}
+
+#[test]
+fn invalid_configured_key_does_not_disable_valid_members() {
+    let (public, secret) = keys().pop().unwrap();
+    let invalid = (0u8..=255)
+        .map(|byte| PublicKey([byte; 32]))
+        .find(|key| dalek::PublicKey::from_bytes(&key.0).is_err())
+        .unwrap();
+    let verifier = SignatureVerifier::new([public, invalid]);
+    let digest = Digest([9; 32]);
+    let signature = Signature::new(&digest, &secret);
+    verifier.verify(&signature, &digest, &public).unwrap();
+    assert!(verifier.verify(&signature, &digest, &invalid).is_err());
+}
+
+#[test]
 fn verify_valid_batch() {
     // Make signatures.
     let message: &[u8] = b"Hello, world!";
