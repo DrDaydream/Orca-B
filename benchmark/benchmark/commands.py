@@ -21,7 +21,7 @@ class CommandMaker:
     def compile():
         # remote.py invokes cargo from <repo>/node, while the benchmark
         # aliases expect binaries under <repo>/target/release.
-        return 'cargo build --target-dir ../target --quiet --release --features benchmark'
+        return 'cargo build --locked --target-dir ../target --quiet --release --features benchmark'
 
     @staticmethod
     def generate_key(filename):

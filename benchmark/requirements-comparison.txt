@@ -1,0 +1,5 @@
+fabric==3.2.3
+boto3==1.34.162
+matplotlib==3.9.2
+multiaddr==0.0.9
+python-dateutil==2.9.0.post0

@@ -1,6 +1,7 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from datetime import datetime
 from glob import glob
+from math import ceil, isfinite
 from multiprocessing import Pool
 from os.path import join
 from re import findall, search
@@ -110,27 +111,27 @@ class LogParser:
         return merged
 
     def _parse_clients(self, log):
-        if search(r'Error', log) is not None:
+        if search(r'(?:panicked|Error|ERROR)', log) is not None:
             raise ParseError('Client(s) panicked')
 
         size = int(search(r'Transactions size: (\d+)', log).group(1))
         rate = int(search(r'Transactions rate: (\d+)', log).group(1))
 
-        tmp = search(r'\[(.*Z) .* Start ', log).group(1)
+        tmp = search(r'\[?(\d{4}-\S+Z) .* Start ', log).group(1)
         start = self._to_posix(tmp)
 
         misses = len(findall(r'rate too high', log))
 
-        tmp = findall(r'\[(.*Z) .* sample transaction (\d+)', log)
+        tmp = findall(r'\[?(\d{4}-\S+Z) .* sample transaction (\d+)', log)
         samples = {int(s): self._to_posix(t) for t, s in tmp}
 
         return size, rate, start, misses, samples
 
     def _parse_primaries(self, log):
-        if search(r'(?:panicked|Error)', log) is not None:
+        if search(r'(?:panicked|Error|ERROR)', log) is not None:
             raise ParseError('Primary(s) panicked')
 
-        tmp = findall(r'\[(.*Z) .* Created B\d+\([^ ]+\) -> ([^ ]+=)', log)
+        tmp = findall(r'\[?(\d{4}-\S+Z) .* Created B\d+\([^ ]+\) -> ([^ ]+=)', log)
         tmp = [(d, self._to_posix(t)) for t, d in tmp]
         proposals = self._merge_results([tmp])
 
@@ -141,7 +142,7 @@ class LogParser:
         )
         tmp = [(d, int(t) / 1_000) for d, t in tmp]
         if not tmp:
-            tmp = findall(r'\[(.*Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)', log)
+            tmp = findall(r'\[?(\d{4}-\S+Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)', log)
             tmp = [(d, self._to_posix(t)) for t, d in tmp]
         commits = self._merge_results([tmp])
 
@@ -155,14 +156,14 @@ class LogParser:
         tmp = [(d, int(t) / 1_000) for d, t in tmp]
         if not tmp:
             tmp = findall(
-                r'\[(.*Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)', log
+                r'\[?(\d{4}-\S+Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)', log
             )
             tmp = [(d, self._to_posix(t)) for t, d in tmp]
         final_commits = self._merge_results([tmp])
 
-        tmp = findall(r'\[(.*Z) .* Header created round \d+ digest (\S+)', log)
+        tmp = findall(r'\[?(\d{4}-\S+Z) .* Header created round \d+ digest (\S+)', log)
         header_proposals = self._merge_results([[(d, self._to_posix(t)) for t, d in tmp]])
-        tmp = findall(r'\[(.*Z) .* Header committed round \d+ digest (\S+) leader (true|false)', log)
+        tmp = findall(r'\[?(\d{4}-\S+Z) .* Header committed round \d+ digest (\S+) leader (true|false)', log)
         header_commits = {d: (self._to_posix(t), leader == 'true') for t, d, leader in tmp}
         outcomes = findall(
             r'Leader outcome round (\d+) digest (\S+) rule ([123]) '
@@ -201,7 +202,7 @@ class LogParser:
             # summaries combined rule outcomes and ordering samples.
             tmp = findall(r'Leader commit-ready round \d+ digest (\S+) at (\d+)', log)
             leader_ready = {d: int(t) / 1_000 for d, t in tmp}
-            tmp = findall(r'\[(.*Z) .* Header rule-ordered round \d+ digest (\S+)', log)
+            tmp = findall(r'\[?(\d{4}-\S+Z) .* Header rule-ordered round \d+ digest (\S+)', log)
             rule_orders = self._merge_results(
                 [[(d, self._to_posix(t)) for t, d in tmp]]
             )
@@ -240,12 +241,12 @@ class LogParser:
             ),
         }
 
-        ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
+        ip = search(r'booted on (?:/ip4/)?(\d+(?:\.\d+){3})', log).group(1)
         
         return proposals, commits, final_commits, header_proposals, header_commits, leader_ready, rule_orders, commit_rules, aba_durations, configs, ip
 
     def _parse_workers(self, log):
-        if search(r'(?:panic|Error)', log) is not None:
+        if search(r'(?:panic|Error|ERROR)', log) is not None:
             raise ParseError('Worker(s) panicked')
 
         tmp = findall(r'Batch ([^ ]+) contains (\d+) B', log)
@@ -254,7 +255,7 @@ class LogParser:
         tmp = findall(r'Batch ([^ ]+) contains sample tx (\d+)', log)
         samples = {int(s): d for d, s in tmp}
 
-        ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
+        ip = search(r'booted on (?:/ip4/)?(\d+(?:\.\d+){3})', log).group(1)
 
         return sizes, samples, ip
 
@@ -313,6 +314,71 @@ class LogParser:
                     assert tx_id in sent
                     latency += [self.final_commits[batch_id] - sent[tx_id]]
         return mean(latency) if latency else 0
+
+    def comparison_metrics(self, duration):
+        """First-replica final commits in [first client Start, Start + duration).
+
+        Unlike the legacy SUMMARY, a commit plateau does not shorten this
+        window. Unfinished samples are counted, never assigned zero latency.
+        The caller must keep the processes alive for the entire window.
+        """
+        if not isfinite(duration) or duration <= 0:
+            raise ValueError('Comparison duration must be positive and finite')
+        if len(set(self.size)) != 1:
+            raise ParseError('Comparison requires equal transaction sizes')
+        if len(self.sent_samples) != len(self.received_samples):
+            raise ParseError('Comparison requires one client log per worker log')
+        start = min(self.start)
+        end = start + duration
+        commits = {d: t for d, t in self.final_commits.items() if start <= t < end}
+        if any(d not in self.sizes or d not in self.proposals for d in commits):
+            raise ParseError('Final commit is missing its batch size or proposal')
+        consensus = [t - self.proposals[d] for d, t in commits.items()]
+        sent_count, e2e = 0, []
+        for sent, received in zip(self.sent_samples, self.received_samples):
+            for tx_id, sent_at in sent.items():
+                if start <= sent_at < end:
+                    sent_count += 1
+                    batch = received.get(tx_id)
+                    if batch in commits:
+                        e2e.append(commits[batch] - sent_at)
+        if any(t < 0 for t in consensus + e2e):
+            raise ParseError('Negative final latency: check clocks and log completeness')
+        e2e.sort()
+        completed = len(e2e)
+        transactions = sum(self.sizes[d] for d in commits) / self.size[0]
+        return {
+            'window_seconds': duration,
+            'window_start': start,
+            'final_batches': len(commits),
+            'final_transactions': transactions,
+            'final_tps': transactions / duration,
+            'final_consensus_mean_ms': mean(consensus) * 1000 if consensus else None,
+            'final_e2e_mean_ms': mean(e2e) * 1000 if e2e else None,
+            'final_e2e_p95_ms': e2e[ceil(0.95 * completed) - 1] * 1000 if e2e else None,
+            'sample_sent': sent_count,
+            'sample_completed': completed,
+            'sample_unfinished': sent_count - completed,
+            'sample_completion_ratio': completed / sent_count if sent_count else None,
+        }
+
+    def print_comparison(self, duration, filename='comparison.json'):
+        from json import dump
+
+        metrics = self.comparison_metrics(duration)
+        with open(filename, 'w') as output:
+            dump(metrics, output, indent=2, allow_nan=False)
+            output.write('\n')
+        display = lambda value: f'{value:,.1f}' if value is not None else 'N/A'
+        print(
+            f' FINAL ORDERED COMPARISON ({duration:g} s, first replica):\n'
+            f" Final TPS: {metrics['final_tps']:,.1f} tx/s\n"
+            f" Final consensus mean: {display(metrics['final_consensus_mean_ms'])} ms\n"
+            f" Final end-to-end mean: {display(metrics['final_e2e_mean_ms'])} ms\n"
+            f" Final end-to-end p95: {display(metrics['final_e2e_p95_ms'])} ms\n"
+            f" Samples completed/sent: {metrics['sample_completed']}/{metrics['sample_sent']}\n"
+            f" Samples unfinished at cutoff: {metrics['sample_unfinished']}\n"
+        )
 
     def _header_latency_stats(self):
         non_leaders, all_headers, leader_times = [], [], []
@@ -425,8 +491,15 @@ class LogParser:
     def process(cls, directory, faults=0):
         assert isinstance(directory, str)
 
+        client_files = sorted(glob(join(directory, 'client-*.log')))
+        worker_files = sorted(glob(join(directory, 'worker-*.log')))
+        if [x.rsplit('client-', 1)[1] for x in client_files] != [
+            x.rsplit('worker-', 1)[1] for x in worker_files
+        ]:
+            raise ParseError('Client and worker log identities do not match')
+
         clients = []
-        for filename in sorted(glob(join(directory, 'client-*.log'))):
+        for filename in client_files:
             with open(filename, 'r') as f:
                 clients += [f.read()]
         primaries = []
@@ -434,7 +507,7 @@ class LogParser:
             with open(filename, 'r') as f:
                 primaries += [f.read()]
         workers = []
-        for filename in sorted(glob(join(directory, 'worker-*.log'))):
+        for filename in worker_files:
             with open(filename, 'r') as f:
                 workers += [f.read()]
 

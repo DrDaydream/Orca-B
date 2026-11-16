@@ -10,18 +10,18 @@ from benchmark.remote import Bench, BenchError
 
 
 @task
-def local(ctx, debug=False):
+def local(ctx, debug=False, nodes=4, duration=20, header_size=1000):
     ''' Run benchmarks on localhost '''
     bench_params = {
         'faults': 0,
-        'nodes': 4,
+        'nodes': nodes,
         'workers': 1,
         'rate': 50_000,
         'tx_size': 512,
-        'duration': 20,
+        'duration': duration,
     }
     node_params = {
-        'header_size': 1_000,  # bytes
+        'header_size': header_size,  # bytes
         'max_header_delay': 200,  # ms
         'gc_depth': 50,  # rounds
         'sync_retry_delay': 10_000,  # ms
@@ -32,8 +32,10 @@ def local(ctx, debug=False):
     try:
         ret = LocalBench(bench_params, node_params).run(debug)
         print(ret.result())
+        ret.print_comparison(duration, 'logs/comparison.json')
     except BenchError as e:
         Print.error(e)
+        raise
 
 
 @task
