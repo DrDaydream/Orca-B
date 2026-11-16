@@ -31,6 +31,129 @@ fn with_payload() -> Proposal {
     p
 }
 
+#[tokio::test]
+async fn local_proposal_broadcast_does_not_wait_for_storage_but_delivery_does() {
+    use crate::proposal_processor::{spawn_proposal_processors, ProposalTracker};
+    use std::sync::{atomic::AtomicU64, Arc};
+    use store::StoreCommand;
+    use tokio::time::{timeout, Duration};
+
+    let p = with_payload();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut c = committee();
+    for authority in c.authorities.values_mut() {
+        authority.primary.primary_to_primary = listener.local_addr().unwrap();
+    }
+    let (tx_store, mut rx_store) = channel(10);
+    let (tx_local, rx_local) = channel(1);
+    let (_tx_remote, rx_remote) = channel(1);
+    let (tx_stored, mut rx_stored) = channel(1);
+    let tracker = ProposalTracker::default();
+    spawn_proposal_processors(
+        p.header.author,
+        c,
+        Store::from_channel(tx_store),
+        Arc::new(AtomicU64::new(0)),
+        50,
+        rx_remote,
+        rx_local,
+        tx_stored,
+        tracker.clone(),
+    );
+    tx_local.send(p.header.clone()).await.unwrap();
+
+    // Serve the already sealed local batches, then hold the atomic write ACK.
+    let ack = loop {
+        match timeout(Duration::from_secs(5), rx_store.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            StoreCommand::Read(key, response) => {
+                let bytes = p
+                    .batches
+                    .iter()
+                    .find(|(d, _)| batch_key(d) == key)
+                    .unwrap()
+                    .1;
+                response.send(Ok(Some(bytes.clone()))).unwrap();
+            }
+            StoreCommand::WriteBatchIfAbsent(entries, response) => {
+                assert_eq!(entries.len(), p.batches.len() + 1);
+                assert_eq!(
+                    entries[&proposal_header_key(&p.block().digest())],
+                    bincode::serialize(&p.header).unwrap()
+                );
+                break response;
+            }
+            _ => panic!("Unexpected storage operation"),
+        }
+    };
+    let (socket, _) = timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .expect("Proposal broadcast must not wait for the local storage ACK")
+        .unwrap();
+    let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
+    let wire = timeout(Duration::from_secs(2), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        wire.as_ref(),
+        bincode::serialize(&PrimaryMessage::Proposal(p.clone())).unwrap()
+    );
+    stream.send(Bytes::from_static(b"Ack")).await.unwrap();
+    assert!(
+        rx_stored.try_recv().is_err(),
+        "Core must not ECHO before storage succeeds"
+    );
+    assert!(tracker.contains(&p.block().digest()));
+    ack.send(Ok(p.batches.len() + 1)).unwrap();
+    let stored = timeout(Duration::from_secs(2), rx_stored.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.into_header(), p.header);
+    assert!(!tracker.contains(&p.block().digest()));
+}
+
+#[tokio::test]
+async fn failed_proposal_storage_does_not_deliver_header_and_releases_tracker() {
+    use crate::proposal_processor::{prepare_proposal, ProposalTracker};
+    use network::ReliableSender;
+    use store::StoreCommand;
+
+    let p = with_payload();
+    let digest = p.block().digest();
+    let tracker = ProposalTracker::default();
+    let guard = tracker.track(&p.header);
+    let (tx_store, mut rx_store) = channel(1);
+    let mut store = Store::from_channel(tx_store);
+    let mut network = ReliableSender::new();
+    let prepare = prepare_proposal(
+        p,
+        committee(),
+        &mut store,
+        Some((&mut network, Vec::new())),
+        Some(guard),
+    );
+    let fail_write = async {
+        match rx_store.recv().await.unwrap() {
+            StoreCommand::WriteBatchIfAbsent(_, ack) => {
+                // RocksDB's error constructor is private; an invalid path
+                // supplies a real storage error without creating another DB.
+                let error = Store::new("\0").err().unwrap();
+                ack.send(Err(error)).unwrap();
+            }
+            _ => panic!("Unexpected storage operation"),
+        }
+    };
+    let (result, ()) = tokio::join!(prepare, fail_write);
+    assert!(matches!(result, Err(DagError::StoreError(_))));
+    assert!(!tracker.contains(&digest));
+}
+
 #[test]
 fn complete_proposal_decoding_reads_payloads_in_bulk() {
     struct CountingReader<'a> {
@@ -300,13 +423,13 @@ async fn proposal_processor_rejects_changed_bytes_even_for_a_known_header() {
     let p = with_payload();
     let digest = p.block().digest();
     let prepare = crate::proposal_processor::prepare_proposal;
-    let (stored, _) = prepare(p.clone(), committee(), &mut store, false, None)
+    let (stored, _) = prepare(p.clone(), committee(), &mut store, None, None)
         .await
         .unwrap();
     assert_eq!(stored.into_header(), p.header);
     let mut forged = p.clone();
     forged.batches.values_mut().next().unwrap()[0] ^= 1;
-    assert!(prepare(forged, committee(), &mut store, false, None)
+    assert!(prepare(forged, committee(), &mut store, None, None)
         .await
         .is_err());
     let restored = load_proposal(&mut store, &digest).await.unwrap().unwrap();

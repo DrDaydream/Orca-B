@@ -26,6 +26,12 @@ pub struct Store {
 }
 
 impl Store {
+    /// Test-only actor injection for controlling storage acknowledgements.
+    #[cfg(feature = "test-utils")]
+    pub fn from_channel(channel: Sender<StoreCommand>) -> Self {
+        Self { channel }
+    }
+
     pub fn new(path: &str) -> StoreResult<Self> {
         let db = rocksdb::DB::open_default(path)?;
         let mut obligations = HashMap::<_, VecDeque<oneshot::Sender<_>>>::new();

@@ -662,7 +662,7 @@ async fn actual_commit_completes_a_stored_unregistered_proposal_without_votes() 
         p.clone(),
         committee(),
         &mut h.core.store,
-        false,
+        None,
         Some(guard),
     )
     .await
@@ -774,7 +774,7 @@ async fn committed_parent_batch_unlocks_dependencies_and_counts_with_grbc_once()
             p.clone(),
             committee(),
             &mut h.core.store,
-            false,
+            None,
             None,
         )
         .await
@@ -1123,7 +1123,7 @@ async fn commit_feedback_is_serviced_inside_a_hot_vote_burst() {
         p.clone(),
         committee(),
         &mut h.core.store,
-        false,
+        None,
         None,
     )
     .await
@@ -1165,7 +1165,7 @@ async fn in_flight_proposal_suppresses_repair_through_core_registration() {
         p.clone(),
         committee(),
         &mut h.core.store,
-        false,
+        None,
         Some(guard),
     )
     .await
@@ -1207,7 +1207,7 @@ async fn failed_duplicate_and_cancelled_proposals_release_repair_suppression() {
         invalid,
         committee(),
         &mut h.core.store,
-        false,
+        None,
         Some(guard)
     )
     .await
@@ -1343,7 +1343,7 @@ async fn large_vote_vector_yields_to_stored_headers_and_preserves_remaining_work
         later.clone(),
         committee(),
         &mut h.core.store,
-        false,
+        None,
         Some(guard),
     )
     .await
@@ -1405,7 +1405,7 @@ async fn proposal_completed_during_a_vote_burst_is_serviced_by_the_next_burst() 
         later.clone(),
         committee(),
         &mut h.core.store,
-        false,
+        None,
         None,
     )
     .await

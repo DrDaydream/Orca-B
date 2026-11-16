@@ -172,7 +172,7 @@ impl Core {
             proposal,
             self.committee.clone(),
             &mut self.store,
-            false,
+            None,
             None,
         )
         .await?;
