@@ -37,6 +37,7 @@ impl Harness {
                 name,
                 quorum_threshold: c.quorum_threshold(),
                 validity_threshold: c.validity_threshold(),
+                vote_verifier: SignatureVerifier::new(c.authorities.keys().copied()),
                 committee: c,
                 store,
                 synchronizer: sync,

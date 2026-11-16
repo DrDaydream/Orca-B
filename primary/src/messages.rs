@@ -2,7 +2,7 @@
 use crate::error::{DagError, DagResult};
 use crate::primary::Round;
 use config::{Committee, WorkerId};
-use crypto::{Digest, Hash, PublicKey, Signature, SignatureService};
+use crypto::{Digest, Hash, PublicKey, Signature, SignatureService, SignatureVerifier};
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
 use serde::{Deserialize, Serialize};
@@ -275,7 +275,7 @@ impl GrbcVote {
         vote
     }
 
-    pub fn verify(&self, committee: &Committee) -> DagResult<()> {
+    pub fn verify(&self, committee: &Committee, verifier: &SignatureVerifier) -> DagResult<()> {
         ensure!(
             committee.stake(&self.author) > 0,
             DagError::UnknownAuthority(self.author)
@@ -284,8 +284,8 @@ impl GrbcVote {
             committee.stake(&self.origin) > 0,
             DagError::UnknownAuthority(self.origin)
         );
-        self.signature
-            .verify(&self.digest(), &self.author)
+        verifier
+            .verify(&self.signature, &self.digest(), &self.author)
             .map_err(DagError::from)
     }
 

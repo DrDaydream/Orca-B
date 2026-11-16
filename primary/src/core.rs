@@ -15,7 +15,7 @@ use crate::vote_sender::VoteDispatch;
 use bytes::Bytes;
 use config::{Committee, Stake};
 use crypto::Hash as _;
-use crypto::{Digest, PublicKey, SignatureService};
+use crypto::{Digest, PublicKey, SignatureService, SignatureVerifier};
 use log::{debug, error, warn};
 use network::{CancelHandler, ReliableSender};
 use std::collections::{HashMap, HashSet};
@@ -39,6 +39,7 @@ pub struct Core {
     name: PublicKey,
     /// The committee information.
     committee: Committee,
+    vote_verifier: SignatureVerifier,
     /// Fixed committee thresholds, computed once rather than for every vote.
     quorum_threshold: Stake,
     validity_threshold: Stake,
@@ -125,6 +126,7 @@ impl Core {
                 name,
                 quorum_threshold: committee.quorum_threshold(),
                 validity_threshold: committee.validity_threshold(),
+                vote_verifier: SignatureVerifier::new(committee.authorities.keys().copied()),
                 committee,
                 store,
                 synchronizer,
@@ -519,7 +521,7 @@ impl Core {
             vote.round >= self.gc_round,
             DagError::TooOld(vote.id.clone(), vote.round)
         );
-        let vote = VerifiedGrbcVote::verify(vote, &self.committee)?;
+        let vote = VerifiedGrbcVote::verify(vote, &self.committee, &self.vote_verifier)?;
         if !self.proposal_headers.contains_key(&vote.id) {
             let digest = vote.block_digest();
             let pending = self.pending_votes.entry(vote.id.clone()).or_default();
