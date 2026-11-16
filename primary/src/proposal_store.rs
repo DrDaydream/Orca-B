@@ -20,6 +20,7 @@ pub(crate) async fn store_verified_proposal(
         .collect();
     entries.insert(proposal_header_key(&digest), bincode::serialize(&header)?);
     store.write_batch_if_absent(entries).await?;
+    log::debug!(target: "orca_latency", "stage=stored id={:?} round={}", header.id, header.round);
     Ok(header)
 }
 

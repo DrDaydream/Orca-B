@@ -193,6 +193,8 @@ impl Proposer {
             wire_bytes += size as u64 + 76;
             payload.insert(digest, worker);
         }
+        debug!(target: "orca_latency", "stage=payload_selected round={} bytes={} remaining={}",
+            self.round, bytes, self.digests.len());
         // Freeze every edge and payload digest before the first network message.
         let header = Header::new(
             self.name,
@@ -276,6 +278,7 @@ impl Proposer {
                     self.last_virtual_edges = virtual_edges;
                 }
                 Some((digest, worker_id, size)) = self.rx_workers.recv() => {
+                    debug!(target: "orca_latency", "stage=batch_queued id={:?} bytes={}", digest, size);
                     self.payload_size += digest.size();
                     self.digests.push_back((digest, worker_id, size));
                 }

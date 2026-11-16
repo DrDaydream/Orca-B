@@ -42,7 +42,9 @@ class CommandMaker:
         if (not adversary_seed.isascii() or not adversary_seed.isdigit()
                 or int(adversary_seed) > 2**64 - 1):
             raise ValueError('ORCA_ADVERSARY_SEED must be an unsigned 64-bit integer')
-        return (f'ORCA_FAULTS={faults} ORCA_RULE3_BEHAVIOR={rule3_behavior} '
+        # Explicitly forward the opt-in filter to remote primary processes too.
+        trace = 'RUST_LOG=info,orca_latency=debug ' if environ.get('ORCA_LATENCY_TRACE') == '1' else ''
+        return (f'{trace}ORCA_FAULTS={faults} ORCA_RULE3_BEHAVIOR={rule3_behavior} '
                 f'ORCA_ADVERSARY_SEED={adversary_seed} '
                 f'./node {v} run --keys {keys} --committee {committee} '
                 f'--store {store} --parameters {parameters} primary')
