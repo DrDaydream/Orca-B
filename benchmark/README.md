@@ -62,6 +62,20 @@ Once you specified both `bench_params` and `node_params` as desired, run:
 ```
 $ fab local
 ```
+On x86_64 Linux, the repository's Cargo configuration enables SSE4.2 and PCLMUL
+for RocksDB hardware CRC32C. Every server running this binary must support both
+CPU features. The flags do not apply to ARM or Windows targets. Existing
+`RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS` environment variables override Cargo's
+configured flags; unset them to use the repository defaults. A change to these
+flags triggers recompilation, so the first run can spend longer in
+`Setting up testbed...`.
+
+After the run, check the primary and worker database logs from this directory:
+```bash
+grep -H 'Fast CRC32 supported' .db-*/LOG
+```
+Each database should report `Supported on x86`.
+
 This command first recompiles your code in `release` mode (and with the `benchmark` feature flag activated), thus ensuring you always benchmark the latest version of your code. This may take a long time the first time you run it. It then generates the configuration files and keys for each node, and runs the benchmarks with the specified parameters. It finally parses the logs and displays a summary of the execution similarly to the one below. All the configuration and key files are hidden JSON files; i.e., their name starts with a dot (`.`), such as `.committee.json`.
 ```
 -----------------------------------------

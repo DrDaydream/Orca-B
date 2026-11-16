@@ -8,3 +8,9 @@ CLANG_PATH = { value = "/usr/bin/clang-14", force = true }
 CC = { value = "/usr/bin/clang-14", force = true }
 CXX = { value = "/usr/bin/clang++-14", force = true }
 CXXFLAGS = { value = "-include cstdint", force = true }
+
+# Enable RocksDB's hardware CRC32C path for the Ubuntu x86_64 testbed.
+# librocksdb-sys reads these features to enable SSE4.2 and PCLMUL in C++.
+# Every machine running this Linux binary must support both CPU features.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+sse4.2,+pclmulqdq"]
