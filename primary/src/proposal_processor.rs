@@ -9,6 +9,7 @@ use crypto::{Digest, Hash as _, PublicKey};
 use log::{debug, warn};
 use network::{CancelHandler, ReliableSender};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use store::Store;
@@ -77,13 +78,14 @@ pub(crate) async fn prepare_proposal(
     proposal: Proposal,
     committee: Committee,
     store: &mut Store,
-    outbound: bool,
+    outbound: Option<(&mut ReliableSender, Vec<SocketAddr>)>,
     in_flight: Option<ProposalGuard>,
-) -> DagResult<(StoredProposalHeader, Option<Bytes>)> {
+) -> DagResult<(StoredProposalHeader, Vec<CancelHandler>)> {
+    let serialize = outbound.is_some();
     let (proposal, bytes) = tokio::task::spawn_blocking(move || {
         proposal.verify(&committee)?;
         let message = PrimaryMessage::Proposal(proposal);
-        let bytes = if outbound {
+        let bytes = if serialize {
             Some(Bytes::from(bincode::serialize(&message)?))
         } else {
             None
@@ -95,8 +97,21 @@ pub(crate) async fn prepare_proposal(
     })
     .await
     .expect("Proposal validation task failed")?;
-    let header = store_verified_proposal(store, proposal).await?;
-    Ok((StoredProposalHeader(header, in_flight), bytes))
+    // Validation precedes both operations. Network transmission need not wait
+    // for our disk, while Core still receives the header only after storage.
+    // join! reuses this task and preserves backpressure on the local producer.
+    let broadcast = async {
+        match outbound {
+            Some((network, addresses)) => {
+                network
+                    .broadcast(addresses, bytes.expect("Missing outbound proposal"))
+                    .await
+            }
+            None => Vec::new(),
+        }
+    };
+    let (handlers, header) = tokio::join!(broadcast, store_verified_proposal(store, proposal));
+    Ok((StoredProposalHeader(header?, in_flight), handlers))
 }
 
 fn report(result: DagResult<()>) {
@@ -149,7 +164,7 @@ pub(crate) fn spawn_proposal_processors(
                         proposal,
                         remote_committee.clone(),
                         &mut remote_store,
-                        false,
+                        None,
                         Some(guard),
                     )
                     .await?;
@@ -189,10 +204,11 @@ pub(crate) fn spawn_proposal_processors(
                         let round = header.round;
                         let guard = in_flight.track(&header);
                         let proposal = assemble_proposal(&mut store, header).await?;
-                        let (header, bytes) = prepare_proposal(proposal, committee.clone(), &mut store, true, Some(guard)).await?;
-                        pending.entry(round).or_default().extend(
-                            network.broadcast(addresses.clone(), bytes.expect("Missing outbound proposal")).await
-                        );
+                        let (header, handlers) = prepare_proposal(
+                            proposal, committee.clone(), &mut store,
+                            Some((&mut network, addresses.clone())), Some(guard),
+                        ).await?;
+                        pending.entry(round).or_default().extend(handlers);
                         tx.send(header).await.expect("Failed to deliver local proposal");
                         Ok(())
                     }.await);

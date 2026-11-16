@@ -26,3 +26,6 @@ network = { path = "../network" }
 
 [features]
 benchmark = []
+
+[dev-dependencies]
+store = { path = "../store", features = ["test-utils"] }

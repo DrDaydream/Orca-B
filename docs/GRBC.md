@@ -11,9 +11,10 @@ primary vote/certificate dissemination with one complete-proposal protocol.
    does not broadcast to peer workers or spawn `QuorumWaiter`.
 2. **Proposer primary:** selects batches, fixes the author, round, payload
    digest/worker-id map, strong parents, weak edges and virtual edges, and
-   signs that header. A dedicated proposal task loads the bytes, validates and
-   stores the complete proposal, then broadcasts `Proposal`. This
-   is the first cross-authority data transmission.
+   signs that header. A dedicated proposal task loads and validates the bytes,
+   then broadcasts the complete `Proposal` concurrently with its atomic local
+   storage operation. This is the first cross-authority data transmission.
+   Local Core delivery still waits for successful storage before ECHO checks.
 3. **Every primary:** verifies the signed header and the exact payload digest
    map, retains the complete data, and checks the required DAG dependencies.
    It broadcasts one signed `ECHO` for each `(origin, round)` instance.
