@@ -50,7 +50,16 @@ impl Helper {
     }
 
     async fn run(&mut self) {
-        while let Some(request) = self.rx_primaries.recv().await {
+        let mut last_proposal: Option<(Digest, Bytes)> = None;
+        loop {
+            // Drop the shared wire buffer before waiting; never wait to fill a batch.
+            if self.rx_primaries.is_empty() {
+                last_proposal = None;
+            }
+            let request = match self.rx_primaries.recv().await {
+                Some(request) => request,
+                None => break,
+            };
             let (digests, origin, include_payload) = match request {
                 RepairRequest::Proposals(digests, origin) => (digests, origin, true),
                 RepairRequest::Votes(digests, origin) => (digests, origin, false),
@@ -89,18 +98,28 @@ impl Helper {
                 if !include_payload {
                     continue;
                 }
-                match load_proposal(&mut self.store, &digest).await {
-                    Ok(Some(proposal)) => {
-                        let bytes = tokio::task::spawn_blocking(move || {
-                            bincode::serialize(&PrimaryMessage::Proposal(proposal))
-                        })
-                        .await
-                        .expect("Proposal response task failed")
-                        .expect("Failed to serialize proposal response");
-                        self.network.send(address, Bytes::from(bytes)).await;
+                // Only immutable proposal bytes are reused. Votes above always come from storage.
+                if last_proposal
+                    .as_ref()
+                    .map_or(true, |(cached, _)| cached != &digest)
+                {
+                    last_proposal = None;
+                    match load_proposal(&mut self.store, &digest).await {
+                        Ok(Some(proposal)) => {
+                            let bytes = tokio::task::spawn_blocking(move || {
+                                bincode::serialize(&PrimaryMessage::Proposal(proposal))
+                            })
+                            .await
+                            .expect("Proposal response task failed")
+                            .expect("Failed to serialize proposal response");
+                            last_proposal = Some((digest, Bytes::from(bytes)));
+                        }
+                        Ok(None) => (),
+                        Err(e) => error!("{}", e),
                     }
-                    Ok(None) => (),
-                    Err(e) => error!("{}", e),
+                }
+                if let Some((_, bytes)) = &last_proposal {
+                    self.network.send(address, bytes.clone()).await;
                 }
             }
         }

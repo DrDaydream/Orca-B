@@ -32,6 +32,135 @@ fn with_payload() -> Proposal {
 }
 
 #[tokio::test]
+async fn queued_repairs_reuse_payload_but_read_fresh_votes() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use store::StoreCommand;
+    use tokio::time::{timeout, Duration};
+
+    let p = with_payload();
+    let digest = p.block().digest();
+    let vote_key = local_votes_key(&digest);
+    let echo = crate::common::votes(&p.header, GrbcPhase::Echo).remove(0);
+    let ready = crate::common::votes(&p.header, GrbcPhase::Ready).remove(0);
+    let mut values: BTreeMap<_, _> = p
+        .batches
+        .iter()
+        .map(|(digest, bytes)| (batch_key(digest), bytes.clone()))
+        .collect();
+    values.insert(
+        proposal_header_key(&digest),
+        bincode::serialize(&p.header).unwrap(),
+    );
+    let payload_reads = Arc::new(AtomicUsize::new(0));
+    let counted = payload_reads.clone();
+    let (tx_store, mut rx_store) = channel(10);
+    tokio::spawn(async move {
+        let mut vote_reads = 0;
+        while let Some(command) = rx_store.recv().await {
+            match command {
+                StoreCommand::Read(key, reply) => {
+                    let value = if key == vote_key {
+                        vote_reads += 1;
+                        // Model READY becoming available after the first request.
+                        let votes = if vote_reads == 1 {
+                            vec![echo.clone()]
+                        } else {
+                            vec![echo.clone(), ready.clone()]
+                        };
+                        Some(bincode::serialize(&votes).unwrap())
+                    } else {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                        values.get(&key).cloned()
+                    };
+                    reply.send(Ok(value)).unwrap();
+                }
+                _ => panic!("Helper should only read immutable payloads and current votes"),
+            }
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peers = [keys()[1].0, keys()[2].0];
+    let mut c = committee();
+    for peer in peers {
+        c.authorities
+            .get_mut(&peer)
+            .unwrap()
+            .primary
+            .primary_to_primary = listener.local_addr().unwrap();
+    }
+    let (tx_requests, rx_requests) = channel(10);
+    let (tx_votes, mut rx_votes) = channel(10);
+    for peer in peers {
+        tx_requests
+            .send(crate::helper::RepairRequest::Proposals(
+                vec![digest.clone()],
+                peer,
+            ))
+            .await
+            .unwrap();
+    }
+    tx_requests
+        .send(crate::helper::RepairRequest::Votes(
+            vec![digest.clone()],
+            peers[0],
+        ))
+        .await
+        .unwrap();
+    crate::helper::Helper::spawn(c, Store::from_channel(tx_store), rx_requests, tx_votes);
+    let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stream = Framed::new(socket, LengthDelimitedCodec::new());
+    let expected = bincode::serialize(&PrimaryMessage::Proposal(p.clone())).unwrap();
+    for _ in 0..2 {
+        let frame = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&frame[..], &expected);
+        stream.send(Bytes::from_static(b"Ack")).await.unwrap();
+    }
+    for (peer, count) in [(peers[0], 1), (peers[1], 2), (peers[0], 2)] {
+        let dispatch = timeout(Duration::from_secs(5), rx_votes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dispatch.requestor, Some(peer));
+        assert_eq!(dispatch.votes.len(), count);
+    }
+    assert_eq!(
+        payload_reads.load(Ordering::Relaxed),
+        p.batches.len() + 1,
+        "Queued requests for the same proposal must not reread its header and batches"
+    );
+    // Let the helper reach its empty receive queue. A later request must not
+    // retain the old payload allocation through the idle interval.
+    tokio::task::yield_now().await;
+    tx_requests
+        .send(crate::helper::RepairRequest::Proposals(
+            vec![digest],
+            peers[0],
+        ))
+        .await
+        .unwrap();
+    let frame = timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(&frame[..], &expected);
+    assert_eq!(
+        payload_reads.load(Ordering::Relaxed),
+        2 * (p.batches.len() + 1)
+    );
+}
+
+#[tokio::test]
 async fn local_proposal_broadcast_does_not_wait_for_storage_but_delivery_does() {
     use crate::proposal_processor::{spawn_proposal_processors, ProposalTracker};
     use std::sync::{atomic::AtomicU64, Arc};
