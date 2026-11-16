@@ -322,9 +322,11 @@ async fn virtual_dependency_uses_header_without_loading_batch_bytes() {
         .get_parents(&child, &Default::default(), &Default::default())
         .await
         .unwrap();
-    assert!(parents
-        .iter()
-        .any(|parent| parent.header.id == dependency.header.id));
+    assert!(parents.iter().any(
+        |(digest, round, origin)| *digest == dependency.block().digest()
+            && *round == dependency.header.round
+            && *origin == dependency.header.author
+    ));
     // A recovery reply must still refuse to send an incomplete proposal.
     assert!(matches!(
         load_proposal(&mut store, &digest).await,

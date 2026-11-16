@@ -2,9 +2,10 @@
 use crate::error::DagResult;
 use crate::header_waiter::WaiterMessage;
 use crate::messages::{proposal_header_key, Certificate, Header};
+use crate::primary::Round;
 use config::Committee;
-use crypto::Digest;
 use crypto::Hash as _;
+use crypto::{Digest, PublicKey};
 use std::collections::{HashMap, HashSet};
 use store::Store;
 use tokio::sync::mpsc::Sender;
@@ -43,10 +44,13 @@ impl Synchronizer {
         header: &Header,
         ready: &HashMap<Digest, Certificate>,
         completed: &HashSet<Digest>,
-    ) -> DagResult<Vec<Certificate>> {
+    ) -> DagResult<Vec<(Digest, Round, PublicKey)>> {
         let mut missing_required = Vec::new();
         let mut missing_virtual = Vec::new();
         let mut parents = Vec::new();
+        // Dependency validation only needs identity, round and author. Compute
+        // the digest once and leave the immutable header's collections in place.
+        let metadata = |parent: &Certificate| (parent.digest(), parent.round(), parent.origin());
         for digest in header.parents.iter().chain(&header.weak_edges) {
             // READY metadata alone cannot satisfy a strong/weak dependency.
             // Reuse Core's immutable record only after local completion.
@@ -54,7 +58,7 @@ impl Synchronizer {
                 .get(digest)
                 .filter(|c| completed.contains(&c.header.id))
             {
-                parents.push(parent.clone());
+                parents.push(metadata(parent));
                 continue;
             }
             if let Some(genesis) = self
@@ -63,18 +67,18 @@ impl Synchronizer {
                 .find(|(x, _)| x == digest)
                 .map(|(_, x)| x)
             {
-                parents.push(genesis.clone());
+                parents.push(metadata(genesis));
                 continue;
             }
 
             match self.store.read(digest.to_vec()).await? {
-                Some(certificate) => parents.push(bincode::deserialize(&certificate)?),
+                Some(certificate) => parents.push(metadata(&bincode::deserialize(&certificate)?)),
                 None => missing_required.push(digest.clone()),
             };
         }
         for digest in &header.virtual_edges {
             if let Some(parent) = ready.get(digest) {
-                parents.push(parent.clone());
+                parents.push(metadata(parent));
                 continue;
             }
             if let Some((_, genesis)) = self
@@ -82,17 +86,17 @@ impl Synchronizer {
                 .iter()
                 .find(|(candidate, _)| candidate == digest)
             {
-                parents.push(genesis.clone());
+                parents.push(metadata(genesis));
                 continue;
             }
             // Validate the target's signed metadata, not its local grade. One
             // honest node reaching READY does not imply every peer can reach
             // READY, so requiring a local grade here would block honest proposals.
             match self.store.read(proposal_header_key(digest)).await? {
-                Some(bytes) => parents.push(Certificate {
+                Some(bytes) => parents.push(metadata(&Certificate {
                     header: bincode::deserialize(&bytes)?,
                     votes: Vec::new(),
-                }),
+                })),
                 None => missing_virtual.push(digest.clone()),
             }
         }

@@ -448,19 +448,19 @@ impl Core {
         // Check the parent certificates. Ensure the parents form a quorum and are all from the previous round.
         let mut stake = 0;
         let mut parent_authors = HashSet::new();
-        for x in referenced
+        for (_, round, origin) in referenced
             .iter()
-            .filter(|x| header.parents.contains(&x.digest()))
+            .filter(|(digest, _, _)| header.parents.contains(digest))
         {
             ensure!(
-                x.round() + 1 == header.round,
+                *round + 1 == header.round,
                 DagError::MalformedHeader(header.id.clone())
             );
             ensure!(
-                parent_authors.insert(x.origin()),
+                parent_authors.insert(*origin),
                 DagError::MalformedHeader(header.id.clone())
             );
-            stake += self.committee.stake(&x.origin());
+            stake += self.committee.stake(origin);
         }
         ensure!(
             stake >= self.quorum_threshold,
@@ -468,24 +468,24 @@ impl Core {
         );
 
         // Weak edges must point strictly below the previous round.
-        for x in referenced
+        for (_, round, _) in referenced
             .iter()
-            .filter(|x| header.weak_edges.contains(&x.digest()))
+            .filter(|(digest, _, _)| header.weak_edges.contains(digest))
         {
             ensure!(
-                x.round() + 1 < header.round,
+                *round + 1 < header.round,
                 DagError::MalformedHeader(header.id.clone())
             );
         }
 
         // Virtual edges reference grade-1 blocks left in VDag at the end of
         // the immediately preceding round.
-        for x in referenced
+        for (_, round, _) in referenced
             .iter()
-            .filter(|x| header.virtual_edges.contains(&x.digest()))
+            .filter(|(digest, _, _)| header.virtual_edges.contains(digest))
         {
             ensure!(
-                x.round() + 1 == header.round,
+                *round + 1 == header.round,
                 DagError::MalformedHeader(header.id.clone())
             );
         }
