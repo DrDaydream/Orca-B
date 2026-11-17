@@ -2,6 +2,7 @@
 mod error;
 mod receiver;
 mod reliable_sender;
+mod scheduler;
 mod simple_sender;
 
 #[cfg(test)]
@@ -10,4 +11,5 @@ pub mod common;
 
 pub use crate::receiver::{MessageHandler, Receiver, Writer};
 pub use crate::reliable_sender::{CancelHandler, ReliableSender};
+pub use crate::scheduler::{DelayBudget, Delivery, DeliveryPolicy};
 pub use crate::simple_sender::SimpleSender;

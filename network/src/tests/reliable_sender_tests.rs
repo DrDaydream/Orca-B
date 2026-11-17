@@ -1,5 +1,18 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
+
+pub(crate) fn saturated_sender(address: SocketAddr) -> (ReliableSender, impl Sized) {
+    let mut sender = ReliableSender::new();
+    let (tx, rx) = channel(1);
+    let (ack, _receive) = oneshot::channel();
+    tx.try_send(InnerMessage {
+        data: Bytes::from_static(b"occupied"),
+        cancel_handler: ack,
+    })
+    .unwrap();
+    sender.connections.insert(address, tx);
+    (sender, rx)
+}
 use crate::common::listener;
 use futures::future::try_join_all;
 

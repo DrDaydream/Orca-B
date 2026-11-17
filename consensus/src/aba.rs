@@ -8,58 +8,12 @@
 use config::{Committee, Stake};
 use crypto::PublicKey;
 use log::trace;
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 pub type AbaInstance = u64;
 pub type AbaRound = u64;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub enum BinaryValue {
-    Zero,
-    One,
-}
-
-impl BinaryValue {
-    fn index(self) -> usize {
-        match self {
-            Self::Zero => 0,
-            Self::One => 1,
-        }
-    }
-}
-
-impl From<bool> for BinaryValue {
-    fn from(value: bool) -> Self {
-        if value {
-            Self::One
-        } else {
-            Self::Zero
-        }
-    }
-}
-
-impl From<BinaryValue> for bool {
-    fn from(value: BinaryValue) -> Self {
-        value == BinaryValue::One
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum AbaMessageKind {
-    BVal(BinaryValue),
-    Aux(BinaryValue),
-    /// A vote emitted only after the sender has locally decided. A receiver
-    /// terminates after collecting f+1 authenticated votes for one value.
-    Decide(BinaryValue),
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AbaMessage {
-    pub instance: AbaInstance,
-    pub round: AbaRound,
-    pub kind: AbaMessageKind,
-}
+pub use primary::{AbaMessage, AbaMessageKind, BinaryValue};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AbaAction {

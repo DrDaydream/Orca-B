@@ -23,7 +23,8 @@ mod vote_sender;
 mod common;
 
 pub use crate::messages::{
-    Certificate, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GrbcPhase, GrbcVote,
-    GrbcVoteBatch, Header, Proposal, MAX_PROPOSAL_BYTES,
+    AbaMessage, AbaMessageKind, BinaryValue, Certificate, ConsensusCommand, ConsensusMessage,
+    ConsensusNetworkMessage, GrbcPhase, GrbcVote, GrbcVoteBatch, Header, Proposal,
+    MAX_PROPOSAL_BYTES,
 };
 pub use crate::primary::{Primary, PrimaryWorkerMessage, Round, WorkerPrimaryMessage};

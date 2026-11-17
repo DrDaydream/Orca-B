@@ -1,0 +1,158 @@
+"""Explicit benchmark adversaries: parameter validation and primary launch config."""
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+from shlex import quote
+
+U64_MAX = 2**64 - 1
+MODES = {'none': 'none', 'silent': 'silent', 'targeted': 'targeted',
+         'network': 'network', 'a0': 'none', 'a1': 'silent',
+         'a3': 'targeted', 'a5': 'network'}
+DEFAULTS = dict(seed=1, start_round=1, rounds=0, delay_ms=200,
+                max_pending_messages=4096, max_pending_bytes=67108864,
+                bullshark_alternating=True)
+
+
+def _integer(value, name, minimum=0):
+    if isinstance(value, bool) or not (
+            isinstance(value, int) or
+            isinstance(value, str) and value.isascii() and value.isdigit()):
+        raise ValueError(f'{name} must be an integer')
+    value = int(value)
+    if not minimum <= value <= U64_MAX:
+        raise ValueError(f'{name} must be between {minimum} and {U64_MAX}')
+    return value
+
+
+def _boolean(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in ('true', 'false'):
+        return value.lower() == 'true'
+    raise ValueError('bullshark-alternating must be true or false')
+
+
+def validate_adversary(options, protocol, nodes, faults):
+    """Validate before any AWS access, also for callers of Bench.run."""
+    if options is None:
+        return None
+    if not isinstance(options, dict):
+        raise ValueError('adversary must be a parameter dictionary')
+    mode = MODES.get(str(options.get('mode', '')).lower())
+    if mode is None:
+        raise ValueError('adversary must be none, silent, targeted, network, A0, A1, A3 or A5')
+    config = dict(mode=mode)
+    for name, default in DEFAULTS.items():
+        value = options.get(name, default)
+        if name == 'bullshark_alternating':
+            config[name] = _boolean(value)
+        else:
+            minimum = 1 if name in ('start_round', 'delay_ms', 'max_pending_messages',
+                                     'max_pending_bytes') else 0
+            config[name] = _integer(value, name.replace('_', '-'), minimum)
+    if config['delay_ms'] > 86_400_000:
+        raise ValueError('delay-ms must be between 1 and 86400000')
+    if config['rounds'] and config['start_round'] > U64_MAX - config['rounds']:
+        raise ValueError('start-round + attack-rounds exceeds the unsigned 64-bit range')
+    ids = options.get('byzantine_ids', [])
+    if not isinstance(ids, (list, tuple)):
+        raise ValueError('byzantine_ids must be launch node IDs')
+    ids = [_integer(value, 'byzantine ID') for value in ids]
+    if len(set(ids)) != len(ids):
+        raise ValueError('byzantine-ids must not contain duplicates')
+    if mode == 'none' and ids:
+        raise ValueError('adversary none requires an empty Byzantine set')
+    if protocol == 'orca' and faults:
+        raise ValueError('Explicit Orca adversary modes require --faults 0; use --byzantine or --byzantine-ids')
+    for n in nodes:
+        if len(ids) > (n - 1) // 3:
+            raise ValueError(f'Fixed Byzantine set exceeds f=floor((n-1)/3) for {n} nodes')
+        if any(i >= n for i in ids):
+            raise ValueError(f'byzantine-ids must be between 0 and {n - 1}')
+        if protocol == 'bullshark' and any(i >= n - faults for i in ids):
+            raise ValueError('byzantine-ids overlap inactive nodes excluded by --faults')
+    if (mode in ('silent', 'targeted') and not ids and
+            not (protocol == 'bullshark' and config['bullshark_alternating'])):
+        raise ValueError('This mode requires --byzantine or --byzantine-ids')
+    config['byzantine_ids'] = ids
+    return config
+
+
+def remote_parameters(*, nodes, workers, rate, tx_size, duration, faults, runs,
+                      default_faults, protocol, adversary='', byzantine=0,
+                      byzantine_ids='', seed=1, start_round=1, attack_rounds=0,
+                      delay_ms=200, max_pending_messages=4096,
+                      max_pending_bytes=67108864, bullshark_alternating='true'):
+    """Parse Fabric values without constructing an AWS manager."""
+    mode = str(adversary).strip().lower() if adversary is not None else ''
+    if mode and mode not in MODES:
+        raise ValueError('adversary must be none, silent, targeted, network, A0, A1, A3 or A5')
+    nodes = _integer(nodes, 'nodes', 2)
+    faults = (default_faults if not mode else 0) if faults in (None, '') else faults
+    faults = _integer(faults, 'faults')
+    if faults >= nodes:
+        raise ValueError('Require 0 <= faults < nodes')
+    rates = rate.split(',') if isinstance(rate, str) else [rate]
+    params = dict(
+        faults=faults, nodes=[nodes], workers=_integer(workers, 'workers', 1),
+        collocate=True, rate=[_integer(str(x).strip(), 'rate') for x in rates],
+        tx_size=_integer(tx_size, 'tx-size', 9),
+        duration=_integer(duration, 'duration', 1), runs=_integer(runs, 'runs', 1),
+    )
+    count = _integer(byzantine, 'byzantine')
+    ids = ([_integer(x.strip(), 'byzantine ID') for x in byzantine_ids.split(',')]
+           if byzantine_ids else [])
+    if count and ids:
+        raise ValueError('Choose either --byzantine or --byzantine-ids')
+    if count > (nodes - 1) // 3:
+        raise ValueError('Fixed Byzantine set exceeds f=floor((n-1)/3)')
+    if count:
+        ids = list(range(count))
+    options = dict(mode=mode, byzantine_ids=ids, seed=seed, start_round=start_round,
+                   rounds=attack_rounds, delay_ms=delay_ms,
+                   max_pending_messages=max_pending_messages,
+                   max_pending_bytes=max_pending_bytes,
+                   bullshark_alternating=_boolean(bullshark_alternating))
+    if not mode:
+        if ids or any(options[name] != default for name, default in DEFAULTS.items()):
+            raise ValueError('Adversary parameters require an explicit --adversary mode')
+        return params
+    params['adversary'] = validate_adversary(options, protocol, [nodes], faults)
+    return params
+
+
+def resolve_adversary(options, launch_authorities):
+    """Map zero-based launch IDs to full keys, preserving committee insertion order."""
+    if options is None:
+        return None
+    names = list(launch_authorities)
+    if not all(isinstance(name, str) and name for name in names) or len(set(names)) != len(names):
+        raise ValueError('Launch authority keys must be nonempty and unique')
+    ids = options['byzantine_ids']
+    if any(i < 0 or i >= len(names) for i in ids):
+        raise ValueError('Byzantine launch ID is outside this committee')
+    config = {name: value for name, value in options.items() if name != 'byzantine_ids'}
+    config['byzantine_authorities'] = [names[i] for i in ids]
+    return config
+
+
+def adversary_environment(config):
+    if config is None:
+        return ''
+    encoded = json.dumps(config, separators=(',', ':'), sort_keys=True)
+    # env works both with ordinary shell commands and with Bullshark's exec wrapper.
+    return f'env BENCH_ADVERSARY_CONFIG={quote(encoded)} '
+
+
+def write_run_snapshot(directory, benchmark_parameters, node_parameters,
+                       launch_authorities, config, nodes, rate, run, *, protocol):
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
+    output = Path(directory) / f'{stamp}-{protocol}-n{nodes}-r{rate}-run{run}.parameters.json'
+    output.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = dict(
+        protocol=protocol, created_utc=stamp, nodes=nodes, rate=rate, run=run,
+        benchmark_parameters=benchmark_parameters, node_parameters=node_parameters,
+        launch_authorities=list(launch_authorities), adversary=config,
+    )
+    output.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+    return str(output)
