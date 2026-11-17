@@ -685,10 +685,17 @@ impl Core {
     }
 
     async fn try_advance_completed(&mut self, certificate: Certificate) -> DagResult<()> {
-        if !self
-            .synchronizer
-            .ready_for_round_advance(&certificate, &self.grade_one_certificates, &self.completed)
-            .await?
+        // Validated dependencies are immutable, even after their memory entries
+        // are collected. Commits without local validation still need this check.
+        if !self.validated.contains(&certificate.header.id)
+            && !self
+                .synchronizer
+                .ready_for_round_advance(
+                    &certificate,
+                    &self.grade_one_certificates,
+                    &self.completed,
+                )
+                .await?
         {
             self.round_advance_pending
                 .insert(certificate.digest(), certificate);
