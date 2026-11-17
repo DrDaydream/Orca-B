@@ -58,13 +58,6 @@ pub(crate) fn spawn_vote_sender(
                             },
                             None => addresses.clone(),
                         };
-                        if log::log_enabled!(target: "orca_latency", log::Level::Debug) {
-                            for vote in &votes {
-                                log::debug!(target: "orca_latency",
-                                    "stage=vote_dispatch id={:?} round={} phase={:?} repair={}",
-                                    vote.id, vote.round, vote.phase, requestor.is_some());
-                            }
-                        }
                         let batch = GrbcVoteBatch::from_votes(votes).expect("Mixed GRBC vote batch");
                         let bytes = bincode::serialize(&PrimaryMessage::GrbcVoteBatch(batch))
                             .expect("Failed to serialize GRBC votes");
