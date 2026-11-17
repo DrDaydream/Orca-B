@@ -66,7 +66,10 @@ class Result:
     @classmethod
     def from_str(cls, raw):
         tps = int(search(r'End-to-end TPS: (\d+)', raw).group(1))
-        latency = int(search(r'End-to-end latency: (\d+)', raw).group(1))
+        sample = search(r'End-to-end latency: ([\d,.]+|N/A) ms', raw)
+        if sample is None or sample.group(1) == 'N/A':
+            raise ValueError('End-to-end latency is unavailable; release/ingress measurements are required')
+        latency = float(sample.group(1).replace(',', ''))
         return cls(tps, latency)
 
     @classmethod

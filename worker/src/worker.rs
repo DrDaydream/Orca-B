@@ -14,6 +14,8 @@ use network::{MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+#[cfg(feature = "benchmark")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::watch;
@@ -60,6 +62,9 @@ impl Worker {
         parameters: Parameters,
         store: Store,
     ) {
+        #[cfg(feature = "benchmark")]
+        info!("Benchmark latency instrumentation version 1");
+
         // Define a worker instance.
         let worker = Self {
             name,
@@ -239,6 +244,26 @@ struct TxReceiverHandler {
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+        #[cfg(feature = "benchmark")]
+        if message.len() >= 9 && message[0] == 0 {
+            // Capture ingress before decoding and before the batching channel can block.
+            let ingress_at = SystemTime::now().duration_since(UNIX_EPOCH);
+            let mut sample_id_bytes = [0u8; 8];
+            sample_id_bytes.copy_from_slice(&message[1..9]);
+            let sample_id = u64::from_be_bytes(sample_id_bytes);
+            match ingress_at {
+                Ok(ingress_at) => info!(
+                    "Benchmark sample ingress id {} at_us {}",
+                    sample_id,
+                    ingress_at.as_micros()
+                ),
+                Err(error) => warn!(
+                    "Benchmark sample ingress timestamp unavailable id {}: {}",
+                    sample_id, error
+                ),
+            }
+        }
+
         // Send the transaction to the batch maker.
         self.tx_batch_maker
             .send(message.to_vec())
