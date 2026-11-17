@@ -11,6 +11,8 @@ use std::cmp::min;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
@@ -33,6 +35,8 @@ pub struct ReliableSender {
     connections: HashMap<SocketAddr, Sender<InnerMessage>>,
     /// Small RNG just used to shuffle nodes and randomize connections (not crypto related).
     rng: SmallRng,
+    /// Optional observation of complete frames successfully written to peers.
+    sent_bytes: Option<Arc<AtomicU64>>,
 }
 
 impl std::default::Default for ReliableSender {
@@ -46,22 +50,37 @@ impl ReliableSender {
         Self {
             connections: HashMap::new(),
             rng: SmallRng::from_entropy(),
+            sent_bytes: None,
+        }
+    }
+
+    /// Count each successful transport send, including retries, in bytes. This
+    /// includes the default codec's four-byte length prefix and the full payload,
+    /// but excludes ACKs, TCP/IP overhead, and partial writes from failed sends.
+    pub fn with_sent_byte_counter(sent_bytes: Arc<AtomicU64>) -> Self {
+        Self {
+            sent_bytes: Some(sent_bytes),
+            ..Self::new()
         }
     }
 
     /// Helper function to spawn a new connection.
-    fn spawn_connection(address: SocketAddr) -> Sender<InnerMessage> {
+    fn spawn_connection(
+        address: SocketAddr,
+        sent_bytes: Option<Arc<AtomicU64>>,
+    ) -> Sender<InnerMessage> {
         let (tx, rx) = channel(1_000);
-        Connection::spawn(address, rx);
+        Connection::spawn(address, rx, sent_bytes);
         tx
     }
 
     /// Reliably send a message to a specific address.
     pub async fn send(&mut self, address: SocketAddr, data: Bytes) -> CancelHandler {
         let (sender, receiver) = oneshot::channel();
+        let sent_bytes = &self.sent_bytes;
         self.connections
             .entry(address)
-            .or_insert_with(|| Self::spawn_connection(address))
+            .or_insert_with(|| Self::spawn_connection(address, sent_bytes.clone()))
             .send(InnerMessage {
                 data,
                 cancel_handler: sender,
@@ -120,16 +139,23 @@ struct Connection {
     retry_delay: u64,
     /// Buffer keeping all messages that need to be re-transmitted.
     buffer: VecDeque<(Bytes, oneshot::Sender<Bytes>)>,
+    /// Shared with the sender, used only for observing successful frame writes.
+    sent_bytes: Option<Arc<AtomicU64>>,
 }
 
 impl Connection {
-    fn spawn(address: SocketAddr, receiver: Receiver<InnerMessage>) {
+    fn spawn(
+        address: SocketAddr,
+        receiver: Receiver<InnerMessage>,
+        sent_bytes: Option<Arc<AtomicU64>>,
+    ) {
         tokio::spawn(async move {
             Self {
                 address,
                 receiver,
                 retry_delay: 200,
                 buffer: VecDeque::new(),
+                sent_bytes,
             }
             .run()
             .await;
@@ -199,6 +225,12 @@ impl Connection {
                 // Try to send the message.
                 match writer.send(data.clone()).await {
                     Ok(()) => {
+                        if let Some(sent_bytes) = &self.sent_bytes {
+                            // SinkExt::send flushes the complete default
+                            // LengthDelimitedCodec frame to this peer. A later
+                            // successful retry is another transmission.
+                            sent_bytes.fetch_add(data.len() as u64 + 4, Ordering::Relaxed);
+                        }
                         // The message has been sent, we remove it from the buffer and add it to
                         // `pending_replies` while we wait for an ACK.
                         pending_replies.push_back((data, handler));

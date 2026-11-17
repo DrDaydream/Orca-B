@@ -1636,10 +1636,11 @@ impl Consensus {
                             .expect("System clock is before Unix epoch")
                             .as_millis()
                     });
-            let _committed_at_ms = SystemTime::now()
+            let committed_at = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .expect("System clock is before Unix epoch")
-                .as_millis();
+                .expect("System clock is before Unix epoch");
+            let _committed_at_ms = committed_at.as_millis();
+            let _committed_at_us = committed_at.as_micros();
             state.update(&sequence, self.gc_depth);
             for certificate in &sequence {
                 #[cfg(not(feature = "benchmark"))]
@@ -1654,8 +1655,12 @@ impl Consensus {
                 #[cfg(feature = "benchmark")]
                 for digest in certificate.header.payload.keys() {
                     info!(
-                        "Committed {} -> {:?} @ {} commit {}",
-                        certificate.header, digest, _rule_ready_at_ms, _committed_at_ms
+                        "Committed {} -> {:?} @ {} commit {} commit_us {}",
+                        certificate.header,
+                        digest,
+                        _rule_ready_at_ms,
+                        _committed_at_ms,
+                        _committed_at_us
                     );
                 }
             }

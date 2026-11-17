@@ -9,6 +9,7 @@ use futures::sink::SinkExt as _;
 use log::{info, warn};
 use rand::Rng;
 use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::time::{interval, sleep, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -42,6 +43,8 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();
+
+    info!("Benchmark latency instrumentation version 1");
 
     let target = matches
         .value_of("ADDR")
@@ -170,6 +173,21 @@ impl Client {
                 schedule_start.elapsed(),
             ) {
                 continue;
+            }
+
+            if burst > 0 {
+                // Release the whole active burst before any send can block.
+                match SystemTime::now().duration_since(UNIX_EPOCH) {
+                    Ok(released_at) => info!(
+                        "Benchmark sample released id {} at_us {}",
+                        counter,
+                        released_at.as_micros()
+                    ),
+                    Err(error) => warn!(
+                        "Benchmark sample release timestamp unavailable id {}: {}",
+                        counter, error
+                    ),
+                }
             }
 
             for x in 0..burst {
