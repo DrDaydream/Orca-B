@@ -82,8 +82,6 @@ pub(crate) async fn prepare_proposal(
     in_flight: Option<ProposalGuard>,
 ) -> DagResult<(StoredProposalHeader, Vec<CancelHandler>)> {
     let serialize = outbound.is_some();
-    debug!(target: "orca_latency", "stage=validate_start id={:?} round={} local={}",
-        proposal.header.id, proposal.header.round, serialize);
     let (proposal, bytes) = tokio::task::spawn_blocking(move || {
         proposal.verify(&committee)?;
         let message = PrimaryMessage::Proposal(proposal);
@@ -99,8 +97,6 @@ pub(crate) async fn prepare_proposal(
     })
     .await
     .expect("Proposal validation task failed")?;
-    debug!(target: "orca_latency", "stage=validated id={:?} round={} local={}",
-        proposal.header.id, proposal.header.round, serialize);
     // Validation precedes both operations. Network transmission need not wait
     // for our disk, while Core still receives the header only after storage.
     // join! reuses this task and preserves backpressure on the local producer.
@@ -207,7 +203,6 @@ pub(crate) fn spawn_proposal_processors(
                     report(async {
                         let round = header.round;
                         let guard = in_flight.track(&header);
-                        debug!(target: "orca_latency", "stage=assemble_start id={:?} round={}", header.id, round);
                         let proposal = assemble_proposal(&mut store, header).await?;
                         let (header, handlers) = prepare_proposal(
                             proposal, committee.clone(), &mut store,
