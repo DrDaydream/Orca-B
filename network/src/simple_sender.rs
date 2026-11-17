@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::NetworkError;
+use crate::scheduler::{Outbound, Scheduler};
 use bytes::Bytes;
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
@@ -20,6 +21,7 @@ pub mod simple_sender_tests;
 /// We keep alive one TCP connection per peer, each connection is handled by a separate task (called `Connection`).
 /// We communicate with our 'connections' through a dedicated channel kept by the HashMap called `connections`.
 pub struct SimpleSender {
+    scheduler: Option<Scheduler>,
     /// A map holding the channels to our connections.
     connections: HashMap<SocketAddr, Sender<Bytes>>,
     /// Small RNG just used to shuffle nodes and randomize connections (not crypto related).
@@ -33,8 +35,18 @@ impl std::default::Default for SimpleSender {
 }
 
 impl SimpleSender {
+    pub fn with_schedule(
+        policy: std::sync::Arc<dyn crate::DeliveryPolicy>,
+        budget: crate::DelayBudget,
+    ) -> Self {
+        let mut sender = Self::new();
+        sender.scheduler = Some(Scheduler::new(policy, budget));
+        sender
+    }
+
     pub fn new() -> Self {
         Self {
+            scheduler: None,
             connections: HashMap::new(),
             rng: SmallRng::from_entropy(),
         }
@@ -50,6 +62,19 @@ impl SimpleSender {
     /// Try (best-effort) to send a message to a specific address.
     /// This is useful to answer sync requests.
     pub async fn send(&mut self, address: SocketAddr, data: Bytes) {
+        let outbound = Outbound {
+            address,
+            data,
+            acknowledgement: None,
+        };
+        let outbound = match &self.scheduler {
+            Some(scheduler) => scheduler.submit(outbound),
+            None => Some(outbound),
+        };
+        let Outbound { address, data, .. } = match outbound {
+            Some(outbound) => outbound,
+            None => return,
+        };
         // Try to re-use an existing connection if possible.
         if let Some(tx) = self.connections.get(&address) {
             if tx.send(data.clone()).await.is_ok() {

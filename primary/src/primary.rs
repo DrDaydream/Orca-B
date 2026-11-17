@@ -20,7 +20,7 @@ use crypto::{Digest, PublicKey, SignatureService};
 use futures::sink::SinkExt as _;
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use log::info;
-use network::{MessageHandler, Receiver as NetworkReceiver, ReliableSender, Writer};
+use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::sync::atomic::AtomicU64;
@@ -134,24 +134,29 @@ fn spawn_aba_broadcaster(
             .map(|(_, address)| address.aba_to_aba)
             .collect();
         #[cfg(not(feature = "benchmark"))]
-        let mut network = ReliableSender::new();
+        let mut network = crate::adversary::reliable_sender();
         #[cfg(feature = "benchmark")]
-        let mut network = ReliableSender::with_sent_byte_counter(aba_bytes.sent);
+        let mut network = crate::adversary::reliable_sender_with_counter(aba_bytes.sent);
         let mut pending = FuturesUnordered::new();
 
         loop {
             tokio::select! {
                 Some(messages) = rx_messages.recv() => {
-                    let payload = bincode::serialize(&messages)
-                        .expect("Failed to serialize ABA batch");
-                    let message = ConsensusNetworkMessage::new(
-                        payload,
-                        name,
-                        &mut signature_service,
-                    ).await;
-                    let bytes = bincode::serialize(&message)
-                        .expect("Failed to serialize ABA network message");
-                    pending.extend(network.broadcast(addresses.clone(), Bytes::from(bytes)).await);
+                    let groups = if crate::adversary::schedule_aba() {
+                        crate::adversary::group_aba_messages(messages)
+                    } else { vec![messages] };
+                    for messages in groups {
+                        let payload = bincode::serialize(&messages)
+                            .expect("Failed to serialize ABA batch");
+                        let message = ConsensusNetworkMessage::new(
+                            payload,
+                            name,
+                            &mut signature_service,
+                        ).await;
+                        let bytes = bincode::serialize(&message)
+                            .expect("Failed to serialize ABA network message");
+                        pending.extend(network.broadcast(addresses.clone(), Bytes::from(bytes)).await);
+                    }
                 }
                 Some(_) = pending.next(), if !pending.is_empty() => {}
                 else => break,
@@ -171,6 +176,8 @@ impl Primary {
         tx_consensus: Sender<ConsensusMessage>,
         mut rx_consensus: Receiver<ConsensusCommand>,
     ) {
+        crate::adversary::initialize(keypair.name, &committee)
+            .expect("Invalid BENCH_ADVERSARY_CONFIG");
         let (tx_others_digests, rx_others_digests) = channel(CHANNEL_CAPACITY);
         let (tx_our_digests, rx_our_digests) = channel(CHANNEL_CAPACITY);
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);

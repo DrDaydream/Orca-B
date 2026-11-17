@@ -41,7 +41,7 @@ impl Helper {
                 committee,
                 store,
                 rx_primaries,
-                network: SimpleSender::new(),
+                network: crate::adversary::simple_sender(),
                 tx_votes,
             }
             .run()

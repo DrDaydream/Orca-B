@@ -15,6 +15,7 @@ import subprocess
 from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError
 from benchmark.utils import BenchError, Print, PathMaker, progress_bar
 from benchmark.commands import CommandMaker
+from benchmark.adversary import resolve_adversary, validate_adversary, write_run_snapshot
 from benchmark.adversary_schedule import build_client_schedules, client_silence_slot_ms
 from benchmark.logs import LogParser, ParseError
 from benchmark.instance import InstanceManager
@@ -160,7 +161,8 @@ class Bench:
 
     def _background_run(self, host, command, log_file):
         name = splitext(basename(log_file))[0]
-        cmd = f'tmux new -d -s "{name}" "{command} |& tee {log_file}"'
+        script = f'{command} |& tee {quote(log_file)}'
+        cmd = f'tmux new -d -s {quote(name)} {quote(script)}'
         c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
         output = c.run(cmd, hide=True)
         self._check_stderr(output)
@@ -248,7 +250,8 @@ class Bench:
 
         return committee
 
-    def _run_single(self, rate, committee, bench_parameters, node_parameters, debug=False):
+    def _run_single(self, rate, committee, bench_parameters, node_parameters, debug=False,
+                    adversary_config=None):
         faults = bench_parameters.faults
 
         # Kill any potentially unfinished run and delete logs.
@@ -260,12 +263,16 @@ class Bench:
         workers_addresses = committee.workers_addresses(0)
         rate_share = ceil(rate / committee.workers())
         names = list(committee.json['authorities'])
-        silence_slot_ms = client_silence_slot_ms(
-            node_parameters.json['max_header_delay']
-        )
-        silence_schedules = build_client_schedules(
-            names, faults, bench_parameters.duration, silence_slot_ms
-        )
+        if adversary_config is None:
+            silence_slot_ms = client_silence_slot_ms(
+                node_parameters.json['max_header_delay']
+            )
+            silence_schedules = build_client_schedules(
+                names, faults, bench_parameters.duration, silence_slot_ms
+            )
+        else:
+            silence_slot_ms = 0
+            silence_schedules = dict.fromkeys(names, '')
         for i, addresses in enumerate(workers_addresses):
             for (id, address) in addresses:
                 host = Committee.ip(address)
@@ -290,7 +297,8 @@ class Bench:
                 PathMaker.db_path(i),
                 PathMaker.parameters_file(),
                 debug=debug,
-                faults=faults
+                faults=faults,
+                adversary_config=adversary_config,
             )
             log_file = PathMaker.primary_log_file(i)
             self._background_run(host, cmd, log_file)
@@ -358,7 +366,11 @@ class Bench:
         try:
             bench_parameters = BenchParameters(bench_parameters_dict)
             node_parameters = NodeParameters(node_parameters_dict)
-        except ConfigError as e:
+            adversary = validate_adversary(
+                bench_parameters_dict.get('adversary'), 'orca',
+                bench_parameters.nodes, bench_parameters.faults,
+            )
+        except (ConfigError, ValueError) as e:
             raise BenchError('Invalid nodes or bench parameters', e)
 
         # Select which hosts to use.
@@ -392,6 +404,7 @@ class Bench:
         for n in bench_parameters.nodes:
             committee_copy = deepcopy(committee)
             committee_copy.remove_nodes(committee.size() - n)
+            adversary_config = resolve_adversary(adversary, committee_copy.json['authorities'])
 
             for r in bench_parameters.rate:
                 Print.heading(f'\nRunning {n} nodes (input rate: {r:,} tx/s)')
@@ -400,8 +413,20 @@ class Bench:
                 for i in range(bench_parameters.runs):
                     Print.heading(f'Run {i+1}/{bench_parameters.runs}')
                     try:
+                        if adversary_config is not None:
+                            snapshot = write_run_snapshot(
+                                PathMaker.results_path(), bench_parameters_dict, node_parameters_dict,
+                                committee_copy.json['authorities'], adversary_config,
+                                n, r, i + 1, protocol='orca-b',
+                            )
+                            Print.info(
+                                f"Adversary: {adversary_config['mode']}; fixed Byzantine IDs: "
+                                f"{adversary['byzantine_ids']}; seed: {adversary_config['seed']}; "
+                                f"parameters: {snapshot}"
+                            )
                         self._run_single(
-                            r, committee_copy, bench_parameters, node_parameters, debug
+                            r, committee_copy, bench_parameters, node_parameters, debug,
+                            adversary_config=adversary_config,
                         )
 
                         faults = bench_parameters.faults

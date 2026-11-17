@@ -187,7 +187,7 @@ pub(crate) fn spawn_proposal_processors(
     });
     tokio::spawn(async move {
         let mut store = store;
-        let mut network = ReliableSender::new();
+        let mut network = crate::adversary::reliable_sender();
         let addresses: Vec<_> = committee
             .others_primaries(&name)
             .iter()

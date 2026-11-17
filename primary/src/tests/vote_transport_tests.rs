@@ -3,6 +3,7 @@ use crate::common::{committee, keys, proposal, votes};
 use crate::messages::{batch_digest, GrbcPhase};
 use crate::vote_sender::VoteDispatch;
 use crypto::{Hash as _, Signature};
+use network::ReliableSender;
 use tokio::net::TcpListener;
 
 #[tokio::test]

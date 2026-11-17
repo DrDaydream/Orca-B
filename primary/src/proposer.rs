@@ -127,6 +127,9 @@ impl Proposer {
     }
 
     fn compute_silence(&self, round: Round) -> bool {
+        if let Some(silent) = adversary::fixed_silence(self.name, round) {
+            return silent;
+        }
         if !adversary::selected(
             &self.name,
             &self.leader_schedule,
@@ -153,7 +156,9 @@ impl Proposer {
     async fn enter_round(&mut self, round: Round) {
         self.round = round;
         self.silent = self.compute_silence(round);
-        if self.adversary_faults == 0 {
+        // Explicit adversaries control primary participation only. Keep the
+        // offered client/worker workload independent from the attack.
+        if self.adversary_faults == 0 || std::env::var_os("BENCH_ADVERSARY_CONFIG").is_some() {
             return;
         }
         let message = PrimaryWorkerMessage::BatchSilent(round, self.silent);

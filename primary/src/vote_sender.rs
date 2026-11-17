@@ -4,7 +4,7 @@ use crate::primary::{PrimaryMessage, Round};
 use bytes::Bytes;
 use config::Committee;
 use crypto::PublicKey;
-use network::{CancelHandler, ReliableSender};
+use network::CancelHandler;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -24,7 +24,7 @@ pub(crate) fn spawn_vote_sender(
     mut rx: Receiver<VoteDispatch>,
 ) {
     tokio::spawn(async move {
-        let mut network = ReliableSender::new();
+        let mut network = crate::adversary::reliable_sender();
         let addresses: Vec<_> = committee
             .others_primaries(&name)
             .iter()
