@@ -121,6 +121,20 @@ def remote_parameters(*, nodes, workers, rate, tx_size, duration, faults, runs,
     return params
 
 
+def local_parameters(defaults, *, protocol, **options):
+    """Reuse remote validation, retaining editable local workload defaults."""
+    values = dict(defaults)
+    values.update({key: value for key, value in options.items() if value is not None})
+    parsed = remote_parameters(**values, default_faults=0, protocol=protocol, runs=1)
+    if len(parsed['rate']) != 1:
+        raise ValueError('local accepts one rate per run; use remote for a rate sweep')
+    parsed['nodes'] = parsed['nodes'][0]
+    parsed['rate'] = parsed['rate'][0]
+    parsed.pop('runs')
+    parsed.pop('collocate')
+    return parsed
+
+
 def resolve_adversary(options, launch_authorities):
     """Map zero-based launch IDs to full keys, preserving committee insertion order."""
     if options is None:

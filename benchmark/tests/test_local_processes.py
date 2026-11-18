@@ -9,6 +9,21 @@ from benchmark.local_processes import LocalProcesses
 
 
 class LocalProcessesTests(unittest.TestCase):
+    def test_env_prefix_delivers_json_to_actual_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'primary-env.log'
+            processes = LocalProcesses()
+            config = '{"mode":"network","byzantine_authorities":[]}'
+            script = 'import os,sys; print(os.environ["BENCH_ADVERSARY_CONFIG"], file=sys.stderr)'
+            command = 'env ' + shlex.quote('BENCH_ADVERSARY_CONFIG=' + config) + ' ' + ' '.join(
+                shlex.quote(x) for x in [sys.executable, '-c', script])
+            try:
+                processes.start(command, str(path))
+                self.assertEqual(processes.processes[0].wait(timeout=10), 0)
+                self.assertEqual(path.read_text().strip(), config)
+            finally:
+                processes.stop()
+
     def launch(self, processes, path, code):
         command = ' '.join(shlex.quote(x) for x in [sys.executable, '-u', '-c', code])
         processes.start(command, str(path))

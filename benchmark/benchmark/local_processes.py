@@ -15,6 +15,8 @@ class LocalProcesses:
 
     def start(self, command, log_file):
         args, env = shlex.split(command), os.environ.copy()
+        if args and args[0] == 'env':
+            args.pop(0)
         while args and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*=.*', args[0]):
             key, value = args.pop(0).split('=', 1)
             env[key] = value

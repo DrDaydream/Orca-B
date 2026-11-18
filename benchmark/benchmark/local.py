@@ -3,6 +3,7 @@ import subprocess
 from math import ceil
 from time import sleep
 
+from benchmark.adversary import resolve_adversary, validate_adversary, write_run_snapshot
 from benchmark.commands import CommandMaker
 from benchmark.adversary_schedule import build_client_schedules, client_silence_slot_ms
 from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameters, ConfigError
@@ -19,7 +20,12 @@ class LocalBench:
         try:
             self.bench_parameters = BenchParameters(bench_parameters_dict)
             self.node_parameters = NodeParameters(node_parameters_dict)
-        except ConfigError as e:
+            self.adversary = validate_adversary(
+                bench_parameters_dict.get('adversary'), 'orca',
+                self.bench_parameters.nodes, self.bench_parameters.faults,
+            )
+            self.benchmark_input = dict(bench_parameters_dict)
+        except (ConfigError, ValueError) as e:
             raise BenchError('Invalid nodes or bench parameters', e)
 
     def __getattr__(self, attr):
@@ -68,16 +74,27 @@ class LocalBench:
             committee.print(PathMaker.committee_file())
 
             self.node_parameters.print(PathMaker.parameters_file())
+            adversary_config = resolve_adversary(self.adversary, names)
+            if adversary_config is not None:
+                snapshot = write_run_snapshot(
+                    PathMaker.results_path(), self.benchmark_input, self.node_parameters.json,
+                    names, adversary_config, nodes, rate, 1, protocol='orca-b-local',
+                )
+                Print.info(f"Adversary: {adversary_config['mode']}; parameters: {snapshot}")
 
             # Run the clients (they will wait for the nodes to be ready).
             workers_addresses = committee.workers_addresses(0)
             rate_share = ceil(rate / committee.workers())
-            silence_slot_ms = client_silence_slot_ms(
-                self.node_parameters.json['max_header_delay']
-            )
-            silence_schedules = build_client_schedules(
-                names, self.faults, self.duration, silence_slot_ms
-            )
+            if adversary_config is None:
+                silence_slot_ms = client_silence_slot_ms(
+                    self.node_parameters.json['max_header_delay']
+                )
+                silence_schedules = build_client_schedules(
+                    names, self.faults, self.duration, silence_slot_ms
+                )
+            else:
+                silence_slot_ms = 0
+                silence_schedules = dict.fromkeys(names, '')
             for i, addresses in enumerate(workers_addresses):
                 for (id, address) in addresses:
                     cmd = CommandMaker.run_client(
@@ -99,7 +116,8 @@ class LocalBench:
                     PathMaker.db_path(i),
                     PathMaker.parameters_file(),
                     debug=debug,
-                    faults=self.faults
+                    faults=self.faults,
+                    adversary_config=adversary_config,
                 )
                 log_file = PathMaker.primary_log_file(i)
                 self._background_run(cmd, log_file)
