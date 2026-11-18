@@ -1,9 +1,11 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from datetime import datetime
 from glob import glob
+import json
 from math import ceil, isfinite
 from multiprocessing import Pool
 from os.path import join
+from pathlib import Path
 from re import findall, search
 from statistics import mean
 
@@ -16,11 +18,25 @@ class ParseError(Exception):
 
 
 class LogParser:
-    def __init__(self, clients, primaries, workers, faults=0):
+    def __init__(self, clients, primaries, workers, faults=0, *,
+                 primary_ids=None, excluded_primary_ids=()):
         inputs = [clients, primaries, workers]
         assert all(isinstance(x, list) for x in inputs)
         assert all(isinstance(x, str) for y in inputs for x in y)
         assert all(x for x in inputs)
+
+        self.primary_ids = list(range(len(primaries))) if primary_ids is None else list(primary_ids)
+        excluded = list(excluded_primary_ids)
+        if (len(self.primary_ids) != len(primaries)
+                or any(type(i) is not int or i < 0 for i in self.primary_ids + excluded)
+                or len(set(self.primary_ids)) != len(self.primary_ids)
+                or len(set(excluded)) != len(excluded)
+                or not set(excluded) < set(self.primary_ids)):
+            raise ParseError('Invalid primary IDs or silent replica exclusions')
+        self.excluded_primary_ids = sorted(excluded)
+        self.included_primary_ids = [i for i in self.primary_ids if i not in excluded]
+        included = lambda values: [value for ident, value in zip(self.primary_ids, values)
+                                   if ident not in excluded]
 
         self.faults = faults
         if isinstance(faults, int):
@@ -48,18 +64,20 @@ class LogParser:
             raise ParseError(f'Failed to parse nodes\' logs: {e}')
         proposals, commits, final_commits, header_proposals, header_commits, leader_ready, rule_orders, commit_rules, aba_durations, self.configs, primary_ips = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
-        self.commits = self._merge_results([x.items() for x in commits])
+        # Keep proposal origins as transaction metadata, but only included
+        # replicas may supply commit observations or rule/ABA statistics.
+        self.commits = self._merge_results([x.items() for x in included(commits)])
         self.final_commits = self._merge_results(
-            [x.items() for x in final_commits]
+            [x.items() for x in included(final_commits)]
         )
         self.header_proposals = self._merge_results([x.items() for x in header_proposals])
-        self.header_commits = self._merge_tagged_results(header_commits)
-        self.leader_ready = self._merge_results([x.items() for x in leader_ready])
-        self.rule_orders = self._merge_results([x.items() for x in rule_orders])
-        self.commit_rules = self._merge_commit_rules(commit_rules)
+        self.header_commits = self._merge_tagged_results(included(header_commits))
+        self.leader_ready = self._merge_results([x.items() for x in included(leader_ready)])
+        self.rule_orders = self._merge_results([x.items() for x in included(rule_orders)])
+        self.commit_rules = self._merge_commit_rules(included(commit_rules))
         # Keep every completed node-instance sample. Unfinished ABA instances
         # have no duration log and are intentionally excluded.
-        self.aba_durations = [duration for values in aba_durations for duration in values]
+        self.aba_durations = [duration for values in included(aba_durations) for duration in values]
 
         # Parse the workers logs.
         try:
@@ -74,7 +92,8 @@ class LogParser:
 
         # Observational statistics keep final commit times per replica.
         try:
-            self.measurements = Measurements(clients, primaries, workers)
+            self.measurements = Measurements(clients, included(primaries), workers)
+            self.measurements.replica_logs = [f'primary-{i}.log' for i in self.included_primary_ids]
         except ValueError as error:
             raise ParseError(str(error)) from error
 
@@ -94,7 +113,15 @@ class LogParser:
         + duration). Without it, the observed log span is labelled as such.
         No runner, workload, or protocol behavior is changed by this parser.
         """
-        return self.measurements.metrics(duration=duration, warmup=warmup, drain=drain)
+        metrics = self.measurements.metrics(duration=duration, warmup=warmup, drain=drain)
+        metrics['included_primary_ids'] = self.included_primary_ids
+        metrics['excluded_primary_ids'] = self.excluded_primary_ids
+        for row, ident in zip(metrics['replicas'], self.included_primary_ids):
+            row['replica'] = ident
+        if metrics['aba'] is not None:
+            for row, ident in zip(metrics['aba']['replicas'], self.included_primary_ids):
+                row['replica'] = ident
+        return metrics
 
     def _merge_results(self, input):
         # Keep the earliest timestamp.
@@ -391,7 +418,7 @@ class LogParser:
         print(format_measurements(metrics['measurement_stats']))
         display = lambda value: f'{value:,.1f}' if value is not None else 'N/A'
         print(
-            f' FINAL ORDERED COMPARISON ({duration:g} s, first replica):\n'
+            f' FINAL ORDERED COMPARISON ({duration:g} s, first included replica):\n'
             f" Final TPS: {metrics['final_tps']:,.1f} tx/s\n"
             f" Final consensus mean: {display(metrics['final_consensus_mean_ms'])} ms\n"
             f" Final end-to-end mean: {display(metrics['final_e2e_mean_ms'])} ms\n"
@@ -465,6 +492,8 @@ class LogParser:
             ' + CONFIG:\n'
             f' Faults: {self.faults} node(s)\n'
             f' Committee size: {self.committee_size} node(s)\n'
+            f' Commit replicas included: {len(self.included_primary_ids)} node(s)\n'
+            f' Excluded A1 silent replica IDs: {",".join(map(str, self.excluded_primary_ids)) or "none"}\n'
             f' Worker(s) per node: {self.workers} worker(s)\n'
             f' Collocate primary and workers: {self.collocate}\n'
             f' Input rate: {sum(self.rate):,} tx/s\n'
@@ -519,8 +548,32 @@ class LogParser:
             output.write('\n')
 
     @classmethod
-    def process(cls, directory, faults=0):
+    def process(cls, directory, faults=0, adversary=None):
         assert isinstance(directory, str)
+
+        primary_files = sorted(glob(join(directory, 'primary-*.log')))
+        primary_ids = []
+        for filename in primary_files:
+            match = search(r'^primary-(\d+)\.log$', Path(filename).name)
+            if match is None:
+                raise ParseError(f'Invalid primary log filename: {filename}')
+            primary_ids.append(int(match.group(1)))
+        population_path = Path(directory) / 'measurement-population.json'
+        excluded = []
+        if adversary is not None:
+            if str(adversary.get('mode', '')).lower() in ('silent', 'a1'):
+                excluded = adversary['byzantine_ids']
+        elif population_path.exists():
+            try:
+                population = json.loads(population_path.read_text(encoding='utf-8'))
+                if (population['schema_version'] != 1
+                        or sorted(population['primary_ids']) != sorted(primary_ids)):
+                    raise ValueError('Saved population does not match the primary logs')
+                excluded = population['excluded_primary_ids']
+                if not isinstance(excluded, list):
+                    raise ValueError('Saved exclusions must be a list of launch IDs')
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                raise ParseError(f'Invalid measurement population: {error}') from error
 
         client_files = sorted(glob(join(directory, 'client-*.log')))
         worker_files = sorted(glob(join(directory, 'worker-*.log')))
@@ -534,7 +587,7 @@ class LogParser:
             with open(filename, 'r') as f:
                 clients += [f.read()]
         primaries = []
-        for filename in sorted(glob(join(directory, 'primary-*.log'))):
+        for filename in primary_files:
             with open(filename, 'r') as f:
                 primaries += [f.read()]
         workers = []
@@ -542,9 +595,17 @@ class LogParser:
             with open(filename, 'r') as f:
                 workers += [f.read()]
 
-        result = cls(clients, primaries, workers, faults=faults)
+        result = cls(clients, primaries, workers, faults=faults,
+                     primary_ids=primary_ids, excluded_primary_ids=excluded)
         result.measurements.source_logs = [
             {'client': c, 'worker': w} for c, w in zip(client_files, worker_files)
         ]
-        result.measurements.replica_logs = sorted(glob(join(directory, 'primary-*.log')))
+        result.measurements.replica_logs = [path for ident, path in zip(primary_ids, primary_files)
+                                           if ident not in result.excluded_primary_ids]
+        if adversary is not None:
+            population = dict(schema_version=1, primary_ids=primary_ids,
+                              excluded_primary_ids=result.excluded_primary_ids)
+            temporary = population_path.with_suffix('.json.tmp')
+            temporary.write_text(json.dumps(population, indent=2) + '\n', encoding='utf-8')
+            temporary.replace(population_path)
         return result

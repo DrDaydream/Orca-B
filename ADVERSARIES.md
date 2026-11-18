@@ -58,6 +58,8 @@ The primary environment contains one shell-quoted `BENCH_ADVERSARY_CONFIG` JSON 
 
 An admitted delayed send remains counted until transport completion/acknowledgement. Its timer does not require new incoming messages, and later consensus garbage collection cannot discard it before release. When the scheduling budget is full, or a message exceeds its byte limit, that message goes immediately through the ordinary transport. The limits bound scheduling storage, not total node memory: the original transport and consensus buffers still exist, and a silent proposer may retain incoming worker batch digests until it can propose again.
 
+For explicit `silent/A1`, local and remote summaries exclude the fixed silent identities as commit-observation replicas for the whole run, including bounded attack windows. Both the pooled release-to-final latency and first-replica final comparison use only the included replicas. Committee size and all client/worker inputs are retained; unfinished samples at included replicas remain unfinished, never zero-latency completions. The summary lists the included count and excluded launch IDs. `logs/measurement-population.json` preserves this choice for `fab logs` and offline parsing. Keep it with the raw logs. Other adversary modes keep their existing native summary population.
+
 The runtime strategy is centralized in `primary/src/adversary.rs`. Python's `benchmark/benchmark/adversary.py` only validates experiment parameters, maps launch IDs to keys, and serializes the configuration. Supporting transport timers and queue accounting implement delivery mechanics; they do not choose adversary strategies.
 
 ## Local runs
