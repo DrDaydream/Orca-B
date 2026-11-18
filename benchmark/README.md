@@ -168,26 +168,32 @@ Once the instances exist, run:
 
 ```bash
 cd /home/ubuntu/experiments/Orca-B-grbc/benchmark
+fab install
 fab remote
 ```
 
-`fab remote` checks the controller and selected instances for the native build
-dependencies, including Clang 14, libclang 14, tmux, and chrony. It installs missing
-packages and Rust 1.85.0, waits for clock synchronization, and clones the configured
-repository on new instances. Existing packages and the installed Rust toolchain
-are reused. `fab install` remains available to prepare the environment separately.
-Both commands require sudo access for system packages and services.
+`fab install` prepares Ubuntu dependencies, Rust 1.85.0 and chrony on the
+controller and testbed, fetches the configured branch, checks out the controller's
+exact HEAD commit remotely, and compiles the node and client binaries on every
+machine. Only this preparation step requires sudo for packages/services.
 
-All selected instances then fetch the configured branch and check out the
-controller's current **HEAD commit**, rather than independently choosing the
-latest branch tip. Update the controller first when testing a newer commit. That
-commit must be available in the configured remote repository; uncommitted Rust
-changes on the controller are not deployed. A reused testbed checkout with
-uncommitted tracked changes is rejected before compilation; save or revert those
-changes before retrying. The runner uses Rust 1.85.0 and the
-repository's Cargo configuration, clearing environment overrides for Rust flags
-and Tokio worker threads. This enables the configured hardware CRC32C build on
-compatible x86_64 CPUs.
+`fab remote` reuses that build. It verifies the recorded commit and executables,
+generates and uploads configuration, runs the experiment and downloads results.
+It does not install dependencies, update source or compile on either the
+controller or experiment machines. All existing experiment and adversary flags
+remain available. Repeat `fab remote` directly when only workload parameters
+change; repeat `fab install` for new machines or a different source commit.
+After updating from an older installer, run `fab install` once to record the
+successful-build marker. Missing or stale builds fail with that instruction.
+
+The controller's native sources and build configuration must match HEAD, and
+that commit must be available from the configured remote repository. Installation
+rejects remote repositories with uncommitted tracked changes. Build flags and
+locked dependencies remain the same; changing orchestration does not change
+the native protocol or latency measurement code.
+
+Builds clear inherited Rust flag and Tokio-thread overrides and retain the
+repository Cargo configuration, including hardware CRC32C on compatible x86_64 CPUs.
 
 The default remote experiment uses 20 nodes, one collocated worker per node,
 `faults=0`, a total input rate of 50,000 tx/s, 512-byte transactions, an 80-second
