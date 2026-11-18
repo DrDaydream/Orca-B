@@ -285,7 +285,7 @@ class LaunchIntegrationTests(unittest.TestCase):
         bench._wait_for_clients = lambda clients, duration: None
         commands = []
         bench._background_run = lambda host, command, log: commands.append(command)
-        bench._logs = lambda *args: SimpleNamespace(
+        bench._logs = lambda *args, **kwargs: SimpleNamespace(
             result=lambda: '', print=lambda *args: None,
             print_comparison=lambda *args: None,
         )

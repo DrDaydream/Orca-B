@@ -143,7 +143,8 @@ class LocalBench:
 
             # Parse logs and return the parser.
             Print.info('Parsing logs...')
-            return LogParser.process(PathMaker.logs_path(), faults=self.faults)
+            return LogParser.process(PathMaker.logs_path(), faults=self.faults,
+                                     adversary=self.adversary)
 
         except (OSError, subprocess.SubprocessError, ParseError, RuntimeError) as e:
             raise BenchError('Failed to run benchmark', e)
