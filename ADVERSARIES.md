@@ -2,7 +2,7 @@
 
 From the controller's `benchmark/` directory, after choosing the desired existing deployment branch/commit in the normal repository workflow:
 
-The controller's committed `HEAD` must be fetchable by the AWS machines from the deployment repository and branch configured in `settings.json`; existing remote clones must have the corresponding `origin`. This delivery provides local feature branches and patches/Git bundles, and does not push the commits to a remote repository. Publish the chosen commit to the configured deployment branch before running the AWS workflow, or apply the patch there, commit it, and check out that published commit on the controller. A branch or bundle present only on the local machine is not automatically available to the AWS machines.
+The controller's committed `HEAD` must be fetchable by the AWS machines from the deployment repository and branch configured in `settings.json`; existing remote clones must have the corresponding `origin`. Use the published `adversary-experiments` branch and set `repo.branch` to `adversary-experiments` in your existing settings. Keep your existing repository directory, credentials, and regional layout.
 
 ```bash
 fab create --nodes 4
@@ -36,7 +36,7 @@ A mode is opt-in. Omitting `--adversary` keeps the old run defaults and legacy f
 
 `targeted` is selective scheduling of existing valid messages. It does not generate conflicting signed proposals or implement an equivocation/fork attack. A2 and A4 are not implemented aliases. Scheduling changes delivery and proposal emission; signatures, certificate checks, quorum thresholds, and consensus commit rules keep their original meaning.
 
-The common experiment flags are `--nodes`, `--workers`, `--rate`, `--tx-size`, `--duration`, `--faults`, and `--runs`. `--nodes` takes one count. `--rate 10000,50000` runs those input rates in order. All new mode commands default to `faults=0` if the option is omitted.
+The common experiment flags are `--nodes`, `--workers`, `--rate`, `--tx-size`, `--duration`, and `--faults`. `remote` additionally accepts `--runs` and comma-separated rate sweeps such as `--rate 10000,50000`. `--nodes` takes one count. All new mode commands default to `faults=0` if the option is omitted.
 
 | Adversary option | Default | Meaning |
 | --- | --- | --- |
@@ -59,6 +59,21 @@ The primary environment contains one shell-quoted `BENCH_ADVERSARY_CONFIG` JSON 
 An admitted delayed send remains counted until transport completion/acknowledgement. Its timer does not require new incoming messages, and later consensus garbage collection cannot discard it before release. When the scheduling budget is full, or a message exceeds its byte limit, that message goes immediately through the ordinary transport. The limits bound scheduling storage, not total node memory: the original transport and consensus buffers still exist, and a silent proposer may retain incoming worker batch digests until it can propose again.
 
 The runtime strategy is centralized in `primary/src/adversary.rs`. Python's `benchmark/benchmark/adversary.py` only validates experiment parameters, maps launch IDs to keys, and serializes the configuration. Supporting transport timers and queue accounting implement delivery mechanics; they do not choose adversary strategies.
+
+## Local runs
+
+Run `fab local` from the same `benchmark/` directory. It builds the local binaries and launches every authority on the current machine; it does not use AWS or require `fab create` / `fab install`. The adversary modes, launch-ID mapping, round windows, and queue bounds are the same as for `remote`.
+
+```bash
+fab local --nodes 4 --workers 1 --rate 1000 --tx-size 512 --duration 30 --header-size 20 --faults 0 --adversary none
+fab local --nodes 4 --workers 1 --rate 1000 --tx-size 512 --duration 30 --header-size 20 --faults 0 --adversary silent --byzantine 1 --seed 7 --start-round 1 --attack-rounds 0
+fab local --nodes 4 --workers 1 --rate 1000 --tx-size 512 --duration 30 --header-size 20 --faults 0 --adversary targeted --byzantine 1 --seed 7 --start-round 1 --attack-rounds 0 --delay-ms 200
+fab local --nodes 4 --workers 1 --rate 1000 --tx-size 512 --duration 30 --header-size 20 --faults 0 --adversary network --byzantine 0 --seed 7 --start-round 1 --attack-rounds 0 --delay-ms 200
+```
+
+`local` accepts one input rate and executes one run: omit `--runs` and do not pass a comma-separated rate sweep. `--header-size` overrides the local header threshold in bytes; `remote` retains its existing node parameters and does not accept this flag. Omitted workload/header options use the editable dictionaries inside `local()` in `fabfile.py`, including any local customizations. A no-argument invocation preserves the original defaults and legacy behavior.
+
+Explicit modes also save a timestamped `results/*-local-*.parameters.json` snapshot with the generated public keys and effective configuration. Runs refresh the normal `logs/` directory; preserve logs before starting a subsequent experiment. Inspect available flags with `fab --help local`.
 
 Offline Python validation, from `benchmark/` after installing the repository's normal Python requirements:
 
