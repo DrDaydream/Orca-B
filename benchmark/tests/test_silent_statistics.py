@@ -127,9 +127,11 @@ class SilentStatisticsTests(unittest.TestCase):
                 self.assertEqual(len(metrics['replicas']), 4)
                 self.assertEqual(metrics['excluded_primary_ids'], [])
 
-    def test_local_runner_passes_the_silent_population_to_real_statistics(self):
+    def test_local_a1_crash_runner_passes_survivors_to_real_statistics(self):
         from benchmark.local import LocalBench
         write_logs(self.root, [1, 4, 4, 4])
+        for name in ('primary-0.log', 'worker-0-0.log', 'client-0-0.log'):
+            (self.root / name).unlink()
         params = dict(nodes=4, workers=1, rate=4000, tx_size=512, duration=100, faults=0,
                       adversary=dict(mode='silent', byzantine_ids=[0]))
         node = dict(header_size=1000, max_header_delay=200, gc_depth=50,
@@ -151,7 +153,7 @@ class SilentStatisticsTests(unittest.TestCase):
         write_logs(self.root, [1, 4, 4, 4])
         bench = Bench.__new__(Bench)
         bench.connect = {}
-        committee = SimpleNamespace(workers_addresses=lambda _: [[(0, '127.0.0.1:3001')]] * 4,
+        committee = SimpleNamespace(size=lambda: 4, workers_addresses=lambda _: [[(0, '127.0.0.1:3001')]] * 4,
                                     primary_addresses=lambda _: ['127.0.0.1:3000'] * 4)
         with patch('benchmark.remote.Connection'), patch('benchmark.remote.subprocess.run'), \
              patch('benchmark.remote.PathMaker.logs_path', return_value=str(self.root)):

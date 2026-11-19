@@ -3,7 +3,7 @@ import subprocess
 from math import ceil
 from time import sleep
 
-from benchmark.adversary import resolve_adversary, validate_adversary, write_run_snapshot
+from benchmark.adversary import active_launch_ids, resolve_adversary, validate_adversary, write_run_snapshot
 from benchmark.commands import CommandMaker
 from benchmark.adversary_schedule import build_client_schedules, client_silence_slot_ms
 from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameters, ConfigError
@@ -75,6 +75,7 @@ class LocalBench:
 
             self.node_parameters.print(PathMaker.parameters_file())
             adversary_config = resolve_adversary(self.adversary, names)
+            active = set(active_launch_ids(nodes, adversary_config))
             if adversary_config is not None:
                 snapshot = write_run_snapshot(
                     PathMaker.results_path(), self.benchmark_input, self.node_parameters.json,
@@ -83,7 +84,8 @@ class LocalBench:
                 Print.info(f"Adversary: {adversary_config['mode']}; parameters: {snapshot}")
 
             # Run the clients (they will wait for the nodes to be ready).
-            workers_addresses = committee.workers_addresses(0)
+            workers_addresses = {i: rows for i, rows in enumerate(committee.workers_addresses(0))
+                                 if i in active}
             rate_share = ceil(rate / committee.workers())
             if adversary_config is None:
                 silence_slot_ms = client_silence_slot_ms(
@@ -95,13 +97,13 @@ class LocalBench:
             else:
                 silence_slot_ms = 0
                 silence_schedules = dict.fromkeys(names, '')
-            for i, addresses in enumerate(workers_addresses):
+            for i, addresses in workers_addresses.items():
                 for (id, address) in addresses:
                     cmd = CommandMaker.run_client(
                         address,
                         self.tx_size,
                         rate_share,
-                        [x for y in workers_addresses for _, x in y],
+                        [x for y in workers_addresses.values() for _, x in y],
                         silence_schedules[names[i]],
                         silence_slot_ms,
                     )
@@ -110,6 +112,8 @@ class LocalBench:
 
             # Run the primaries (except the faulty ones).
             for i, address in enumerate(committee.primary_addresses(0)):
+                if i not in active:
+                    continue
                 cmd = CommandMaker.run_primary(
                     PathMaker.key_file(i),
                     PathMaker.committee_file(),
@@ -123,7 +127,7 @@ class LocalBench:
                 self._background_run(cmd, log_file)
 
             # Run the workers (except the faulty ones).
-            for i, addresses in enumerate(workers_addresses):
+            for i, addresses in workers_addresses.items():
                 for (id, address) in addresses:
                     cmd = CommandMaker.run_worker(
                         PathMaker.key_file(i),
@@ -144,7 +148,7 @@ class LocalBench:
             # Parse logs and return the parser.
             Print.info('Parsing logs...')
             return LogParser.process(PathMaker.logs_path(), faults=self.faults,
-                                     adversary=self.adversary)
+                                     adversary=self.adversary, committee_size=nodes)
 
         except (OSError, subprocess.SubprocessError, ParseError, RuntimeError) as e:
             raise BenchError('Failed to run benchmark', e)

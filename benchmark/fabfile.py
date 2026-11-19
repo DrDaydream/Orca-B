@@ -12,7 +12,7 @@ from benchmark.remote import Bench, BenchError
 
 
 @task(help={
-    'adversary': 'Mode: none/A0, silent/A1, targeted/A3, network/A5; omitted keeps legacy behavior.',
+    'adversary': 'Mode: none/A0, silent/A1 (full-run crashes), targeted/A3, network/A5; omitted keeps legacy behavior.',
     'header-size': 'Override the local header size in bytes.',
     'bullshark-alternating': 'Bullshark: true or false for alternate unavailable leader slots.',
 })
@@ -119,13 +119,13 @@ def install(ctx):
 
 
 @task(help={
-    'adversary': 'Explicit mode: none/A0, silent/A1, targeted/A3, network/A5; omitted preserves legacy behavior.',
+    'adversary': 'Explicit mode: none/A0, silent/A1 (full-run crashes), targeted/A3, network/A5; omitted preserves legacy behavior.',
     'faults': 'Legacy faults (original default when mode omitted); explicit modes default to 0.',
     'delay-ms': 'Selected message delay in milliseconds, 1..86400000.',
-    'byzantine': 'Fixed Byzantine count (first launch IDs), at most floor((nodes-1)/3).',
+    'byzantine': 'Fixed count (A1: last launch IDs; A3/A5: first IDs), at most floor((nodes-1)/3).',
     'byzantine-ids': 'Comma-separated zero-based launch IDs; mutually exclusive with byzantine.',
     'bullshark-alternating': 'Bullshark only: true or false; alternate normal/unavailable leader slots.',
-    'attack-rounds': 'Attack window length; 0 means unbounded.',
+    'attack-rounds': 'A3/A5 round window; 0 is unbounded. A1 requires 0 and start-round=1.',
     'rate': 'Input transactions per second; comma-separated values run a sweep.',
 })
 def remote(ctx, debug=False, nodes=20, workers=1, rate='50000', tx_size=512,

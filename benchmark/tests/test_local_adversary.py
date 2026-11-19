@@ -96,15 +96,16 @@ class LocalAdversaryTests(unittest.TestCase):
                 self.assertEqual(config['mode'], mode)
                 self.assertEqual(config['byzantine_authorities'], [KEYS[1]] if mode in ['silent', 'targeted'] else [])
                 primaries = [c for c in commands if c.endswith(' primary')]
-                self.assertEqual(len(primaries), 4)
+                self.assertEqual(len(primaries), 3 if mode == 'silent' else 4)
                 for command in primaries:
                     env = dict(token.split('=', 1) for token in shlex.split(command)
                                if '=' in token and token.split('=', 1)[0].isidentifier())
-                    self.assertEqual(json.loads(env['BENCH_ADVERSARY_CONFIG']), config)
+                    self.assertEqual(json.loads(env['BENCH_ADVERSARY_CONFIG']),
+                                     dict(mode='none', bullshark_alternating=False) if mode == 'silent' else config)
                     if PROTOCOL == 'orca':
                         self.assertEqual(env['ORCA_FAULTS'], '0')
                 clients = [c for c in commands if './benchmark_client ' in c]
-                self.assertEqual(len(clients), 4)
+                self.assertEqual(len(clients), 3 if mode == 'silent' else 4)
                 self.assertTrue(all('--silence-schedule' not in c for c in clients))
 
     def test_direct_local_api_rejects_bad_identity_before_cleanup(self):

@@ -202,6 +202,11 @@ impl DeliveryPolicy for Policy {
             return Delivery::Send;
         }
         if let Some(recipient) = self.aba_peers.get(&address) {
+            // ABA scheduling is reserved for A5. A3 only controls GRBC traffic;
+            // A1 process failures are applied by the benchmark launcher.
+            if self.config.mode != Mode::Network {
+                return Delivery::Send;
+            }
             let envelope: crate::messages::ConsensusNetworkMessage =
                 bincode::deserialize(data).expect("Locally serialized ABA envelope");
             let batches: Vec<Vec<u8>> =
@@ -280,7 +285,7 @@ pub(crate) fn schedule_aba() -> bool {
         .lock()
         .unwrap()
         .as_ref()
-        .map_or(false, |runtime| runtime.policy.schedules_local_sender())
+        .map_or(false, |runtime| runtime.policy.config.mode == Mode::Network)
 }
 
 pub(crate) fn fixed_silence(name: PublicKey, round: u64) -> Option<bool> {

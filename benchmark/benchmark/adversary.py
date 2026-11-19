@@ -1,6 +1,7 @@
 """Explicit benchmark adversaries: parameter validation and primary launch config."""
 from datetime import datetime, timezone
 import json
+from math import ceil
 from pathlib import Path
 from shlex import quote
 
@@ -54,6 +55,13 @@ def validate_adversary(options, protocol, nodes, faults):
         raise ValueError('delay-ms must be between 1 and 86400000')
     if config['rounds'] and config['start_round'] > U64_MAX - config['rounds']:
         raise ValueError('start-round + attack-rounds exceeds the unsigned 64-bit range')
+    if mode == 'silent':
+        if faults:
+            raise ValueError('A1 requires --faults 0; select crashed nodes with --byzantine or --byzantine-ids')
+        if config['start_round'] != 1 or config['rounds'] != 0:
+            raise ValueError('A1 is a full-run crash: require --start-round 1 --attack-rounds 0')
+        config['fault_model'] = 'crash-stop'
+        config['bullshark_alternating'] = False
     ids = options.get('byzantine_ids', [])
     if not isinstance(ids, (list, tuple)):
         raise ValueError('byzantine_ids must be launch node IDs')
@@ -107,7 +115,7 @@ def remote_parameters(*, nodes, workers, rate, tx_size, duration, faults, runs,
     if count > (nodes - 1) // 3:
         raise ValueError('Fixed Byzantine set exceeds f=floor((n-1)/3)')
     if count:
-        ids = list(range(count))
+        ids = list(range(nodes - count, nodes)) if MODES.get(mode) == 'silent' else list(range(count))
     options = dict(mode=mode, byzantine_ids=ids, seed=seed, start_round=start_round,
                    rounds=attack_rounds, delay_ms=delay_ms,
                    max_pending_messages=max_pending_messages,
@@ -147,12 +155,75 @@ def resolve_adversary(options, launch_authorities):
         raise ValueError('Byzantine launch ID is outside this committee')
     config = {name: value for name, value in options.items() if name != 'byzantine_ids'}
     config['byzantine_authorities'] = [names[i] for i in ids]
+    if config.get('fault_model') == 'crash-stop':
+        config['byzantine_ids'] = list(ids)
     return config
+
+
+def active_launch_ids(nodes, adversary=None, faults=0):
+    """Keep original launch IDs; A1 omits primary, workers and clients together."""
+    missing = set(range(nodes - faults, nodes))
+    if adversary and adversary.get('fault_model') == 'crash-stop':
+        missing.update(adversary['byzantine_ids'])
+    if any(type(i) is not int or i < 0 or i >= nodes for i in missing):
+        raise ValueError('Inactive authority outside the committee')
+    active = [i for i in range(nodes) if i not in missing]
+    if not active:
+        raise ValueError('At least one authority must be started')
+    return active
+
+
+def crash_population(directory, primary_ids, adversary=None, committee_size=None):
+    """Validate a complete A1 log population, including when reparsing an archive."""
+    directory = Path(directory)
+    saved_path = directory / 'measurement-population.json'
+    if adversary and adversary.get('fault_model') == 'crash-stop':
+        crashed = adversary['byzantine_ids']
+        if committee_size is None:
+            raise ValueError('A1 log parsing requires the original committee size')
+    elif adversary is None and saved_path.exists():
+        saved = json.loads(saved_path.read_text(encoding='utf-8'))
+        if saved.get('fault_model') != 'crash-stop':
+            return None
+        if saved.get('schema_version') != 2:
+            raise ValueError('Unknown crash population version')
+        crashed = saved['crashed_primary_ids']
+        if committee_size is not None and committee_size != saved['committee_size']:
+            raise ValueError('Committee size differs from saved population')
+        committee_size = saved['committee_size']
+        if sorted(saved['primary_ids']) != sorted(primary_ids):
+            raise ValueError('Saved crash population does not match primary logs')
+    else:
+        return None
+    if (type(committee_size) is not int or committee_size < 2 or not isinstance(crashed, list)
+            or not crashed or len(set(crashed)) != len(crashed)
+            or any(type(i) is not int or i < 0 or i >= committee_size for i in crashed)):
+        raise ValueError('Invalid crashed authority IDs or committee size')
+    expected = set(range(committee_size)) - set(crashed)
+    if set(primary_ids) != expected or len(primary_ids) != len(expected):
+        raise ValueError('A1 primary logs must contain exactly the surviving authorities')
+    for kind in ('client', 'worker'):
+        actual = {}
+        for path in directory.glob(f'{kind}-*.log'):
+            parts = path.stem.split('-')
+            if len(parts) != 3:
+                raise ValueError(f'Invalid {kind} log identity: {path.name}')
+            ident, worker = map(int, parts[1:])
+            actual.setdefault(ident, set()).add(worker)
+        if set(actual) != expected or len({tuple(sorted(v)) for v in actual.values()}) != 1:
+            raise ValueError(f'A1 {kind} logs do not cover the surviving authorities')
+    return dict(schema_version=2, fault_model='crash-stop', committee_size=committee_size,
+                primary_ids=primary_ids, excluded_primary_ids=[],
+                crashed_primary_ids=sorted(crashed))
 
 
 def adversary_environment(config):
     if config is None:
         return ''
+    if config.get('fault_model') == 'crash-stop':
+        # A1 is implemented by the launcher, including on Bullshark. Running
+        # authorities must not acquire the previous runtime silence/slot faults.
+        config = dict(mode='none', bullshark_alternating=False)
     encoded = json.dumps(config, separators=(',', ':'), sort_keys=True)
     # env works both with ordinary shell commands and with Bullshark's exec wrapper.
     return f'env BENCH_ADVERSARY_CONFIG={quote(encoded)} '
@@ -168,5 +239,13 @@ def write_run_snapshot(directory, benchmark_parameters, node_parameters,
         benchmark_parameters=benchmark_parameters, node_parameters=node_parameters,
         launch_authorities=list(launch_authorities), adversary=config,
     )
+    legacy_faults = benchmark_parameters.get('faults', 0) if protocol.startswith('bullshark') else 0
+    active = active_launch_ids(nodes, config, legacy_faults)
+    workers = benchmark_parameters['workers']
+    snapshot.update(fault_model=config.get('fault_model', 'runtime'),
+                    active_launch_ids=active,
+                    inactive_launch_ids=[i for i in range(nodes) if i not in active],
+                    offered_rate_tps=ceil(rate / (nodes * workers)) * len(active) * workers)
+    snapshot['aba_scheduling'] = 'A5-only' if protocol.startswith('orca-b') else 'not-applicable'
     output.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + '\n', encoding='utf-8')
     return str(output)
