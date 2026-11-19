@@ -302,7 +302,7 @@ fn aba_batches_split_by_instance_without_changing_messages() {
 }
 
 #[tokio::test]
-async fn signed_aba_envelope_uses_instance_round_and_honest_batches_stay_unchanged() {
+async fn only_a5_delays_signed_aba_envelopes_using_the_instance_round() {
     use crate::messages::{AbaMessage, AbaMessageKind, BinaryValue, ConsensusNetworkMessage};
     let mut policy = policy("targeted");
     policy.config.start_round = 7;
@@ -333,12 +333,25 @@ async fn signed_aba_envelope_uses_instance_round_and_honest_batches_stay_unchang
     .await;
     envelope.verify(&committee()).unwrap();
     let wire = Bytes::from(bincode::serialize(&envelope).unwrap());
-    assert!(
-        matches!(policy.delivery(address, &wire), Delivery::Delay(_, _)),
-        "instance 7 lies in window even though ABA round is 2"
-    );
+    assert!(matches!(policy.delivery(address, &wire), Delivery::Send),
+            "A3 must deliver ABA normally, including from a Byzantine sender");
+    for kind in [AbaMessageKind::BVal(BinaryValue::One),
+                 AbaMessageKind::Aux(BinaryValue::Zero),
+                 AbaMessageKind::Decide(BinaryValue::One)] {
+        let messages = vec![AbaMessage { instance: 7, round: 2, kind }];
+        let batches = vec![bincode::serialize(&messages).unwrap()];
+        let envelope = ConsensusNetworkMessage::new(
+            bincode::serialize(&batches).unwrap(), policy.name, &mut signature_service,
+        ).await;
+        let packet = Bytes::from(bincode::serialize(&envelope).unwrap());
+        policy.config.mode = Mode::Targeted;
+        assert!(matches!(policy.delivery(address, &packet), Delivery::Send));
+        policy.config.mode = Mode::Network;
+        assert!(matches!(policy.delivery(address, &packet), Delivery::Delay(_, _)),
+                "A5 still delays each ABA message kind inside the instance window");
+    }
     policy.config.mode = Mode::Silent;
-    assert!(matches!(policy.delivery(address, &wire), Delivery::Drop(_)));
+    assert!(matches!(policy.delivery(address, &wire), Delivery::Send));
     policy.name = policy.leaders[1];
     assert!(!policy.schedules_local_sender());
     assert!(matches!(policy.delivery(address, &wire), Delivery::Send));

@@ -10,6 +10,7 @@ from re import findall, search
 from statistics import mean
 
 from benchmark.utils import Print
+from benchmark.adversary import crash_population
 from benchmark.measurements import Measurements, format_measurements
 
 
@@ -38,6 +39,7 @@ class LogParser:
         included = lambda values: [value for ident, value in zip(self.primary_ids, values)
                                    if ident not in excluded]
 
+        self.crashed_primary_ids = []
         self.faults = faults
         if isinstance(faults, int):
             self.committee_size = len(primaries)
@@ -116,6 +118,7 @@ class LogParser:
         metrics = self.measurements.metrics(duration=duration, warmup=warmup, drain=drain)
         metrics['included_primary_ids'] = self.included_primary_ids
         metrics['excluded_primary_ids'] = self.excluded_primary_ids
+        metrics['crashed_primary_ids'] = self.crashed_primary_ids
         for row, ident in zip(metrics['replicas'], self.included_primary_ids):
             row['replica'] = ident
         if metrics['aba'] is not None:
@@ -491,6 +494,7 @@ class LogParser:
             '-----------------------------------------\n'
             ' + CONFIG:\n'
             f' Faults: {self.faults} node(s)\n'
+            f' Crashed authority IDs: {",".join(map(str, self.crashed_primary_ids)) or "none"}\n'
             f' Committee size: {self.committee_size} node(s)\n'
             f' Commit replicas included: {len(self.included_primary_ids)} node(s)\n'
             f' Excluded A1 silent replica IDs: {",".join(map(str, self.excluded_primary_ids)) or "none"}\n'
@@ -548,7 +552,7 @@ class LogParser:
             output.write('\n')
 
     @classmethod
-    def process(cls, directory, faults=0, adversary=None):
+    def process(cls, directory, faults=0, adversary=None, committee_size=None):
         assert isinstance(directory, str)
 
         primary_files = sorted(glob(join(directory, 'primary-*.log')))
@@ -560,7 +564,13 @@ class LogParser:
             primary_ids.append(int(match.group(1)))
         population_path = Path(directory) / 'measurement-population.json'
         excluded = []
-        if adversary is not None:
+        try:
+            crash = crash_population(directory, primary_ids, adversary, committee_size)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            raise ParseError(f'Invalid crash population: {error}') from error
+        if crash is not None:
+            pass
+        elif adversary is not None:
             if str(adversary.get('mode', '')).lower() in ('silent', 'a1'):
                 excluded = adversary['byzantine_ids']
         elif population_path.exists():
@@ -602,10 +612,17 @@ class LogParser:
         ]
         result.measurements.replica_logs = [path for ident, path in zip(primary_ids, primary_files)
                                            if ident not in result.excluded_primary_ids]
-        if adversary is not None:
+        if adversary is not None and crash is None:
             population = dict(schema_version=1, primary_ids=primary_ids,
                               excluded_primary_ids=result.excluded_primary_ids)
             temporary = population_path.with_suffix('.json.tmp')
             temporary.write_text(json.dumps(population, indent=2) + '\n', encoding='utf-8')
             temporary.replace(population_path)
+        if crash is not None:
+            result.crashed_primary_ids = crash['crashed_primary_ids']
+            result.committee_size = crash['committee_size']
+            result.faults = len(crash['crashed_primary_ids'])
+            temporary = Path(directory) / 'measurement-population.json.tmp'
+            temporary.write_text(json.dumps(crash, indent=2) + '\n', encoding='utf-8')
+            temporary.replace(Path(directory) / 'measurement-population.json')
         return result

@@ -8,7 +8,7 @@ The controller's committed `HEAD` must be fetchable by the AWS machines from the
 fab create --nodes 4
 fab install
 fab remote --nodes 4 --workers 1 --rate 10000 --tx-size 512 --duration 60 --faults 0 --runs 1 --adversary none
-fab remote --nodes 4 --workers 1 --rate 10000 --tx-size 512 --duration 60 --faults 0 --runs 1 --adversary silent --byzantine 1 --seed 7 --start-round 5 --attack-rounds 40
+fab remote --nodes 4 --workers 1 --rate 10000 --tx-size 512 --duration 60 --faults 0 --runs 1 --adversary silent --byzantine 1 --seed 7 --start-round 1 --attack-rounds 0
 fab remote --nodes 4 --rate 10000 --duration 60 --faults 0 --runs 1 --adversary targeted --byzantine-ids 1 --seed 7 --delay-ms 200
 fab remote --nodes 4 --rate 10000 --duration 60 --faults 0 --runs 1 --adversary network --byzantine 0 --seed 7 --delay-ms 200
 ```
@@ -21,16 +21,18 @@ Orca's legacy `faults` controls a moving proposer schedule. Explicit modes requi
 
 Orca has an ordinary leader target each round. `silent` and `targeted` require a nonempty fixed Byzantine set; `network` can run with an empty set. The Bullshark alternation option is accepted for a common command interface but does not change Orca's schedule.
 
-The window is keyed to a proposal/vote's evidence round, or to the leader-round instance for ABA. New-round proposal and send behavior resumes outside the window. A proposal withheld during a silent round is not created retroactively, and repair traffic for evidence inside that round window can remain omitted; the window does not promise later replay of all previously withheld evidence. Explicit modes do not use the legacy worker `BatchSilent` control or client silence schedule.
+A3/A5 use the evidence round for their attack window. A1 is a full-run crash: require `--start-round 1 --attack-rounds 0`, and do not combine it with nonzero `--faults`. The selected authorities have no primary, workers or corresponding clients for the whole run. Surviving primaries receive `mode=none` with alternating leader faults disabled. The committee still contains all configured authorities and keeps its original quorum.
 
 The controller workflow is `fab create`, `fab install`, then any number of `fab remote` runs. Run these commands from `benchmark/` with your existing `settings.json`. `fab install` prepares dependencies, fetches the configured branch, checks out the controller's exact commit on every testbed machine, and compiles both the remote and controller binaries. `fab remote` only verifies the installed build, generates and uploads experiment configuration, runs the benchmark, and downloads results; it never installs packages, fetches source or compiles. Changing rate, node count or adversary parameters reuses the same installed binaries. New instances, a different controller commit, missing binaries or a failed build require `fab install` again. Existing binaries installed by older scripts need one `fab install` to record the build marker. Use `fab --help remote` to inspect the unchanged parameters.
+
+Only A5 may delay ABA envelopes (BVal, Aux and Decide). A3 schedules GRBC traffic and leaves ABA delivery and batching on the ordinary path, even for a Byzantine sender. A1 omits crashed processes; ABA from surviving processes uses ordinary delivery. This does not prevent GRBC delays or missing processes from indirectly slowing consensus progress.
 
 A mode is opt-in. Omitting `--adversary` keeps the old run defaults and legacy fault behavior. Explicit `--adversary none` (alias `A0`) is the no-injection baseline. The only aliases are:
 
 | Mode | Alias | Behavior |
 | --- | --- | --- |
 | `none` | `A0` | No scheduling injection. |
-| `silent` | `A1` | Fixed Byzantine authorities suppress proposals and selected primary protocol sends during the attack window. |
+| `silent` | `A1` | Whole-run process crashes, matching legacy Bullshark faults: omit each selected primary, all its workers and clients. |
 | `targeted` | `A3` | Fixed Byzantine senders use a deterministic, leader-dependent recipient schedule to delay valid signed evidence. |
 | `network` | `A5` | The delivery schedule can also delay sends from honest authorities. An empty fixed Byzantine set is allowed. |
 
@@ -40,31 +42,33 @@ The common experiment flags are `--nodes`, `--workers`, `--rate`, `--tx-size`, `
 
 | Adversary option | Default | Meaning |
 | --- | --- | --- |
-| `--byzantine` | `0` | Fixed Byzantine count; selects launch IDs `0..count-1`. |
+| `--byzantine` | `0` | A1 selects the last `count` launch IDs; A3/A5 select IDs `0..count-1`. |
 | `--byzantine-ids` | empty | Explicit comma-separated launch IDs, e.g. `0,2`; use instead of a positive count. |
 | `--seed` | `1` | Deterministic scheduling seed, unsigned 64-bit integer. |
-| `--start-round` | `1` | First protocol round affected; at least 1. |
-| `--attack-rounds` | `0` | Window length; zero is unbounded. |
+| `--start-round` | `1` | A3/A5 first affected round; A1 requires 1. |
+| `--attack-rounds` | `0` | A3/A5 window length; zero is unbounded. A1 requires 0. |
 | `--delay-ms` | `200` | Delay of selected sends, from 1 through 86,400,000 ms. |
 | `--max-pending-messages` | `4096` | Positive per-primary bound on admitted delayed messages, including sends still awaiting transport completion. |
 | `--max-pending-bytes` | `67108864` | Positive per-primary bound on their retained serialized message bytes. |
-| `--bullshark-alternating` | `true` | Bullshark only; accepts the value `true` or `false`. |
+| `--bullshark-alternating` | `true` | Bullshark A3/A5 only; accepts `true` or `false`. A1 always disables it. |
 
-The bounded window is `[start_round, start_round + attack_rounds)`; overflow is rejected. Queue bounds fit the 64-bit deployment target. Fixed Byzantine membership is selected once per committee: its size cannot exceed `f = floor((nodes - 1) / 3)`, IDs must be unique and in range, and they refer to key-generation/launch order (the ID used by `.node-<id>.json`), not a public-key sort order or a shortened display ID. Each primary receives the corresponding full public keys. Parameter errors are rejected before constructing the AWS manager.
+For A3/A5, the bounded window is `[start_round, start_round + attack_rounds)`; overflow is rejected. Queue bounds fit the 64-bit deployment target. Fixed Byzantine membership is selected once per committee: its size cannot exceed `f = floor((nodes - 1) / 3)`, IDs must be unique and in range, and they refer to key-generation/launch order (the ID used by `.node-<id>.json`), not a public-key sort order or a shortened display ID. A3/A5 primaries receive the corresponding full public keys; A1 uses the launch IDs to omit processes. Parameter errors are rejected before constructing the AWS manager.
 
 Every explicit-mode run writes a timestamped `results/*-n<N>-r<R>-run<I>.parameters.json` file before launch, including benchmark parameters, node parameters, the full launch-ID-to-public-key array, and resolved runtime configuration. The controller prints its path. Keep this file with the run's logs and normal performance results. A seed is deterministic for the same committee, parameters, and protocol rounds; `fab remote` generates new keys, so the seed alone is not a promise of the same identity-dependent schedule across fresh committees.
 
-The primary environment contains one shell-quoted `BENCH_ADVERSARY_CONFIG` JSON object with `mode`, `byzantine_authorities`, `seed`, `start_round`, `rounds`, `delay_ms`, `max_pending_messages`, `max_pending_bytes`, and `bullshark_alternating`. Fabric resolves aliases and launch IDs before passing it to Rust. The benchmark clients and workers continue to receive ordinary workload commands.
+The primary environment contains one shell-quoted `BENCH_ADVERSARY_CONFIG` JSON object with `mode`, `byzantine_authorities`, `seed`, `start_round`, `rounds`, `delay_ms`, `max_pending_messages`, `max_pending_bytes`, and `bullshark_alternating`. Fabric resolves aliases and launch IDs before passing it to Rust. A3/A5 clients and workers receive ordinary workload commands. A1 omits those belonging to crashed identities.
 
-An admitted delayed send remains counted until transport completion/acknowledgement. Its timer does not require new incoming messages, and later consensus garbage collection cannot discard it before release. When the scheduling budget is full, or a message exceeds its byte limit, that message goes immediately through the ordinary transport. The limits bound scheduling storage, not total node memory: the original transport and consensus buffers still exist, and a silent proposer may retain incoming worker batch digests until it can propose again.
+An admitted delayed send remains counted until transport completion/acknowledgement. Its timer does not require new incoming messages, and later consensus garbage collection cannot discard it before release. When the scheduling budget is full, or a message exceeds its byte limit, that message goes immediately through the ordinary transport. The limits bound scheduling storage, not total node memory: the original transport and consensus buffers still exist, independently of the scheduler.
 
-For explicit `silent/A1`, local and remote summaries exclude the fixed silent identities as commit-observation replicas for the whole run, including bounded attack windows. Both the pooled release-to-final latency and first-replica final comparison use only the included replicas. Committee size and all client/worker inputs are retained; unfinished samples at included replicas remain unfinished, never zero-latency completions. The summary lists the included count and excluded launch IDs. `logs/measurement-population.json` preserves this choice for `fab logs` and offline parsing. Keep it with the raw logs. Other adversary modes keep their existing native summary population.
+For A1, log download and latency statistics include only surviving authorities and their sources. The summary records the full committee size, crash count and original crashed IDs. `logs/measurement-population.json` (schema 2) preserves this information for `fab logs`; a missing surviving primary/client/worker log is an error. Historical Orca schema-1 silence archives keep their original interpretation.
 
-The runtime strategy is centralized in `primary/src/adversary.rs`. Python's `benchmark/benchmark/adversary.py` only validates experiment parameters, maps launch IDs to keys, and serializes the configuration. Supporting transport timers and queue accounting implement delivery mechanics; they do not choose adversary strategies.
+A1 keeps the legacy per-client rate `ceil(rate / (nodes * workers))`; removing clients lowers the aggregate configured offered load. For 10 nodes, 3 crashes, 1 worker and rate 10000, 7 clients each use 1000 tx/s, totaling 7000 tx/s. Parameter snapshots record `fault_model`, `active_launch_ids`, `inactive_launch_ids` and `offered_rate_tps`. This is configured load, not measured ingress.
+
+The runtime strategy is centralized in `primary/src/adversary.rs`. Python's `benchmark/benchmark/adversary.py` validates experiment parameters, chooses A1's active launch IDs, maps IDs to keys, and saves configuration and log population metadata. Supporting transport timers and queue accounting implement delivery mechanics; they do not choose adversary strategies.
 
 ## Local runs
 
-Run `fab local` from the same `benchmark/` directory. It builds the local binaries and launches every authority on the current machine; it does not use AWS or require `fab create` / `fab install`. The adversary modes, launch-ID mapping, round windows, and queue bounds are the same as for `remote`.
+Run `fab local` from the same `benchmark/` directory. It builds the local binaries and launches the active authorities on the current machine; it does not use AWS or require `fab create` / `fab install`. The adversary modes, launch-ID mapping, round windows, and queue bounds are the same as for `remote`.
 
 ```bash
 fab local --nodes 4 --workers 1 --rate 1000 --tx-size 512 --duration 30 --header-size 20 --faults 0 --adversary none

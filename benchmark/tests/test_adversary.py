@@ -65,10 +65,10 @@ class AdversaryParameterTests(unittest.TestCase):
         self.assertEqual(config['rounds'], 0)
         self.assertEqual(config['max_pending_bytes'], 67108864)
 
-    def test_count_selects_first_launch_ids_and_resolves_full_keys(self):
+    def test_a1_count_selects_last_launch_ids_and_resolves_full_keys(self):
         params = parameters(adversary='silent', byzantine=1)
         self.assertEqual(resolve_adversary(params['adversary'], KEYS)
-                         ['byzantine_authorities'], [KEYS[0]])
+                         ['byzantine_authorities'], [KEYS[-1]])
 
     def test_invalid_identity_sets_fail_before_launch(self):
         cases = [dict(byzantine=2), dict(byzantine_ids='1,1'),
@@ -98,11 +98,10 @@ class AdversaryParameterTests(unittest.TestCase):
         config = resolve_adversary(parameters(adversary='network')['adversary'], KEYS)
         self.assertEqual(config['byzantine_authorities'], [])
         if PROTOCOL == 'bullshark':
-            options = parameters(adversary='silent')['adversary']
+            options = parameters(adversary='targeted')['adversary']
             self.assertTrue(resolve_adversary(options, KEYS)['bullshark_alternating'])
-        else:
-            with self.assertRaises(ValueError):
-                parameters(adversary='silent')
+        with self.assertRaises(ValueError):
+            parameters(adversary='silent')
 
     def test_false_alternation_requires_fixed_set_for_silent_and_targeted(self):
         for mode in ('silent', 'targeted'):
@@ -117,7 +116,7 @@ class AdversaryParameterTests(unittest.TestCase):
 
     def test_faults_keep_protocol_meaning(self):
         if PROTOCOL == 'bullshark':
-            params = parameters(adversary='silent', byzantine_ids='0', faults=1)
+            params = parameters(adversary='targeted', byzantine_ids='0', faults=1)
             self.assertEqual(params['faults'], 1)
             with self.assertRaises(ValueError):
                 parameters(adversary='silent', byzantine_ids='3', faults=1)
