@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts' / 'a1_acceptance.py'
@@ -58,6 +58,39 @@ def sample_report(case, latency=1000, completed=8, released=10):
 
 
 class MatrixTests(unittest.TestCase):
+    def test_repository_directory_overrides_match_dry_run_and_execution(self):
+        for protocol, flag, directory in [
+            ('Orca-B', '--orca-b-dir', 'Orca-B-grbc'),
+            ('Orca-A', '--orca-a-dir', 'alternate A'),
+        ]:
+            with self.subTest(protocol=protocol), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for index, override in enumerate((directory, (root / directory).as_posix())):
+                    bench = root / directory / 'benchmark'
+                    bench.mkdir(parents=True, exist_ok=True)
+                    acceptance.save(bench / 'settings.json', {'repo': {'name': protocol}})
+                    output, printed = root / f'campaign-{index}', io.StringIO()
+                    args = ['--root', str(root), '--output', str(output), '--protocol', protocol,
+                            '--nodes', '10', flag, override]
+                    with patch.object(acceptance.subprocess, 'Popen') as launch, redirect_stdout(printed):
+                        self.assertEqual(acceptance.main([*args, '--dry-run']), 0)
+                    self.assertIn(acceptance.shlex.quote(bench.as_posix()), printed.getvalue())
+                    self.assertFalse(output.exists())
+                    launch.assert_not_called()
+                    campaign = dict(identities={})
+                    with patch.object(acceptance.sys, 'platform', 'linux'), \
+                         patch.object(acceptance.shutil, 'which', return_value='/usr/bin/fab'), \
+                         patch.object(acceptance.signal, 'signal'), \
+                         patch.object(acceptance, 'controller_lock', return_value=nullcontext()), \
+                         patch.object(acceptance, 'open_campaign', return_value=campaign), \
+                         patch.object(acceptance, 'identity', return_value={'commit': 'fixture'}) as identity, \
+                         patch.object(acceptance, 'run_case') as run_case, \
+                         patch.object(acceptance, 'write_report', return_value={'passed': False}):
+                        self.assertEqual(acceptance.main(args), 1)
+                    identity.assert_called_once_with(bench.resolve())
+                    self.assertEqual(run_case.call_count, 5)
+                    self.assertTrue(all(call.args[1] == bench.resolve() for call in run_case.call_args_list))
+
     def test_exact_toolkit_rounding_and_a1_population(self):
         cases = acceptance.cases()
         self.assertEqual(len(cases), 30)

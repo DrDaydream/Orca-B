@@ -14,7 +14,7 @@ import importlib.util
 import json
 import math
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import shlex
 import shutil
@@ -669,7 +669,11 @@ def controller_lock():
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=Path('/home/ubuntu/experiments'),
-                        help='Parent directory containing Orca-A/benchmark and Orca-B/benchmark')
+                        help='Parent directory for relative repository paths')
+    parser.add_argument('--orca-a-dir', type=Path, default=Path('Orca-A'),
+                        help='Orca-A checkout, absolute or relative to --root')
+    parser.add_argument('--orca-b-dir', type=Path, default=Path('Orca-B'),
+                        help='Orca-B checkout, absolute or relative to --root (e.g. Orca-B-grbc)')
     parser.add_argument('--output', type=Path, required=True,
                         help='Separate acceptance campaign directory; never reuse a figure-matrix output')
     parser.add_argument('--protocol', choices=('all', *PROTOCOLS), default='all',
@@ -687,6 +691,8 @@ def main(argv=None):
     parser.add_argument('--rerun-latency-failures', action='store_true', help='Explicitly replace a valid >=3000 ms attempt; retain old evidence')
     args = parser.parse_args(argv)
     output = args.output.expanduser().resolve()
+    benches = {protocol: args.root.expanduser() / directory.expanduser() / 'benchmark'
+               for protocol, directory in [('Orca-A', args.orca_a_dir), ('Orca-B', args.orca_b_dir)]}
     try:
         plan = cases(duration=args.duration, warmup=args.warmup, drain=args.drain, header_size=args.header_size)
         chosen = [c for c in plan if (args.protocol == 'all' or c['protocol'] == args.protocol)
@@ -698,10 +704,10 @@ def main(argv=None):
                   f'output={args.output.as_posix()}')
             print(f'Serial execution shares {LOCK.as_posix()}; start only after the existing matrix finishes.')
             for case in chosen:
-                bench = PurePosixPath(args.root.as_posix()) / case['protocol'] / 'benchmark'
+                bench = benches[case['protocol']]
                 print(f"\n# {case_key(case)}; nominal={case['nominal_rate_tps']}; "
                       f"offered={case['offered_rate_tps']}; active={len(case['active_launch_ids'])}")
-                print(f'cd {shlex.quote(str(bench))}\n{shlex.join(command(case))}')
+                print(f'cd {shlex.quote(bench.as_posix())}\n{shlex.join(command(case))}')
             return 0
         if args.report_only:
             campaign = read(output / 'campaign.json')
@@ -721,7 +727,7 @@ def main(argv=None):
             campaign = open_campaign(output, plan, args.variant)
             try:
                 for protocol in dict.fromkeys(c['protocol'] for c in chosen):
-                    bench = (args.root / protocol / 'benchmark').resolve()
+                    bench = benches[protocol].resolve()
                     ident = identity(bench)
                     require(read(bench / 'settings.json')['repo']['name'] == protocol,
                             f'{protocol} settings.json points at another repository')

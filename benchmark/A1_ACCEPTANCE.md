@@ -59,6 +59,7 @@ require settings, installed binaries or cloud credentials:
 ```bash
 python3 /home/ubuntu/experiments/Orca-A/benchmark/scripts/a1_acceptance.py \
   --root /home/ubuntu/experiments \
+  --orca-b-dir Orca-B-grbc \
   --output /home/ubuntu/experiments/a1-acceptance-clock-v1 \
   --dry-run
 ```
@@ -67,6 +68,13 @@ Use a new, dedicated acceptance output directory. Do not reuse a figure-matrix
 output, copy old selected results into it, or update the active figure toolkit.
 The full manifest always contains both protocols and all 30 cases. `--protocol`
 and `--nodes` only filter the work performed in the current invocation.
+
+Repository names and checkout directories can differ. `--orca-a-dir` and
+`--orca-b-dir` default to `Orca-A` and `Orca-B`; each accepts an absolute checkout
+path or a path relative to `--root`. For the controller's `Orca-B-grbc` checkout,
+pass `--orca-b-dir Orca-B-grbc` as shown here. Planning and execution use the
+same mapping; the selected checkout's `settings.json` must still name the actual
+protocol (`Orca-B`), and its source/build identity is checked before execution.
 
 After Mysticeti completes, first install Orca-A on the existing testbed using
 the normal native installation procedure. For example, on an idle controller
@@ -92,11 +100,12 @@ campaign; a changed configuration requires a new campaign.
 Then install Orca-B and run its group serially against the same output:
 
 ```bash
-cd /home/ubuntu/experiments/Orca-B/benchmark
+cd /home/ubuntu/experiments/Orca-B-grbc/benchmark
 flock -n /tmp/five-protocol-figure-matrix.lock fab install
 
 python3 scripts/a1_acceptance.py \
   --root /home/ubuntu/experiments \
+  --orca-b-dir Orca-B-grbc \
   --output /home/ubuntu/experiments/a1-acceptance-clock-v1 \
   --protocol Orca-B
 ```
