@@ -91,7 +91,6 @@ pub struct Core {
     grade_one_certificates: HashMap<Digest, Certificate>,
     /// Header IDs whose broadcast no longer needs local processing.
     completed: HashSet<Digest>,
-    round_advance_pending: HashMap<Digest, Certificate>,
     /// Completed blocks not yet referenced by a weak edge.
     weak_edge_candidates: HashMap<Digest, Round>,
     /// Sender only for small synchronization requests.
@@ -156,7 +155,6 @@ impl Core {
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 grade_one_certificates: HashMap::new(),
                 completed: HashSet::new(),
-                round_advance_pending: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
@@ -196,7 +194,7 @@ impl Core {
         self.missing_proposals.remove(&digest);
         // Consensus may traverse complete, authenticated data before local
         // GRBC delivery. This experimental early path assumes no equivocation;
-        // voting still waits for the DAG dependency checks below.
+        // voting proceeds independently of local DAG dependency availability.
         if let std::collections::hash_map::Entry::Vacant(entry) =
             self.proposal_headers.entry(header.id.clone())
         {
@@ -221,8 +219,8 @@ impl Core {
         self.process_header(&header).await
     }
 
-    /// Count a fresh vote and report only threshold crossings. Proposal and
-    /// dependency arrival separately recheck votes collected before validation.
+    /// Count a fresh authenticated vote and report only threshold crossings.
+    /// Proposal arrival rechecks votes collected before the proposal was verified.
     fn record_vote(&mut self, vote: &VerifiedGrbcVote) -> DagResult<bool> {
         let header = self
             .proposal_headers
@@ -366,7 +364,6 @@ impl Core {
         for block in completed {
             self.try_advance_completed(block.clone()).await?;
         }
-        self.retry_round_advance_pending().await?;
         self.tx_cleanup
             .send(blocks)
             .await
@@ -433,64 +430,9 @@ impl Core {
         if self.validated.contains(&header.id) {
             return self.evaluate_grbc(header).await;
         }
-        // Ensure we have the parents. If at least one parent is missing, the synchronizer returns an empty
-        // vector; it will gather the missing parents (as well as all ancestors) from other nodes and then
-        // reschedule processing of this header.
-        let referenced = self
-            .synchronizer
-            .get_parents(header, &self.grade_one_certificates, &self.completed)
-            .await?;
-        if referenced.is_empty() {
-            debug!("Processing of {} suspended: missing parent(s)", header.id);
-            return Ok(());
-        }
-
-        // Check the parent certificates. Ensure the parents form a quorum and are all from the previous round.
-        let mut stake = 0;
-        let mut parent_authors = HashSet::new();
-        for x in referenced
-            .iter()
-            .filter(|x| header.parents.contains(&x.digest()))
-        {
-            ensure!(
-                x.round() + 1 == header.round,
-                DagError::MalformedHeader(header.id.clone())
-            );
-            ensure!(
-                parent_authors.insert(x.origin()),
-                DagError::MalformedHeader(header.id.clone())
-            );
-            stake += self.committee.stake(&x.origin());
-        }
-        ensure!(
-            stake >= self.quorum_threshold,
-            DagError::HeaderRequiresQuorum(header.id.clone())
-        );
-
-        // Weak edges must point strictly below the previous round.
-        for x in referenced
-            .iter()
-            .filter(|x| header.weak_edges.contains(&x.digest()))
-        {
-            ensure!(
-                x.round() + 1 < header.round,
-                DagError::MalformedHeader(header.id.clone())
-            );
-        }
-
-        // Virtual edges reference grade-1 blocks left in VDag at the end of
-        // the immediately preceding round.
-        for x in referenced
-            .iter()
-            .filter(|x| header.virtual_edges.contains(&x.digest()))
-        {
-            ensure!(
-                x.round() + 1 == header.round,
-                DagError::MalformedHeader(header.id.clone())
-            );
-        }
-
-        // Proposal verification has already checked and stored every payload byte.
+        // Experimental no-wait path: parent availability and parent metadata
+        // validation do not gate ECHO, READY or FINISH. The signed proposal
+        // and its own complete payload were verified by ProposalProcessor.
         self.validated.insert(header.id.clone());
         if self
             .last_voted
@@ -648,7 +590,6 @@ impl Core {
                 .expect("Failed to send grade-2 certificate to consensus");
             self.try_advance_completed(block).await?;
         }
-        self.retry_round_advance_pending().await?;
         Ok(())
     }
 
@@ -685,23 +626,7 @@ impl Core {
     }
 
     async fn try_advance_completed(&mut self, certificate: Certificate) -> DagResult<()> {
-        // Validated dependencies are immutable, even after their memory entries
-        // are collected. Commits without local validation still need this check.
-        if !self.validated.contains(&certificate.header.id)
-            && !self
-                .synchronizer
-                .ready_for_round_advance(
-                    &certificate,
-                    &self.grade_one_certificates,
-                    &self.completed,
-                )
-                .await?
-        {
-            self.round_advance_pending
-                .insert(certificate.digest(), certificate);
-            return Ok(());
-        }
-        self.round_advance_pending.remove(&certificate.digest());
+        // A completed quorum advances without waiting for its causal dependencies.
         if let Some(parents) = self
             .certificates_aggregators
             .entry(certificate.round())
@@ -737,14 +662,6 @@ impl Core {
                 .send((parents, weak_edges, virtual_edges, round))
                 .await
                 .expect("Failed to send GRBC edges to proposer");
-        }
-        Ok(())
-    }
-
-    async fn retry_round_advance_pending(&mut self) -> DagResult<()> {
-        let pending: Vec<_> = self.round_advance_pending.values().cloned().collect();
-        for certificate in pending {
-            self.try_advance_completed(certificate).await?;
         }
         Ok(())
     }
@@ -888,8 +805,6 @@ impl Core {
         self.certificates_aggregators
             .retain(|round, _| *round >= gc_round);
         self.grade_one_certificates
-            .retain(|_, c| c.round() >= gc_round);
-        self.round_advance_pending
             .retain(|_, c| c.round() >= gc_round);
         self.weak_edge_candidates
             .retain(|_, round| *round >= gc_round);

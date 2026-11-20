@@ -301,7 +301,7 @@ async fn complete_header_notification_exposes_all_payload_bytes() {
 }
 
 #[tokio::test]
-async fn virtual_dependency_uses_header_without_loading_batch_bytes() {
+async fn proposal_repair_rejects_metadata_without_batch_bytes() {
     let mut store = store("metadata_only");
     let dependency = with_payload();
     let digest = dependency.block().digest();
@@ -313,18 +313,6 @@ async fn virtual_dependency_uses_header_without_loading_batch_bytes() {
             bincode::serialize(&dependency.header).unwrap(),
         )
         .await;
-    let c = committee();
-    let (tx_headers, _headers) = channel(10);
-    let mut sync = crate::synchronizer::Synchronizer::new(&c, store.clone(), tx_headers);
-    let mut child = proposal().header;
-    child.virtual_edges.insert(digest.clone());
-    let parents = sync
-        .get_parents(&child, &Default::default(), &Default::default())
-        .await
-        .unwrap();
-    assert!(parents
-        .iter()
-        .any(|parent| parent.header.id == dependency.header.id));
     // A recovery reply must still refuse to send an incomplete proposal.
     assert!(matches!(
         load_proposal(&mut store, &digest).await,

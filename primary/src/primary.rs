@@ -301,12 +301,7 @@ impl Primary {
             name, address
         );
 
-        // The `Synchronizer` provides auxiliary methods helping to `Core` to sync.
-        let synchronizer = Synchronizer::new(
-            &committee,
-            store.clone(),
-            /* tx_header_waiter */ tx_sync_headers,
-        );
+        let synchronizer = Synchronizer::new(tx_sync_headers);
 
         // The `SignatureService` is used to require signatures on specific digests.
         let signature_service = SignatureService::new(secret);
