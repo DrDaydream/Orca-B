@@ -2,6 +2,44 @@
 use super::*;
 use std::fs;
 
+#[test]
+fn database_progress_does_not_depend_on_polling_the_async_runtime() {
+    // A busy protocol runtime must not also suspend the database actor. Exercise
+    // the real store, including the atomic write acknowledgement, outside block_on.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let path = format!(".db_test_independent_actor_{}", std::process::id());
+    let _ = fs::remove_dir_all(&path);
+    let store = runtime.block_on(async { Store::new(&path).unwrap() });
+    let (sender, mut receiver) = oneshot::channel();
+    store
+        .channel
+        .try_send(StoreCommand::WriteBatchIfAbsent(
+            [(vec![4], vec![9])].iter().cloned().collect(),
+            sender,
+        ))
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let result = loop {
+        match receiver.try_recv() {
+            Ok(result) => break Some(result),
+            Err(oneshot::error::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            _ => break None,
+        }
+    };
+    drop(store);
+    drop(runtime);
+    assert_eq!(
+        result
+            .expect("database stalled behind the async runtime")
+            .unwrap(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn create_store() {
     // Create new store.

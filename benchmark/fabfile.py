@@ -14,13 +14,16 @@ from benchmark.remote import Bench, BenchError
 @task(help={
     'adversary': 'Mode: none/A0, silent/A1 (full-run crashes), targeted/A3, network/A5; omitted keeps legacy behavior.',
     'header-size': 'Override the local header size in bytes.',
+    'warmup': 'Seconds of input before the common measurement window (default 0).',
+    'drain': 'Seconds to observe commits after input stops (default 0).',
+    'common-clock': 'Use an acknowledged common UTC window (true by default).',
     'bullshark-alternating': 'Bullshark: true or false for alternate unavailable leader slots.',
 })
 def local(ctx, debug=False, nodes=None, workers=None, rate=None, tx_size=None,
           duration=None, faults=None, header_size=None, adversary='', byzantine=0,
           byzantine_ids='', seed=1, start_round=1, attack_rounds=0,
           delay_ms=200, max_pending_messages=4096, max_pending_bytes=67108864,
-          bullshark_alternating='true'):
+          bullshark_alternating='true', warmup=0, drain=0, common_clock='true'):
     ''' Run benchmarks on localhost '''
     bench_params = {
         'faults': 0,
@@ -47,6 +50,7 @@ def local(ctx, debug=False, nodes=None, workers=None, rate=None, tx_size=None,
             seed=seed, start_round=start_round, attack_rounds=attack_rounds,
             delay_ms=delay_ms, max_pending_messages=max_pending_messages,
             max_pending_bytes=max_pending_bytes, bullshark_alternating=bullshark_alternating,
+            warmup=warmup, drain=drain, common_clock=common_clock,
         )
         if header_size is not None:
             node_params['header_size'] = int(header_size)
@@ -127,12 +131,17 @@ def install(ctx):
     'bullshark-alternating': 'Bullshark only: true or false; alternate normal/unavailable leader slots.',
     'attack-rounds': 'A3/A5 round window; 0 is unbounded. A1 requires 0 and start-round=1.',
     'rate': 'Input transactions per second; comma-separated values run a sweep.',
+    'header-size': 'Override the remote header size in bytes.',
+    'warmup': 'Seconds of input before the common measurement window (default 0).',
+    'drain': 'Seconds to observe commits after input stops (default 0).',
+    'common-clock': 'Use an acknowledged common UTC window (true by default).',
 })
 def remote(ctx, debug=False, nodes=20, workers=1, rate='50000', tx_size=512,
            duration=80, faults=None, runs=1, adversary='', byzantine=0,
            byzantine_ids='', seed=1, start_round=1, attack_rounds=0,
            delay_ms=200, max_pending_messages=4096, max_pending_bytes=67108864,
-           bullshark_alternating='true'):
+           bullshark_alternating='true', warmup=0, drain=0, common_clock='true',
+           header_size=None):
     ''' Prepare the AWS testbed and run one benchmark '''
     try:
         bench_params = remote_parameters(
@@ -143,7 +152,10 @@ def remote(ctx, debug=False, nodes=20, workers=1, rate='50000', tx_size=512,
             start_round=start_round, attack_rounds=attack_rounds, delay_ms=delay_ms,
             max_pending_messages=max_pending_messages, max_pending_bytes=max_pending_bytes,
             bullshark_alternating=bullshark_alternating,
+            warmup=warmup, drain=drain, common_clock=common_clock,
         )
+        if header_size is not None and (isinstance(header_size, bool) or int(header_size) < 1):
+            raise ValueError('header-size must be positive')
     except ValueError as e:
         raise Exit(str(e), code=2) from e
     node_params = {
@@ -156,6 +168,8 @@ def remote(ctx, debug=False, nodes=20, workers=1, rate='50000', tx_size=512,
         'max_batch_delay': 200  # ms
     }
     try:
+        if header_size is not None:
+            node_params['header_size'] = int(header_size)
         Bench(ctx).run(bench_params, node_params, debug)
     except BenchError as e:
         Print.error(e)

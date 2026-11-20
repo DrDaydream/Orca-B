@@ -5,6 +5,7 @@ kept per replica. No send timestamp or rule-ready timestamp substitutes for
 a missing release, ingress, or final ordered commit event.
 """
 from datetime import datetime, timezone
+import json
 from math import ceil, isfinite
 import re
 from statistics import mean
@@ -13,6 +14,26 @@ from statistics import mean
 _TIME = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})')
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _VERSION = 'Benchmark latency instrumentation version 1'
+_FINAL_RECORD = re.compile(
+    r'Committed B\d+\([^()\s]+\) -> (\S+) @ (\d+) commit (\d+) commit_us (\d+)'
+)
+_BATCH_OBSERVATION = re.compile(r'Benchmark batch (\S+) bytes (\d+) samples (\[.*\])')
+
+
+def validate_clock_plan(plan):
+    """Validate the shared absolute UTC plan without changing caller data."""
+    fields = ('load_us', 'start_us', 'end_us', 'drain_end_us')
+    if not isinstance(plan, dict) or set(plan) != {'schema', 'run_id', *fields}:
+        raise ValueError('Clock plan requires schema, run_id, load_us, start_us, end_us, drain_end_us')
+    if type(plan['schema']) is not int or plan['schema'] != 2:
+        raise ValueError('Clock plan schema must be 2')
+    if not isinstance(plan['run_id'], str) or not plan['run_id'].strip():
+        raise ValueError('Clock plan run_id must be a nonempty string')
+    if any(type(plan[key]) is not int or plan[key] < 0 for key in fields):
+        raise ValueError('Clock plan timestamps must be nonnegative integer epoch microseconds')
+    if not plan['load_us'] <= plan['start_us'] < plan['end_us'] <= plan['drain_end_us']:
+        raise ValueError('Clock plan requires load_us <= start_us < end_us <= drain_end_us')
+    return dict(plan)
 
 
 def _unix_us(text):
@@ -49,6 +70,9 @@ class Measurements:
     def __init__(self, clients, primaries, workers):
         if len(clients) != len(workers):
             raise ValueError('Measurement statistics require one client log per worker log')
+        self.client_texts = tuple(clients)
+        self.worker_texts = tuple(workers)
+        self.primary_texts = tuple(primaries)
         self.sources = []
         self.starts = []
         self.last_log_us = 0
@@ -115,25 +139,32 @@ class Measurements:
         end = (start + round(duration * 1000000) if duration is not None
                else max(start, self.last_log_us + 1))
         cutoff = end + round(drain * 1000000)
+        return self._release_metrics(start, end, cutoff,
+                                     'configured_duration' if duration is not None else 'observed_log_span')
+
+    def _release_metrics(self, start, end, cutoff, basis, exclusive_cutoff=False,
+                         sources=None, finals=None):
+        sources = self.sources if sources is None else sources
+        finals = self.final if finals is None else finals
         cohort = [(source_id, ident, stamp)
-                  for source_id, source in enumerate(self.sources)
+                  for source_id, source in enumerate(sources)
                   for ident, stamp in source['release'].items()
                   if start <= stamp < end]
-        supported = sum(source['supported'] for source in self.sources)
-        status = ('available' if supported == len(self.sources) and self.sources
+        supported = sum(source['supported'] for source in sources)
+        status = ('available' if supported == len(sources) and sources
                   else 'partial' if supported else 'unavailable')
         replicas, pooled = [], [[], [], []]
-        for replica, final in enumerate(self.final):
+        for replica, final in enumerate(finals):
             values = [[], [], []]
             completed = not_received = missing_ingress = invalid = 0
             for source_id, ident, released in cohort:
-                source = self.sources[source_id]
+                source = sources[source_id]
                 received = source['ingress'].get(ident)
-                if received is None or received > cutoff:
+                if received is None or received > cutoff or (exclusive_cutoff and received == cutoff):
                     not_received += 1
                 committed = min((final[batch] for batch in source['batches'].get(ident, ())
                                  if batch in final), default=None)
-                if committed is None or committed > cutoff:
+                if committed is None or committed > cutoff or (exclusive_cutoff and committed == cutoff):
                     continue
                 completed += 1
                 if received is None:
@@ -164,11 +195,11 @@ class Measurements:
             replicas.append(row)
         result = {
             'schema_version': 1, 'status': status,
-            'window_basis': 'configured_duration' if duration is not None else 'observed_log_span',
+            'window_basis': basis,
             'window_start_us': start, 'window_end_us': end, 'commit_cutoff_us': cutoff,
             'window_seconds': (end - start) / 1000000,
             'last_observed_log_us': self.last_log_us,
-            'source_pairs': len(self.sources), 'instrumented_source_pairs': supported,
+            'source_pairs': len(sources), 'instrumented_source_pairs': supported,
             'source_logs': self.source_logs,
             'released_samples': len(cohort),
             'replica_aggregation': 'pooled paired transaction-replica observations; no earliest-replica merge',
@@ -178,6 +209,189 @@ class Measurements:
             'aba': self._aba_metrics(start, end),
         }
         return result
+
+    def clock_metrics(self, plan):
+        """Fixed release cohort plus per-replica final commits in [start, end).
+
+        The release cohort drains only until drain_end_us (exclusive). The
+        commit cohort can include releases during warmup and uses their
+        original timestamps. Replica means are averaged with equal weight;
+        missing evidence never supplies zero latency or a successful grade.
+        This method neither reads files nor modifies the plan or measurements.
+        """
+        plan = validate_clock_plan(plan)
+        clock_sources, sources, batch_sizes, finals = self._clock_evidence(plan)
+        start, end = plan['start_us'], plan['end_us']
+        seconds = (end - start) / 1000000
+        release = self._release_metrics(start, end, plan['drain_end_us'],
+                                        'planned_release_window', exclusive_cutoff=True,
+                                        sources=sources, finals=finals)
+        tx_sizes = {int(value) for log in self.client_texts
+                    for value in re.findall(r'Transactions size: (\d+)', log)}
+        if len(tx_sizes) != 1 or min(tx_sizes) <= 0 or any(
+                not re.search(r'Transactions size: (\d+)', log) for log in self.client_texts):
+            raise ValueError('Clocked throughput requires equal positive transaction sizes in every client log')
+        tx_size = next(iter(tx_sizes))
+        if any(size % tx_size for size in batch_sizes.values()):
+            raise ValueError('Batch bytes are not a whole number of fixed-size transactions')
+        replicas = []
+        for replica, all_final in enumerate(finals):
+            final = {batch: at for batch, at in all_final.items() if start <= at < end}
+            values, selected, missing_release, missing_ingress, invalid = [], 0, 0, 0, 0
+            for source in sources:
+                for ident, batches in source['batches'].items():
+                    committed = next((final[batch] for batch in batches if batch in final), None)
+                    if committed is None:
+                        continue
+                    selected += 1
+                    released, ingress = source['release'].get(ident), source['ingress'].get(ident)
+                    if released is None:
+                        missing_release += 1
+                    if ingress is None:
+                        missing_ingress += 1
+                    if released is None or ingress is None:
+                        continue
+                    if not released <= ingress <= committed:
+                        invalid += 1
+                        continue
+                    values.append(committed - released)
+            byte_count = sum(batch_sizes[batch] for batch in final)
+            complete = (bool(values) and not (missing_release or missing_ingress or invalid)
+                        and release['instrumented_source_pairs'] == len(self.sources))
+            replicas.append({
+                'replica': replica, 'replica_log': self.replica_logs[replica],
+                'final_batches': len(final), 'final_bytes': byte_count,
+                'final_transactions': byte_count / tx_size,
+                'final_tps': byte_count / tx_size / seconds,
+                'final_bps': byte_count / seconds,
+                'missing_batch_sizes': [],
+                'selected_samples': selected, 'matched_samples': len(values),
+                'missing_release_samples': missing_release,
+                'missing_ingress_samples': missing_ingress, 'invalid_time_samples': invalid,
+                'coverage_complete': complete, 'throughput_coverage_complete': True,
+                'release_to_final': _distribution(values),
+            })
+        complete = bool(replicas) and all(row['coverage_complete'] for row in replicas)
+        throughput_complete = bool(replicas) and all(row['throughput_coverage_complete'] for row in replicas)
+        matched = sum(row['matched_samples'] for row in replicas)
+        commit = {
+            'window_basis': 'planned_final_commit_window',
+            'window_start_us': start, 'window_end_us': end, 'window_seconds': seconds,
+            'replica_aggregation': 'arithmetic mean of per-replica means; no earliest-replica merge',
+            'coverage_basis': 'selected transaction-replica samples have release, ingress, final and batch bytes; process uptime is verified by the runner',
+            'expected_replicas': len(replicas),
+            'replicas_with_samples': sum(row['matched_samples'] > 0 for row in replicas),
+            'selected_samples': sum(row['selected_samples'] for row in replicas),
+            'matched_samples': matched, 'coverage_complete': complete,
+            'throughput_coverage_complete': throughput_complete,
+            'status': 'available' if complete else 'partial' if matched else 'unavailable',
+            'mean_replica_release_to_final_ms': mean(row['release_to_final']['mean_ms'] for row in replicas) if complete else None,
+            'mean_replica_final_tps': mean(row['final_tps'] for row in replicas) if throughput_complete else None,
+            'mean_replica_final_bps': mean(row['final_bps'] for row in replicas) if throughput_complete else None,
+            'replicas': replicas,
+        }
+        return {'schema': 2, 'run_id': plan['run_id'], 'plan': plan,
+                'clock_sources': clock_sources, 'release_window': release, 'commit_window': commit}
+
+    def _clock_evidence(self, plan):
+        clocks, sources, batch_sizes, finals = [], [], {}, []
+        if not self.sources or not self.final:
+            raise ValueError('Clocked measurements require client/worker pairs and primary logs')
+        for log in self.client_texts + self.worker_texts + self.primary_texts:
+            if re.search(r'\b(?:panicked|panic|Error|ERROR)\b', log):
+                raise ValueError('Runtime failure in clocked measurement logs')
+        for replica, log in enumerate(self.primary_texts):
+            if not log.strip():
+                raise ValueError(f'Missing primary log for replica {replica}')
+            final = {}
+            for line in log.splitlines():
+                match = re.search(r'\bCommitted B', line)
+                if match is None:
+                    continue
+                message = line[match.start():]
+                if re.fullmatch(r'Committed B\d+\([^()\s]+\)', message):
+                    continue  # A header summary carries no batch or timestamp.
+                record = _FINAL_RECORD.fullmatch(message)
+                if record is None:
+                    raise ValueError(f'Malformed final commit record for replica {replica}')
+                batch, _, milliseconds, microseconds = record.groups()
+                stamp = int(microseconds)
+                if stamp // 1000 != int(milliseconds):
+                    raise ValueError(f'Inconsistent final commit timestamp for replica {replica}')
+                final[batch] = min(final.get(batch, stamp), stamp)
+            finals.append(final)
+        for source_id, (client, worker, source) in enumerate(zip(
+                self.client_texts, self.worker_texts, self.sources)):
+            markers = {}
+            for label in ('clock ready', 'clock armed', 'input started', 'input stopped'):
+                lines = [line for line in client.splitlines() if f'Benchmark {label}' in line]
+                if len(lines) != 1:
+                    raise ValueError(f'Missing or ambiguous Benchmark {label} evidence for source {source_id}')
+                markers[label] = lines[0].split(f'Benchmark {label}', 1)[1].strip()
+            try:
+                armed = validate_clock_plan(json.loads(markers['clock armed']))
+            except (ValueError, TypeError) as error:
+                raise ValueError(f'Invalid armed plan for source {source_id}: {error}') from error
+            if armed != plan:
+                raise ValueError(f'Armed clock plan does not match the requested plan for source {source_id}')
+            started = re.fullmatch(r'at_us (\d+) lateness_us (\d+)', markers['input started'])
+            stopped = re.fullmatch(r'at_us (\d+) released_samples (\d+)', markers['input stopped'])
+            if not started or not stopped:
+                raise ValueError(f'Invalid clock input timestamps for source {source_id}')
+            started_us, lateness_us = map(int, started.groups())
+            stopped_us, released_samples = map(int, stopped.groups())
+            if (not plan['load_us'] <= started_us <= plan['load_us'] + 500000
+                    or lateness_us != started_us - plan['load_us']):
+                raise ValueError(f'Invalid or late input start for source {source_id}')
+            if stopped_us < plan['end_us']:
+                raise ValueError(f'Input stopped before the planned end for source {source_id}')
+            if any(not started_us <= stamp < plan['end_us'] for stamp in source['release'].values()):
+                raise ValueError(f'Sample release outside the planned input interval for source {source_id}')
+            for log, kind in ((client, 'released'), (worker, 'ingress')):
+                stamps = {}
+                for line in log.splitlines():
+                    if f'Benchmark sample {kind}' in line and not re.search(
+                            rf'Benchmark sample {kind} id \d+ at_us \d+$', line):
+                        raise ValueError(f'Malformed sample {kind} event for source {source_id}')
+                for ident, at in re.findall(rf'Benchmark sample {kind} id (\d+) at_us (\d+)', log):
+                    stamps.setdefault(int(ident), []).append(int(at))
+                if any(len(values) != 1 for values in stamps.values()):
+                    raise ValueError(f'Ambiguous sample {kind} timestamps for source {source_id}')
+            if (len(source['release']) != released_samples
+                    or any(ident != position for position, ident in enumerate(source['release']))):
+                raise ValueError(f'Incomplete sample release sequence for source {source_id}')
+            batches = {}
+            for line in worker.splitlines():
+                marker = line.find('Benchmark batch')
+                if marker == -1:
+                    continue
+                observation = _BATCH_OBSERVATION.fullmatch(line[marker:])
+                if observation is None:
+                    raise ValueError(f'Malformed batch observation for source {source_id}')
+                batch, size, sample_ids = observation.groups()
+                try:
+                    ids = json.loads(sample_ids)
+                except ValueError as error:
+                    raise ValueError(f'Malformed batch observation for {batch}') from error
+                if (int(size) <= 0 or any(type(ident) is not int or ident < 0 for ident in ids)):
+                    raise ValueError(f'Invalid batch observation for {batch}')
+                if batch in batch_sizes:
+                    raise ValueError(f'Ambiguous batch observation for {batch}')
+                batch_sizes[batch] = int(size)
+                for ident in ids:
+                    if ident in batches:
+                        raise ValueError(f'Ambiguous sample-to-batch mapping for source {source_id}')
+                    batches[ident] = {batch}
+            sources.append(dict(source, batches=batches))
+            clocks.append(dict(source=source_id, **self.source_logs[source_id],
+                               input_started_us=started_us, input_stopped_us=stopped_us,
+                               lateness_us=lateness_us, released_samples=released_samples))
+        relevant_batches = {batch for final in finals for batch, stamp in final.items()
+                            if stamp < plan['drain_end_us']}
+        missing = relevant_batches - batch_sizes.keys()
+        if missing:
+            raise ValueError(f'Missing batch observation for {len(missing)} final batches: {sorted(missing)[:10]}')
+        return clocks, sources, batch_sizes, finals
 
     def _aba_metrics(self, start, end):
         if not any(self.aba):
@@ -220,6 +434,37 @@ class Measurements:
             'mean_replica_sent_bytes_per_second': mean(r['sent_bytes_per_second'] for r in replicas) if complete else None,
             'sum_replica_received_bytes_per_second': sum(r['received_bytes_per_second'] for r in replicas) if complete else None,
         }
+
+
+def format_clock_metrics(metrics):
+    display = lambda value: f'{value:,.3f}' if value is not None else 'N/A'
+    plan, commit = metrics['plan'], metrics['commit_window']
+    lines = [
+        ' + CLOCKED FINAL COMMIT MEASUREMENTS:',
+        f" Run ID: {metrics['run_id']}",
+        f" Clocked measurement window: {commit['window_seconds']:.3f} s; "
+        f"fixed drain {(plan['drain_end_us'] - plan['end_us']) / 1000000:.3f} s",
+        f" UTC interval: [{plan['start_us']}, {plan['end_us']}) us; "
+        f"release cohort final cutoff: {plan['drain_end_us']} us (exclusive)",
+        ' End-to-end population: final commits in the measurement window; original client release, including warmup',
+        ' Replica aggregation: arithmetic mean of per-replica means',
+        f" End-to-end latency: {display(commit['mean_replica_release_to_final_ms'])} ms",
+        f" End-to-end TPS: {display(commit['mean_replica_final_tps'])} tx/s (mean per replica)",
+        f" Evidence: {commit['status']}; replicas with matched samples "
+        f"{commit['replicas_with_samples']}/{commit['expected_replicas']}; "
+        f"matched/selected observations {commit['matched_samples']}/{commit['selected_samples']}",
+    ]
+    for row in commit['replicas']:
+        lines.append(f" Final-window replica {row['replica']}: mean "
+                     f"{display(row['release_to_final']['mean_ms'])} ms; "
+                     f"TPS {display(row['final_tps'])}; matched/selected "
+                     f"{row['matched_samples']}/{row['selected_samples']}; "
+                     f"missing release {row['missing_release_samples']}; "
+                     f"missing ingress {row['missing_ingress_samples']}; "
+                     f"invalid clocks {row['invalid_time_samples']}; "
+                     f"coverage complete {row['coverage_complete']}")
+    lines.append(' Release-window statistics (release cohort, fixed drain):')
+    return '\n'.join(lines) + '\n' + format_measurements(metrics['release_window'])
 
 
 def format_measurements(metrics):

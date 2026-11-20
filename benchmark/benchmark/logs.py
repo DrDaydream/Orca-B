@@ -11,7 +11,8 @@ from statistics import mean
 
 from benchmark.utils import Print
 from benchmark.adversary import crash_population
-from benchmark.measurements import Measurements, format_measurements
+from benchmark.measurements import (Measurements, format_measurements,
+                                    format_clock_metrics, validate_clock_plan)
 
 
 class ParseError(Exception):
@@ -40,6 +41,7 @@ class LogParser:
                                    if ident not in excluded]
 
         self.crashed_primary_ids = []
+        self.measurement_plan = None
         self.faults = faults
         if isinstance(faults, int):
             self.committee_size = len(primaries)
@@ -115,7 +117,13 @@ class LogParser:
         + duration). Without it, the observed log span is labelled as such.
         No runner, workload, or protocol behavior is changed by this parser.
         """
+        if self.measurement_plan is not None:
+            # A saved clock plan is authoritative for every native report.
+            return self.clock_metrics()['release_window']
         metrics = self.measurements.metrics(duration=duration, warmup=warmup, drain=drain)
+        return self._measurement_population(metrics)
+
+    def _measurement_population(self, metrics):
         metrics['included_primary_ids'] = self.included_primary_ids
         metrics['excluded_primary_ids'] = self.excluded_primary_ids
         metrics['crashed_primary_ids'] = self.crashed_primary_ids
@@ -124,6 +132,24 @@ class LogParser:
         if metrics['aba'] is not None:
             for row, ident in zip(metrics['aba']['replicas'], self.included_primary_ids):
                 row['replica'] = ident
+        return metrics
+
+    def clock_metrics(self, plan=None):
+        """Public planned windows using the included primary launch IDs."""
+        saved = self.measurement_plan
+        if plan is None:
+            plan = saved
+        elif saved is not None and plan != saved:
+            raise ParseError('Requested clock plan does not match the saved measurement window')
+        try:
+            metrics = self.measurements.clock_metrics(plan)
+        except ValueError as error:
+            raise ParseError(f'Invalid clock measurements: {error}') from error
+        self._measurement_population(metrics['release_window'])
+        for row, ident in zip(metrics['commit_window']['replicas'], self.included_primary_ids):
+            row['replica'] = ident
+        for key in ('included_primary_ids', 'excluded_primary_ids', 'crashed_primary_ids'):
+            metrics[key] = getattr(self, key)
         return metrics
 
     def _merge_results(self, input):
@@ -413,6 +439,13 @@ class LogParser:
     def print_comparison(self, duration, filename='comparison.json'):
         from json import dump
 
+        if self.measurement_plan is not None:
+            metrics = self.clock_metrics()
+            with open(filename, 'w', encoding='utf-8') as output:
+                dump(metrics, output, indent=2, allow_nan=False)
+                output.write('\n')
+            print(format_clock_metrics(metrics))
+            return
         metrics = self.comparison_metrics(duration)
         metrics['measurement_stats'] = self.measurement_metrics(duration=duration)
         with open(filename, 'w') as output:
@@ -466,6 +499,15 @@ class LogParser:
         return leader_ratios, block_ratios
 
     def result(self):
+        if self.measurement_plan is not None:
+            return ('\n-----------------------------------------\n SUMMARY:\n'
+                    '-----------------------------------------\n'
+                    f' Committee size: {self.committee_size} node(s)\n'
+                    f' Commit replicas included: {len(self.included_primary_ids)} node(s)\n'
+                    f' Input rate: {sum(self.rate):,} tx/s\n'
+                    f' Transaction size: {self.size[0]:,} B\n'
+                    + format_clock_metrics(self.clock_metrics())
+                    + '-----------------------------------------\n')
         header_size = self.configs[0]['header_size']
         max_header_delay = self.configs[0]['max_header_delay']
         gc_depth = self.configs[0]['gc_depth']
@@ -548,13 +590,21 @@ class LogParser:
         # can keep their filenames and repeated-run behavior.
         from json import dump
         with open(filename + '.metrics.jsonl', 'a', encoding='utf-8') as output:
-            dump(self.measurement_metrics(), output, allow_nan=False)
+            metrics = self.clock_metrics() if self.measurement_plan is not None else self.measurement_metrics()
+            dump(metrics, output, allow_nan=False)
             output.write('\n')
 
     @classmethod
     def process(cls, directory, faults=0, adversary=None, committee_size=None):
         assert isinstance(directory, str)
 
+        plan_path = Path(directory) / 'measurement-window.json'
+        plan = None
+        if plan_path.exists():
+            try:
+                plan = validate_clock_plan(json.loads(plan_path.read_text(encoding='utf-8')))
+            except (OSError, ValueError, TypeError) as error:
+                raise ParseError(f'Invalid measurement window: {error}') from error
         primary_files = sorted(glob(join(directory, 'primary-*.log')))
         primary_ids = []
         for filename in primary_files:
@@ -605,6 +655,10 @@ class LogParser:
             with open(filename, 'r') as f:
                 workers += [f.read()]
 
+        if plan is not None and not all((clients, primaries, workers)):
+            raise ParseError('Missing client, primary, or worker logs for the clocked measurement')
+        if plan is None and any('Benchmark clock ' in log for log in clients):
+            raise ParseError('Clocked client logs require measurement-window.json')
         result = cls(clients, primaries, workers, faults=faults,
                      primary_ids=primary_ids, excluded_primary_ids=excluded)
         result.measurements.source_logs = [
@@ -612,6 +666,9 @@ class LogParser:
         ]
         result.measurements.replica_logs = [path for ident, path in zip(primary_ids, primary_files)
                                            if ident not in result.excluded_primary_ids]
+        result.measurement_plan = plan
+        if plan is not None:
+            result.clock_metrics()  # Reject missing or inconsistent run evidence before reporting.
         if adversary is not None and crash is None:
             population = dict(schema_version=1, primary_ids=primary_ids,
                               excluded_primary_ids=result.excluded_primary_ids)

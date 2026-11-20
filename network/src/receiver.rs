@@ -58,6 +58,9 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                     continue;
                 }
             };
+            if let Err(error) = socket.set_nodelay(true) {
+                warn!("Could not enable TCP_NODELAY for {}: {}", peer, error);
+            }
             info!("Incoming connection established with {}", peer);
             Self::spawn_runner(socket, peer, self.handler.clone()).await;
         }

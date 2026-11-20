@@ -239,3 +239,45 @@ async fn echo_and_ready_bypass_a_blocked_proposal_connection() {
         .unwrap();
     accept.abort();
 }
+
+#[tokio::test]
+async fn queue_invariant_saturated_aba_routes_committed_feedback_and_replays_fifo() {
+    let (tx_feedback, rx_feedback) = channel(1);
+    let (tx_core, mut rx_core) = channel(1);
+    let (tx_aba, mut rx_aba) = channel(1);
+    tx_aba.send(vec![vec![0]]).await.unwrap();
+    spawn_consensus_router(rx_feedback, tx_core, tx_aba);
+    for byte in 1..=3 {
+        tx_feedback
+            .send(ConsensusCommand::AbaBroadcast(vec![vec![byte]]))
+            .await
+            .unwrap();
+    }
+    // The bounded feedback sender has handed its last command to the router.
+    drop(tx_feedback.reserve().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let block = proposal().block();
+    let expected = block.digest();
+    tx_feedback
+        .send(ConsensusCommand::CleanupBatch(vec![block]))
+        .await
+        .unwrap();
+    let feedback = tokio::time::timeout(Duration::from_secs(2), rx_core.recv())
+        .await
+        .expect("a queued commit waited for outbound ABA capacity")
+        .unwrap();
+    assert!(
+        matches!(feedback, ConsensusCommand::CleanupBatch(blocks) if blocks[0].digest() == expected)
+    );
+    drop(tx_feedback);
+    let replay = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut replay = Vec::new();
+        while let Some(batch) = rx_aba.recv().await {
+            replay.extend(batch);
+        }
+        replay
+    })
+    .await
+    .unwrap();
+    assert_eq!(replay, vec![vec![0], vec![1], vec![2], vec![3]]);
+}

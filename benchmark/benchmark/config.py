@@ -217,6 +217,19 @@ class BenchParameters:
             self.tx_size = int(json['tx_size'])
            
             self.duration = int(json['duration'])
+            for name in ('warmup', 'drain'):
+                value = json.get(name, 0)
+                if (isinstance(value, bool) or not isinstance(value, (int, str))
+                        or not str(value).isascii() or not str(value).isdigit()):
+                    raise ConfigError(f'{name} must be a nonnegative integer')
+                setattr(self, name, int(value))
+            self.common_clock = json.get('common_clock', True)
+            if type(self.common_clock) is not bool:
+                raise ConfigError('common_clock must be a boolean')
+            if self.common_clock and self.duration <= 0:
+                raise ConfigError('duration must be positive')
+            if not self.common_clock and (self.warmup or self.drain):
+                raise ConfigError('warmup and drain require the common clock')
 
             self.runs = int(json['runs']) if 'runs' in json else 1
         except KeyError as e:

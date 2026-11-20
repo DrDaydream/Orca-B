@@ -119,6 +119,298 @@ async fn local_proposal_broadcast_does_not_wait_for_storage_but_delivery_does() 
 }
 
 #[tokio::test]
+async fn runtime_review_two_local_rounds_progress_while_peer_enqueue_is_saturated() {
+    use crate::proposal_processor::{prepare_local_proposal, ProposalTracker};
+    use network::{DelayBudget, Delivery, DeliveryPolicy, ReliableSender};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct CountProposalDecisions {
+        wire: Bytes,
+        calls: AtomicUsize,
+    }
+    impl DeliveryPolicy for CountProposalDecisions {
+        fn delivery(&self, _: std::net::SocketAddr, data: &Bytes) -> Delivery {
+            if data == &self.wire {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Delivery::Delay(Duration::from_secs(1), String::new())
+            } else {
+                Delivery::Send
+            }
+        }
+    }
+    use store::StoreCommand;
+    use tokio::time::{timeout, Duration};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let p = with_payload();
+    let mut replay_store = store("released_proposal_retry");
+    store_verified_proposal(&mut replay_store, p.clone())
+        .await
+        .unwrap();
+    let policy = Arc::new(CountProposalDecisions {
+        wire: Bytes::from(bincode::serialize(&PrimaryMessage::Proposal(p.clone())).unwrap()),
+        calls: AtomicUsize::new(0),
+    });
+    // No delay budget remains, so the policy releases the initial attempt.
+    let sender = || ReliableSender::with_schedule(policy.clone(), DelayBudget::new(0, 0));
+    let mut network = sender();
+    // All queued messages share this allocation. A connected peer which does
+    // not read blocks the transport write and then its bounded enqueue channel.
+    let filler = Bytes::from(vec![0; 8 * 1024 * 1024]);
+    let mut queued = vec![network.send(address, filler.clone()).await];
+    let (socket, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let peer = Framed::new(socket, LengthDelimitedCodec::new());
+    let mut saturated = false;
+    for _ in 0..1100 {
+        match timeout(
+            Duration::from_millis(50),
+            network.send(address, filler.clone()),
+        )
+        .await
+        {
+            Ok(handler) => queued.push(handler),
+            Err(_) => {
+                saturated = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saturated,
+        "Fixture must saturate the real peer enqueue channel"
+    );
+
+    let round = p.header.round;
+    let digest = p.block().digest();
+    let tracker = ProposalTracker::default();
+    let guard = tracker.track(&p.header);
+    let (tx_store, mut rx_store) = channel(1);
+    let mut storage = Store::from_channel(tx_store);
+    let (tx_stored, mut rx_stored) = channel(1);
+    let mut next = p.clone();
+    next.header.round += 1;
+    next.header.id = next.header.digest();
+    next.header.signature = Signature::new(&next.header.id, &keys().pop().unwrap().1);
+    let first_header = p.header.clone();
+    let second_header = next.header.clone();
+    let next_guard = tracker.track(&next.header);
+    let prepare = async {
+        for (proposal, guard) in [(p, guard), (next, next_guard)] {
+            let (accepted, deferred) = prepare_local_proposal(
+                proposal,
+                committee(),
+                &mut storage,
+                (&mut network, vec![address]),
+                guard,
+                &tx_stored,
+            )
+            .await
+            .unwrap();
+            assert!(accepted.is_empty());
+            assert_eq!(deferred, vec![address]);
+        }
+    };
+    let observe = async {
+        for header in [first_header, second_header] {
+            let ack = match rx_store.recv().await.unwrap() {
+                StoreCommand::WriteBatchIfAbsent(_, ack) => ack,
+                _ => panic!("Unexpected storage operation"),
+            };
+            assert!(rx_stored.try_recv().is_err());
+            ack.send(Ok(3)).unwrap();
+            assert_eq!(rx_stored.recv().await.unwrap().into_header(), header);
+        }
+    };
+    timeout(Duration::from_secs(3), async {
+        tokio::join!(prepare, observe)
+    })
+    .await
+    .expect("Both stored local rounds must progress before the peer queue drains");
+    assert!(!tracker.contains(&digest));
+    assert_eq!(policy.calls.load(Ordering::Relaxed), 1);
+    let retry = crate::proposal_processor::spawn_proposal_retry(
+        sender(),
+        address,
+        replay_store,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        50,
+    );
+    retry.send((round, digest)).await.unwrap();
+    let received = async {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut frames = Framed::new(socket, LengthDelimitedCodec::new());
+        assert_eq!(frames.next().await.unwrap().unwrap().freeze(), policy.wire);
+        frames.send(Bytes::from_static(b"Ack")).await.unwrap();
+    };
+    timeout(Duration::from_secs(3), received).await.unwrap();
+    assert_eq!(
+        policy.calls.load(Ordering::Relaxed),
+        1,
+        "transport retry repeated the released scheduling decision"
+    );
+    drop(peer);
+    drop(queued);
+}
+
+#[tokio::test]
+async fn local_proposal_storage_failure_returns_while_peer_enqueue_is_saturated() {
+    use crate::proposal_processor::{prepare_local_proposal, ProposalTracker};
+    use network::ReliableSender;
+    use store::StoreCommand;
+    use tokio::time::{timeout, Duration};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut network = ReliableSender::new();
+    let filler = Bytes::from(vec![0; 8 * 1024 * 1024]);
+    let mut queued = vec![network.send(address, filler.clone()).await];
+    // Keep the connected peer alive without reading so the real transport
+    // write and bounded enqueue channel stay blocked throughout the test.
+    let (_socket, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut saturated = false;
+    for _ in 0..1100 {
+        match timeout(
+            Duration::from_millis(50),
+            network.send(address, filler.clone()),
+        )
+        .await
+        {
+            Ok(handler) => queued.push(handler),
+            Err(_) => {
+                saturated = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saturated,
+        "Fixture must saturate the real peer enqueue channel"
+    );
+
+    let p = with_payload();
+    let digest = p.block().digest();
+    let tracker = ProposalTracker::default();
+    let guard = tracker.track(&p.header);
+    let (tx_store, mut rx_store) = channel(1);
+    let mut storage = Store::from_channel(tx_store);
+    let (tx_stored, mut rx_stored) = channel(1);
+    let prepare = prepare_local_proposal(
+        p,
+        committee(),
+        &mut storage,
+        (&mut network, vec![address]),
+        guard,
+        &tx_stored,
+    );
+    let fail_write = async {
+        match rx_store.recv().await.unwrap() {
+            StoreCommand::WriteBatchIfAbsent(_, ack) => {
+                assert!(rx_stored.try_recv().is_err());
+                assert!(tracker.contains(&digest));
+                ack.send(Err(Store::new("\0").err().unwrap())).unwrap();
+            }
+            _ => panic!("Unexpected storage operation"),
+        }
+    };
+    let (result, ()) = timeout(Duration::from_secs(2), async {
+        tokio::join!(prepare, fail_write)
+    })
+    .await
+    .expect("Storage failure must return before the saturated peer queue unblocks");
+    assert!(matches!(result, Err(DagError::StoreError(_))));
+    assert!(
+        rx_stored.try_recv().is_err(),
+        "Failed storage must never publish"
+    );
+    assert!(
+        !tracker.contains(&digest),
+        "Failed storage must release its guard"
+    );
+    assert!(
+        timeout(Duration::from_millis(50), network.send(address, filler))
+            .await
+            .is_err(),
+        "Peer enqueue must still be saturated after the storage error returns"
+    );
+    drop(queued);
+}
+
+#[tokio::test]
+async fn local_proposal_rejects_invalid_bytes_before_storage_or_publication() {
+    use crate::proposal_processor::{prepare_local_proposal, ProposalTracker};
+    use network::ReliableSender;
+
+    let mut p = with_payload();
+    p.batches.values_mut().next().unwrap()[0] ^= 1;
+    let digest = p.block().digest();
+    let tracker = ProposalTracker::default();
+    let guard = tracker.track(&p.header);
+    let (tx_store, mut rx_store) = channel(1);
+    let mut storage = Store::from_channel(tx_store);
+    let (tx_stored, mut rx_stored) = channel(1);
+    let mut network = ReliableSender::new();
+    assert!(prepare_local_proposal(
+        p,
+        committee(),
+        &mut storage,
+        (&mut network, Vec::new()),
+        guard,
+        &tx_stored
+    )
+    .await
+    .is_err());
+    assert!(rx_store.try_recv().is_err());
+    assert!(rx_stored.try_recv().is_err());
+    assert!(!tracker.contains(&digest));
+}
+
+#[tokio::test]
+async fn local_proposal_failed_storage_does_not_publish() {
+    use crate::proposal_processor::{prepare_local_proposal, ProposalTracker};
+    use network::ReliableSender;
+    use store::StoreCommand;
+
+    let p = with_payload();
+    let digest = p.block().digest();
+    let tracker = ProposalTracker::default();
+    let guard = tracker.track(&p.header);
+    let (tx_store, mut rx_store) = channel(1);
+    let mut storage = Store::from_channel(tx_store);
+    let (tx_stored, mut rx_stored) = channel(1);
+    let mut network = ReliableSender::new();
+    let prepare = prepare_local_proposal(
+        p,
+        committee(),
+        &mut storage,
+        (&mut network, Vec::new()),
+        guard,
+        &tx_stored,
+    );
+    let fail_write = async {
+        match rx_store.recv().await.unwrap() {
+            StoreCommand::WriteBatchIfAbsent(_, ack) => {
+                assert!(rx_stored.try_recv().is_err());
+                ack.send(Err(Store::new("\0").err().unwrap())).unwrap();
+            }
+            _ => panic!("Unexpected storage operation"),
+        }
+    };
+    let (result, ()) = tokio::join!(prepare, fail_write);
+    assert!(matches!(result, Err(DagError::StoreError(_))));
+    assert!(rx_stored.try_recv().is_err());
+    assert!(!tracker.contains(&digest));
+}
+
+#[tokio::test]
 async fn failed_proposal_storage_does_not_deliver_header_and_releases_tracker() {
     use crate::proposal_processor::{prepare_proposal, ProposalTracker};
     use network::ReliableSender;

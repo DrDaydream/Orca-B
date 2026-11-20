@@ -12,7 +12,7 @@ struct Harness {
     _repairs: Receiver<crate::helper::RepairRequest>,
     _parents: Receiver<ProposerMessage>,
     _headers: Receiver<crate::header_waiter::WaiterMessage>,
-    cleanup: Receiver<Vec<Certificate>>,
+    cleanup: tokio::sync::watch::Receiver<Round>,
 }
 
 impl Harness {
@@ -30,7 +30,7 @@ impl Harness {
         let (tx_parents, parents) = channel(100);
         let (tx_votes, outgoing) = channel(100);
         let (tx_repairs, repairs) = channel(100);
-        let (tx_cleanup, cleanup) = channel(100);
+        let (tx_cleanup, cleanup) = tokio::sync::watch::channel(0);
         Self {
             core: Core {
                 name,
@@ -61,11 +61,14 @@ impl Harness {
                 validated: HashSet::new(),
                 last_ready: HashMap::new(),
                 local_votes: HashMap::new(),
+                deferred_vote_blocks: 0,
                 missing_proposals: HashMap::new(),
                 pending_votes: HashMap::new(),
                 certificates_aggregators: HashMap::new(),
                 grade_one_certificates: HashMap::new(),
                 completed: HashSet::new(),
+                own_pending_grbc: HashSet::new(),
+                own_local_deliveries: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::new(),
@@ -154,6 +157,305 @@ async fn echo_quorum_delivers_ready_but_never_finish() {
     assert_eq!(h.core.votes_aggregators[&p.header.id].echo_weight, 3);
     assert_eq!(h.core.votes_aggregators[&p.header.id].ready_weight, 3);
     assert!(h.grades().is_empty());
+    assert!(h.outgoing().is_empty());
+}
+
+#[tokio::test]
+async fn own_proposal_delivers_immediately_and_still_supplies_peer_ready_votes() {
+    let mut h = Harness::new("self_deliver", 3);
+    let p = proposal(); // Fixture proposer is node 3.
+    h.core.process_proposal(p.clone()).await.unwrap();
+    assert_eq!(h.grades(), vec![1, 2]);
+    assert!(h.core.completed.contains(&p.header.id));
+    assert_eq!(h.core.votes_aggregators[&p.header.id].echo_weight, 1);
+    assert_eq!(h.core.votes_aggregators[&p.header.id].ready_weight, 0);
+    let outgoing = h.outgoing();
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].phase, GrbcPhase::Echo);
+    // Local commit feedback must not close the READY slot before peers receive
+    // our normal broadcast contribution.
+    h.core.process_committed(vec![p.block()]).await.unwrap();
+    let echoes = votes(&p.header, GrbcPhase::Echo);
+    h.core.process_grbc_vote(echoes[0].clone()).await.unwrap();
+    h.core.process_grbc_vote(echoes[0].clone()).await.unwrap();
+    assert!(h.outgoing().is_empty());
+    h.core.process_grbc_vote(echoes[1].clone()).await.unwrap();
+    let outgoing = h.outgoing();
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].phase, GrbcPhase::Ready);
+    assert!(h.grades().is_empty()); // No second local delivery.
+    let ready = votes(&p.header, GrbcPhase::Ready);
+    h.core.process_grbc_vote(ready[0].clone()).await.unwrap();
+    h.core.process_grbc_vote(ready[1].clone()).await.unwrap();
+    h.core.process_grbc_vote(ready[2].clone()).await.unwrap();
+    assert_eq!(h.core.votes_aggregators[&p.header.id].ready_weight, 3);
+    assert!(h.grades().is_empty());
+    assert!(h.outgoing().is_empty());
+}
+
+#[tokio::test]
+async fn runtime_review_stored_self_progresses_while_a_remote_vote_is_waiting() {
+    let h = Harness::new("self_behind_remote", 3);
+    let mut core = h.core;
+    let mut events = h.events;
+    let mut storage = core.store.clone();
+    let remote = Proposal {
+        header: crate::common::headers().remove(0),
+        batches: BTreeMap::new(),
+    };
+    let own = proposal();
+    let (tx, mut outgoing) = channel(1);
+    tx.send(VoteDispatch {
+        requestor: None,
+        votes: Vec::new(),
+    })
+    .await
+    .unwrap();
+    core.tx_votes = tx;
+    let (tx_stored, rx_stored) = channel(2);
+    core.rx_proposals = rx_stored;
+    let run = tokio::spawn(async move { core.run().await });
+    let check = async {
+        for p in [&remote, &own] {
+            let (stored, _) = crate::proposal_processor::prepare_proposal(
+                p.clone(),
+                committee(),
+                &mut storage,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            tx_stored.send(stored).await.ok().unwrap();
+            if p.header.id == remote.header.id {
+                storage
+                    .notify_read(local_votes_key(&remote.block().digest()))
+                    .await
+                    .unwrap();
+            }
+        }
+        for expected in [1, 2] {
+            let (grade, id) = loop {
+                match events.recv().await.unwrap() {
+                    ConsensusMessage::GradeOne(c) => break (1, c.header.id),
+                    ConsensusMessage::GradeTwo(c) => break (2, c.header.id),
+                    _ => {}
+                }
+            };
+            assert_eq!((grade, id), (expected, own.header.id.clone()));
+        }
+        assert!(outgoing.recv().await.unwrap().votes.is_empty());
+        let mut seen = HashSet::new();
+        while seen.len() < 2 {
+            for vote in outgoing.recv().await.unwrap().votes {
+                assert_eq!(vote.phase, GrbcPhase::Echo);
+                seen.insert(vote.id);
+            }
+        }
+        assert!(seen.contains(&remote.header.id) && seen.contains(&own.header.id));
+    };
+    let result = tokio::time::timeout(Duration::from_secs(3), check).await;
+    run.abort();
+    let _ = run.await;
+    result.expect("Core must deliver own grades before the earlier vote queue drains");
+}
+
+#[tokio::test]
+async fn queue_invariant_qualified_remote_finishes_behind_an_unrelated_vote() {
+    let mut h = Harness::new("remote_behind_remote_vote", 3);
+    let (tx_votes, mut outgoing) = channel(1);
+    tx_votes
+        .try_send(VoteDispatch {
+            requestor: None,
+            votes: Vec::new(),
+        })
+        .unwrap();
+    h.core.tx_votes = tx_votes;
+    let mut remote = crate::common::headers();
+    let first = remote.remove(0);
+    let next = remote.remove(0);
+    for header in [&first, &next] {
+        h.core
+            .process_proposal(Proposal {
+                header: header.clone(),
+                batches: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+    }
+    for vote in votes(&next, GrbcPhase::Ready).into_iter().take(2) {
+        h.core.process_grbc_vote(vote).await.unwrap();
+    }
+    assert_eq!(h.grades(), vec![1, 2]);
+    assert!(h.core.completed.contains(&next.id));
+    assert!(outgoing.recv().await.unwrap().votes.is_empty());
+    let run = tokio::spawn(async move { h.core.run().await });
+    let phases = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut phases = Vec::new();
+        let mut saw_first = false;
+        while phases.len() < 2 || !saw_first {
+            for vote in outgoing.recv().await.unwrap().votes {
+                if vote.id == first.id {
+                    assert_eq!(vote.phase, GrbcPhase::Echo);
+                    saw_first = true;
+                } else {
+                    assert_eq!(vote.id, next.id);
+                    phases.push(vote.phase);
+                }
+            }
+        }
+        phases
+    })
+    .await
+    .unwrap();
+    assert_eq!(phases, vec![GrbcPhase::Echo, GrbcPhase::Ready]);
+    run.abort();
+    let _ = run.await;
+}
+
+#[tokio::test]
+async fn queue_invariant_paused_worker_cleanup_preserves_latest_round_without_blocking_core() {
+    let mut h = Harness::new("paused_worker_cleanup", 0);
+    let mut p = proposal();
+    let feedback = async {
+        for round in 1..=105 {
+            p.header.round = round;
+            resign(&mut p);
+            h.core.process_proposal(p.clone()).await.unwrap();
+            h.grades();
+            h.outgoing();
+            h.core.process_committed(vec![p.block()]).await.unwrap();
+            assert!(h._headers.try_recv().is_ok());
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(4), feedback)
+        .await
+        .expect("committed feedback blocked behind the paused worker cleanup consumer");
+    assert_eq!(*h.cleanup.borrow_and_update(), 105);
+    assert_eq!(h.core.consensus_round.load(Ordering::Relaxed), 105);
+}
+
+#[tokio::test]
+async fn own_local_delivery_bypasses_a_full_vote_queue() {
+    let mut h = Harness::new("self_delivery_full_votes", 3);
+    let (tx_votes, mut rx_votes) = channel(1);
+    tx_votes
+        .send(VoteDispatch {
+            requestor: None,
+            votes: vec![],
+        })
+        .await
+        .unwrap();
+    h.core.tx_votes = tx_votes;
+    let p = proposal();
+    tokio::time::timeout(Duration::from_secs(2), h.core.process_proposal(p.clone()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.grades(), vec![1, 2]);
+    assert_eq!(h.core.deferred_vote_blocks, 1);
+    assert!(rx_votes.recv().await.unwrap().votes.is_empty());
+    let run = tokio::spawn(async move { h.core.run().await });
+    let dispatch = tokio::time::timeout(Duration::from_secs(2), rx_votes.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dispatch.votes[0].id, p.header.id);
+    assert_eq!(dispatch.votes[0].phase, GrbcPhase::Echo);
+    run.abort();
+    let _ = run.await;
+}
+
+#[tokio::test]
+async fn own_local_delivery_is_idempotent_and_rejects_a_second_round_variant() {
+    let mut h = Harness::new("self_delivery_duplicate", 3);
+    let p = proposal();
+    h.core.process_proposal(p.clone()).await.unwrap();
+    assert_eq!(h.grades(), vec![1, 2]);
+    h.core.process_proposal(p.clone()).await.unwrap();
+    assert!(h.grades().is_empty());
+    let mut conflict = p.clone();
+    conflict.header.weak_edges.insert(Digest([42; 32]));
+    resign(&mut conflict);
+    h.core.process_proposal(conflict.clone()).await.unwrap();
+    assert!(h.grades().is_empty());
+    assert!(!h.core.completed.contains(&conflict.header.id));
+}
+
+#[tokio::test]
+async fn own_commit_before_core_registration_still_votes_and_does_not_duplicate_delivery() {
+    let mut h = Harness::new("self_commit_before_callback", 3);
+    let p = proposal();
+    let (stored, _) = crate::proposal_processor::prepare_proposal(
+        p.clone(),
+        h.core.committee.clone(),
+        &mut h.core.store,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    for vote in votes(&p.header, GrbcPhase::Echo).iter().take(2) {
+        h.core.process_grbc_vote(vote.clone()).await.unwrap();
+    }
+    h.core.process_committed(vec![p.block()]).await.unwrap();
+    assert!(h.grades().is_empty());
+    h.core.process_stored_proposal(stored).await.unwrap();
+    let outgoing = h.outgoing();
+    assert_eq!(outgoing.len(), 2);
+    assert_eq!(outgoing[0].phase, GrbcPhase::Echo);
+    assert_eq!(outgoing[1].phase, GrbcPhase::Ready);
+    assert!(h.grades().iter().all(|grade| *grade != 2));
+}
+
+#[tokio::test]
+async fn runtime_review_early_commit_selects_both_own_voting_slots() {
+    let mut h = Harness::new("self_selected_votes", 3);
+    let selected = proposal();
+    let (stored, _) = crate::proposal_processor::prepare_proposal(
+        selected.clone(),
+        committee(),
+        &mut h.core.store,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    h.core
+        .process_committed(vec![selected.block()])
+        .await
+        .unwrap();
+    let mut other = selected.clone();
+    other.header.weak_edges.insert(Digest([42; 32]));
+    resign(&mut other);
+    h.core.process_proposal(other.clone()).await.unwrap();
+    for vote in votes(&other.header, GrbcPhase::Ready).into_iter().take(2) {
+        h.core.process_grbc_vote(vote).await.unwrap();
+    }
+    assert!(
+        h.outgoing().is_empty(),
+        "Both voting slots belong to the committed header"
+    );
+    h.core.process_stored_proposal(stored).await.unwrap();
+    for vote in votes(&selected.header, GrbcPhase::Echo).into_iter().take(2) {
+        h.core.process_grbc_vote(vote).await.unwrap();
+    }
+    let outgoing = h.outgoing();
+    assert_eq!(outgoing.len(), 2);
+    assert!(outgoing.iter().all(|v| v.id == selected.header.id));
+    assert_eq!(outgoing[0].phase, GrbcPhase::Echo);
+    assert_eq!(outgoing[1].phase, GrbcPhase::Ready);
+}
+
+#[tokio::test]
+async fn invalid_own_payload_is_not_delivered_locally() {
+    let mut h = Harness::new("self_invalid_payload", 3);
+    let mut p = proposal();
+    p.header.payload.insert(Digest([77; 32]), 0);
+    resign(&mut p);
+    assert!(h.core.process_proposal(p).await.is_err());
+    assert!(h.grades().is_empty());
+    assert!(h.core.completed.is_empty());
     assert!(h.outgoing().is_empty());
 }
 
@@ -653,7 +955,7 @@ async fn actual_commit_completes_a_stored_unregistered_proposal_without_votes() 
         .await
         .unwrap()
         .is_some());
-    assert_eq!(h.cleanup.try_recv().unwrap()[0].header, p.header);
+    assert_eq!(*h.cleanup.borrow_and_update(), p.header.round);
     assert!(matches!(h._headers.try_recv().unwrap(),
         crate::header_waiter::WaiterMessage::Committed(ref blocks)
         if blocks == &vec![(p.block().digest(),p.header.id.clone())]));
@@ -693,7 +995,7 @@ async fn commit_requires_the_exact_complete_local_proposal() {
         .await
         .is_err());
     assert!(h.core.completed.is_empty());
-    assert!(h.cleanup.try_recv().is_err());
+    assert!(!h.cleanup.has_changed().unwrap());
     h.core.process_proposal(p.clone()).await.unwrap();
     let mut changed = p.block();
     changed.header.signature = Signature::default();
@@ -762,7 +1064,10 @@ async fn committed_parent_batch_counts_with_grbc_once_without_gating_child_echo(
     assert_eq!(strong.len(), 3);
     assert!(h.grades().is_empty());
     assert!(h.outgoing().is_empty());
-    assert_eq!(h.cleanup.try_recv().unwrap().len(), 3);
+    assert_eq!(
+        *h.cleanup.borrow_and_update(),
+        committed.iter().map(Certificate::round).max().unwrap()
+    );
     for p in &parents {
         assert!(h
             .core
@@ -912,7 +1217,7 @@ async fn commit_feedback_is_serviced_inside_a_hot_vote_burst() {
     assert!(h.core.completed.contains(&p.header.id));
     assert!(h.core.pending_votes.is_empty());
     assert!(h.core.cancel_handlers.is_empty());
-    assert_eq!(h.cleanup.try_recv().unwrap().len(), 1);
+    assert_eq!(*h.cleanup.borrow_and_update(), p.header.round);
     assert!(h.core.vote_batch.len() > 0);
     h.core.process_stored_proposal(stored).await.unwrap();
     assert!(h.outgoing().is_empty());

@@ -141,7 +141,20 @@ fn spawn_aba_broadcaster(
 
         loop {
             tokio::select! {
-                Some(messages) = rx_messages.recv() => {
+                Some(mut messages) = rx_messages.recv() => {
+                    // Coalesce independent ABA instances before signing. Other
+                    // consensus commands are handled by the separate router.
+                    let deadline = sleep(Duration::from_millis(1));
+                    tokio::pin!(deadline);
+                    loop {
+                        tokio::select! {
+                            () = &mut deadline => break,
+                            next = rx_messages.recv() => match next {
+                                Some(mut more) => messages.append(&mut more),
+                                None => break,
+                            },
+                        }
+                    }
                     let groups = if crate::adversary::schedule_aba() {
                         crate::adversary::group_aba_messages(messages)
                     } else { vec![messages] };
@@ -165,6 +178,39 @@ fn spawn_aba_broadcaster(
     });
 }
 
+fn spawn_consensus_router(
+    mut rx_consensus: Receiver<ConsensusCommand>,
+    tx_consensus_commands: Sender<ConsensusCommand>,
+    tx_aba_broadcast: Sender<Vec<Vec<u8>>>,
+) {
+    tokio::spawn(async move {
+        let mut spool = crate::aba_spool::AbaSpool::default();
+        let mut input_closed = false;
+        while !input_closed || !spool.is_empty() {
+            tokio::select! {
+                permit = tx_aba_broadcast.reserve(), if !spool.is_empty() => {
+                    permit.expect("ABA broadcaster stopped").send(spool.pop().await);
+                }
+                command = rx_consensus.recv(), if !input_closed => match command {
+                    Some(ConsensusCommand::AbaBroadcast(batch)) => {
+                        if spool.is_empty() {
+                            match tx_aba_broadcast.try_send(batch) {
+                                Ok(()) => continue,
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => spool.push(batch).await,
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => panic!("ABA broadcaster stopped"),
+                            }
+                        } else {
+                            spool.push(batch).await;
+                        }
+                    }
+                    Some(command) => tx_consensus_commands.send(command).await.expect("Core stopped"),
+                    None => input_closed = true,
+                }
+            }
+        }
+    });
+}
+
 pub struct Primary;
 
 impl Primary {
@@ -174,7 +220,7 @@ impl Primary {
         parameters: Parameters,
         store: Store,
         tx_consensus: Sender<ConsensusMessage>,
-        mut rx_consensus: Receiver<ConsensusCommand>,
+        rx_consensus: Receiver<ConsensusCommand>,
     ) {
         crate::adversary::initialize(keypair.name, &committee)
             .expect("Invalid BENCH_ADVERSARY_CONFIG");
@@ -192,42 +238,9 @@ impl Primary {
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_consensus_commands, rx_consensus_commands) = channel(CHANNEL_CAPACITY);
         let (tx_aba_broadcast, rx_aba_broadcast) = channel(CHANNEL_CAPACITY);
-        let (tx_cleanup, rx_cleanup) = channel(CHANNEL_CAPACITY);
+        let (tx_cleanup, rx_cleanup) = tokio::sync::watch::channel(0);
 
-        tokio::spawn(async move {
-            while let Some(command) = rx_consensus.recv().await {
-                match command {
-                    ConsensusCommand::AbaBroadcast(mut messages) => {
-                        // Coalesce bursts from independent ABA instances. The
-                        // Core signs the resulting batch once.
-                        let deadline = sleep(Duration::from_millis(1));
-                        tokio::pin!(deadline);
-                        loop {
-                            tokio::select! {
-                                () = &mut deadline => break,
-                                next = rx_consensus.recv() => match next {
-                                    Some(ConsensusCommand::AbaBroadcast(mut more)) => {
-                                        messages.append(&mut more);
-                                    }
-                                    Some(command) => {
-                                        tx_consensus_commands.send(command).await.expect("Failed to send consensus command");
-                                    }
-                                    None => break,
-                                }
-                            }
-                        }
-                        tx_aba_broadcast
-                            .send(messages)
-                            .await
-                            .expect("Failed to send ABA batch");
-                    }
-                    command => tx_consensus_commands
-                        .send(command)
-                        .await
-                        .expect("Failed to send consensus command"),
-                }
-            }
-        });
+        spawn_consensus_router(rx_consensus, tx_consensus_commands, tx_aba_broadcast);
 
         // Write the parameters to the logs.
         parameters.log();
@@ -237,7 +250,7 @@ impl Primary {
         let secret = keypair.secret;
 
         // Atomic variable use to synchronizer all tasks with the latest consensus round. This is only
-        // used for cleanup. The only tasks that write into this variable is `GarbageCollector`.
+        // used for cleanup. Core publishes this watermark after applying each committed batch.
         let consensus_round = Arc::new(AtomicU64::new(0));
         let in_flight = ProposalTracker::default();
         #[cfg(feature = "benchmark")]
@@ -355,7 +368,7 @@ impl Primary {
         );
 
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
-        GarbageCollector::spawn(&name, &committee, consensus_round.clone(), rx_cleanup);
+        GarbageCollector::spawn(&name, &committee, rx_cleanup);
 
         // Receives batch digests from other workers. They are only used to validate headers.
         PayloadReceiver::spawn(store.clone(), /* rx_workers */ rx_others_digests);
