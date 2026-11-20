@@ -1,7 +1,12 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
+from itertools import zip_longest
+import json
 from fabric import Connection, ThreadingGroup as Group
 from fabric.exceptions import GroupException
+from invoke.exceptions import Failure
 from paramiko import RSAKey
 from paramiko.ssh_exception import PasswordRequiredException, SSHException
 from os import environ, pathsep, access, X_OK
@@ -11,7 +16,11 @@ from shlex import quote
 from time import sleep
 from math import ceil
 from copy import deepcopy
+from datetime import datetime
+from re import fullmatch, search
 import subprocess
+from time import monotonic, time
+from uuid import uuid4
 
 from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError
 from benchmark.utils import BenchError, Print, PathMaker, progress_bar
@@ -20,6 +29,7 @@ from benchmark.adversary import active_launch_ids, resolve_adversary, validate_a
 from benchmark.adversary_schedule import build_client_schedules, client_silence_slot_ms
 from benchmark.logs import LogParser, ParseError
 from benchmark.instance import InstanceManager
+from benchmark import timing
 
 
 class FabricError(Exception):
@@ -122,6 +132,36 @@ class Bench:
         assert isinstance(hosts, list)
         assert isinstance(delete_logs, bool)
         hosts = hosts if hosts else self.manager.hosts(flat=True)
+        if getattr(self, '_run_dir', None):
+            # A run owns only its UUID directory and prefixed tmux sessions.
+            # In particular, a second controller must not kill an existing run.
+            prefix = f'orca-{self._run_id}-'
+            if delete_logs:
+                directory = quote(self._run_dir)
+                config = quote(getattr(self, '_remote_config', None) or '.')
+                cmd = (f'orca_origin="$PWD"; orca_config="$PWD"/{config}; '
+                       f'mkdir -p {quote(str(Path(self._run_dir).parent).replace(chr(92), "/"))} && '
+                       f'mkdir {directory} && mkdir {directory}/logs && '
+                       f'cd {directory} && ln -s "$orca_origin/node" node && '
+                       'ln -s "$orca_origin/benchmark_client" benchmark_client && '
+                       'cp "$orca_config"/.*.json .')
+            else:
+                directory = quote(self._run_dir)
+                cmd = ("(tmux list-sessions -F '#{session_name}' 2>/dev/null || true) | "
+                       'while IFS= read -r orca_session; do case "$orca_session" in '
+                       f'{quote(prefix)}*) tmux kill-session -t "=$orca_session" || true;; esac; done; '
+                       # Account for a child still exiting after tmux drops the session.
+                       f'for orca_attempt in 1 2 3 4 5; do '
+                       f'orca_running=0; for orca_cwd in /proc/[0-9]*/cwd; do '
+                       f'if test "$orca_cwd" -ef {directory}; then orca_running=1; break; fi; done; '
+                       'if test "$orca_running" = 0; then exit 0; fi; sleep 1; done; '
+                       'echo "Processes are still using this benchmark directory" >&2; exit 1')
+            try:
+                Group(*hosts, user='ubuntu', connect_kwargs=self.connect,
+                      connect_timeout=10).run(cmd, hide=True, timeout=15)
+            except GroupException as error:
+                raise BenchError('Failed to prepare/stop this benchmark run', FabricError(error))
+            return
         delete_logs = CommandMaker.clean_logs() if delete_logs else 'true'
         cmd = [delete_logs, f'({CommandMaker.kill()} || true)']
         try:
@@ -141,8 +181,7 @@ class Bench:
                 return []
 
             # Select the hosts in different data centers.
-            ordered = zip(*hosts.values())
-            ordered = [x for y in ordered for x in y]
+            ordered = [ip for row in zip_longest(*hosts.values()) for ip in row if ip is not None]
             return ordered[:nodes]
 
         # Spawn the primary and each worker on a different machine. Each
@@ -168,6 +207,9 @@ class Bench:
     def _background_run(self, host, command, log_file):
         name = splitext(basename(log_file))[0]
         script = f'{command} |& tee {quote(log_file)}'
+        if getattr(self, '_run_dir', None):
+            name = f'orca-{self._run_id}-{name}'
+            script = f'cd {quote(self._run_dir)} || exit 1; set -o pipefail; {script}'
         cmd = f'tmux new -d -s {quote(name)} {quote(script)}'
         c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
         output = c.run(cmd, hide=True)
@@ -323,17 +365,270 @@ class Bench:
         for i, name in enumerate(progress):
             for ip in committee.ips(name):
                 c = Connection(ip, user='ubuntu', connect_kwargs=self.connect)
-                c.run(f'{CommandMaker.cleanup()} || true', hide=True)
-                c.put(PathMaker.committee_file(), '.')
-                c.put(PathMaker.key_file(i), '.')
-                c.put(PathMaker.parameters_file(), '.')
+                destination = getattr(self, '_remote_config', None)
+                if destination:
+                    c.run(f'mkdir -p {quote(destination)}', hide=True, timeout=15)
+                else:
+                    c.run(f'{CommandMaker.cleanup()} || true', hide=True)
+                c.put(PathMaker.committee_file(), destination or '.')
+                c.put(PathMaker.key_file(i), destination or '.')
+                c.put(PathMaker.parameters_file(), destination or '.')
 
         return committee
 
+    def _read_clock_logs(self, timeout):
+        grouped = {}
+        for identity in self._clock_clients + self._clock_primaries + self._clock_workers:
+            grouped.setdefault(identity[0], []).append(identity)
+        def read_host(item):
+            host, identities = item
+            commands = [f'cd {quote(self._run_dir)} || exit 1']
+            for index, (_, logfile) in enumerate(identities):
+                session = f'orca-{self._run_id}-{splitext(basename(logfile))[0]}'
+                commands += [
+                    f'printf "%s\\n" __ORCA_LOG_{index}__',
+                    f'tmux has-session -t {quote("=" + session)} 2>/dev/null || '
+                    'printf "%s\\n" "ERROR benchmark process exited"',
+                    f'if test -f {quote(logfile)}; then '
+                    "grep -E 'Benchmark clock|Benchmark input|Primary.*booted on|ERROR|panicked at|address already in use' "
+                    f'{quote(logfile)} || true; fi',
+                ]
+            try:
+                with Connection(host, user='ubuntu', connect_kwargs=self.connect,
+                                connect_timeout=timeout) as connection:
+                    output = connection.run('\n'.join(commands), hide=True, timeout=timeout)
+            except (Failure, SSHException, OSError) as error:
+                raise ExecutionError(f'Failed to read benchmark process/log status on {host}') from error
+            logs = {}
+            for index, identity in enumerate(identities):
+                marker = f'__ORCA_LOG_{index}__\n'
+                if marker not in output.stdout:
+                    raise ExecutionError(f'Missing process/log status for {identity}')
+                logs[identity] = output.stdout.split(marker, 1)[1].split('__ORCA_LOG_', 1)[0]
+            return logs
+        logs = {}
+        with ThreadPoolExecutor(max_workers=min(32, len(grouped))) as executor:
+            for result in executor.map(read_host, grouped.items()):
+                logs.update(result)
+        return logs
+
+    def _publish_clock(self, plan):
+        self._measurement_window = plan
+        timing.save_plan(plan, getattr(self, '_collection_directory', None) or PathMaker.logs_path(),
+                         PathMaker.results_path(), getattr(self, '_snapshot', None))
+        encoded = json.dumps(plan, sort_keys=True, separators=(',', ':')).encode()
+        def publish(host):
+            temporary = f'{timing.START_PLAN}.{self._run_id}.tmp'
+            try:
+                with Connection(host, user='ubuntu', connect_kwargs=self.connect,
+                                connect_timeout=10) as connection:
+                    # Fabric's SFTP transfer uses the same bounded socket as SSH.
+                    connection.open()
+                    connection.sftp().get_channel().settimeout(10)
+                    connection.put(BytesIO(encoded), remote=f'{self._run_dir}/{temporary}')
+                    connection.run(
+                        f'cd {quote(self._run_dir)} && test ! -e {timing.START_PLAN} && '
+                        f'mv -- {quote(temporary)} {timing.START_PLAN}', hide=True, timeout=10,
+                    )
+            except (Failure, SSHException, OSError) as error:
+                raise ExecutionError(f'Failed to publish benchmark plan on {host}') from error
+        hosts = list(dict.fromkeys(host for host, _ in self._clock_clients))
+        with ThreadPoolExecutor(max_workers=min(32, len(hosts))) as executor:
+            list(executor.map(publish, hosts))
+
+    def _wait_for_clients(self, clients, duration):
+        """Keep nodes alive for the complete window used by comparison_metrics."""
+        if getattr(self, '_clock_enabled', False) is True:
+            hosts = sorted({host for host, _ in clients + self._clock_primaries})
+            self._check_clock_sync(hosts)
+            try:
+                return timing.coordinate(
+                    clients, self._clock_primaries, self._read_clock_logs, self._publish_clock,
+                    duration=duration, warmup=self._clock_settings.warmup,
+                    drain=self._clock_settings.drain, run_id=self._run_id,
+                )
+            except timing.ClockError as error:
+                raise ExecutionError(str(error)) from error
+        if not clients:
+            raise ExecutionError('No benchmark clients were launched')
+        timeout = monotonic() + 120
+        starts = {}
+        while len(starts) < len(clients):
+            for host, logfile in clients:
+                identity = (host, logfile)
+                if identity in starts:
+                    continue
+                remaining = timeout - monotonic()
+                if remaining <= 0:
+                    raise ExecutionError('Clients did not start within 120 seconds')
+                try:
+                    with Connection(host, user='ubuntu', connect_kwargs=self.connect,
+                                    connect_timeout=min(10, remaining)) as connection:
+                        output = connection.run(
+                            f'if test -f {quote(logfile)}; then cat {quote(logfile)}; fi',
+                            hide=True, timeout=min(10, remaining),
+                        )
+                except (Failure, SSHException, OSError) as e:
+                    raise ExecutionError(f'Failed to read client startup log {logfile}') from e
+                match = search(r'(\d{4}-\S+Z)[^\n]* Start ', output.stdout)
+                if match:
+                    starts[identity] = datetime.fromisoformat(
+                        match[1].replace('Z', '+00:00')
+                    ).timestamp()
+            if monotonic() >= timeout:
+                raise ExecutionError('Clients did not start within 120 seconds')
+            if len(starts) < len(clients):
+                sleep(0.1)
+        deadline = min(starts.values()) + duration
+        if max(starts.values()) >= deadline:
+            raise ExecutionError('Client startup skew exceeds the measurement window')
+        while time() < deadline:
+            sleep(min(0.1, max(0, deadline - time())))
+
+    def _check_clock_sync(self, hosts):
+        command = ['chronyc', 'waitsync', '10', '0.1', '0', '1']
+        try:
+            subprocess.run(command, check=True, timeout=15, capture_output=True, text=True)
+            with Group(*hosts, user='ubuntu', connect_kwargs=self.connect,
+                       connect_timeout=10) as group:
+                group.run(' '.join(command), hide=True, timeout=15)
+        except (OSError, subprocess.SubprocessError, GroupException) as error:
+            raise ExecutionError('UTC clocks are not synchronized within 100 ms; check chrony') from error
+
+    def _begin_clock_collection(self):
+        target = environ.get('ORCA_BENCHMARK_LOGS_DIRECTORY')
+        self._collection_directory = Path(target or PathMaker.logs_path())
+        if target is None:
+            subprocess.run(CommandMaker.clean_logs(), shell=True, check=True,
+                           stderr=subprocess.DEVNULL)
+        self._collection_directory.mkdir(parents=True, exist_ok=True)
+        if any(self._collection_directory.iterdir()):
+            raise ExecutionError(f'Attempt log directory is not empty: {self._collection_directory}')
+
+    @staticmethod
+    def _log_identities(committee, active):
+        for i, addresses in enumerate(committee.workers_addresses(0)):
+            if i in active:
+                for worker, address in addresses:
+                    host = Committee.ip(address)
+                    yield host, PathMaker.client_log_file(i, worker)
+                    yield host, PathMaker.worker_log_file(i, worker)
+        for i, address in enumerate(committee.primary_addresses(0)):
+            if i in active:
+                yield Committee.ip(address), PathMaker.primary_log_file(i)
+
+    def _collect_clock_logs(self):
+        identities = {}
+        for host, logfile in self._expected_clock_logs:
+            identities.setdefault(host, []).append(logfile)
+
+        def collect_host(item):
+            host, logfiles = item
+            pending = list(logfiles)
+            errors = {}
+            try:
+                with Connection(host, user='ubuntu', connect_kwargs=self.connect,
+                                connect_timeout=10) as connection:
+                    connection.open()
+                    connection.sftp().get_channel().settimeout(10)
+                    for logfile in logfiles:
+                        target = self._collection_directory / basename(logfile)
+                        partial = target.with_suffix('.log.partial')
+                        try:
+                            connection.get(self._remote_log(logfile), local=str(partial))
+                            partial.replace(target)
+                        except (Failure, SSHException, OSError) as error:
+                            errors[logfile] = f'{host}: {error}'
+                        pending.remove(logfile)
+            except (Failure, SSHException, OSError) as error:
+                errors.update((logfile, f'{host}: {error}') for logfile in pending)
+            return errors
+
+        errors = {}
+        with ThreadPoolExecutor(max_workers=min(32, len(identities))) as executor:
+            for result in executor.map(collect_host, identities.items()):
+                errors.update(result)
+        return errors
+
+    def _release_run_storage(self, hosts, retain_logs):
+        if not fullmatch(r'\.orca-benchmark/[0-9a-f]{32}/[0-9a-f]{32}', self._run_dir):
+            raise ExecutionError(f'Unexpected remote benchmark directory: {self._run_dir}')
+        directory = quote(self._run_dir)
+        if retain_logs:
+            command = (f'if test -d {directory}; then find {directory} -mindepth 1 -maxdepth 1 '
+                       '! -name logs -exec rm -rf -- {} +; fi')
+        else:
+            command = f'rm -rf -- {directory}'
+        with Group(*hosts, user='ubuntu', connect_kwargs=self.connect,
+                   connect_timeout=10) as group:
+            group.run(command, hide=True, timeout=30)
+
+    def _finish_clock_run(self, hosts, failure):
+        issues = {}
+        try:
+            self.kill(hosts=hosts, delete_logs=False)
+        except Exception as error:
+            issues['stop'] = str(error)
+        try:
+            missing = self._collect_clock_logs()
+            if missing:
+                issues['logs'] = missing
+        except Exception as error:
+            issues['logs'] = str(error)
+        if 'stop' not in issues:
+            try:
+                self._release_run_storage(hosts, retain_logs='logs' in issues)
+            except Exception as error:
+                issues['cleanup'] = str(error)
+        if issues:
+            detail = {'run_id': self._run_id, 'remote_directory': self._run_dir, **issues}
+            (self._collection_directory / 'collection-issues.json').write_text(
+                json.dumps(detail, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+            error = ExecutionError(f'Benchmark log collection or teardown failed for {self._run_dir}: {issues}')
+            if failure is None:
+                raise error
+            Print.warn(str(error))
+
     def _run_single(self, rate, committee, bench_parameters, node_parameters, debug=False,
                     adversary_config=None):
+        self._run_started = False
+        failure = None
+        try:
+            return self._run_single_inner(rate, committee, bench_parameters, node_parameters,
+                                          debug, adversary_config)
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            if self._run_started:
+                try:
+                    if self._collection_directory is not None:
+                        self._finish_clock_run(committee.ips(), failure)
+                    else:
+                        self.kill(hosts=committee.ips(), delete_logs=False)
+                except Exception as error:
+                    if failure is None:
+                        raise
+                    Print.warn(f'Failed to stop benchmark run {self._run_id}: {error}')
+                finally:
+                    self._run_started = False
+
+    def _run_single_inner(self, rate, committee, bench_parameters, node_parameters, debug=False,
+                          adversary_config=None):
         faults = bench_parameters.faults
         active = set(active_launch_ids(committee.size(), adversary_config))
+        self._clock_enabled = bench_parameters.common_clock
+        self._clock_settings = bench_parameters
+        self._measurement_window = None
+        self._clock_clients, self._clock_primaries, self._clock_workers = [], [], []
+        self._run_id = uuid4().hex
+        self._run_dir = (f'{getattr(self, "_remote_config", ".orca-benchmark")}/{self._run_id}'
+                         if self._clock_enabled else None)
+        self._collection_directory = None
+        if self._clock_enabled and getattr(self, '_remote_config', None):
+            self._begin_clock_collection()
+            self._expected_clock_logs = list(self._log_identities(committee, active))
+        self._run_started = True
 
         # Kill any potentially unfinished run and delete logs.
         hosts = committee.ips()
@@ -350,11 +645,12 @@ class Bench:
                 node_parameters.json['max_header_delay']
             )
             silence_schedules = build_client_schedules(
-                names, faults, bench_parameters.duration, silence_slot_ms
+                names, faults, bench_parameters.warmup + bench_parameters.duration, silence_slot_ms
             )
         else:
             silence_slot_ms = 0
             silence_schedules = dict.fromkeys(names, '')
+        clients = []
         for i, addresses in workers_addresses.items():
             for (id, address) in addresses:
                 host = Committee.ip(address)
@@ -365,9 +661,12 @@ class Bench:
                     [x for y in workers_addresses.values() for _, x in y],
                     silence_schedules[names[i]],
                     silence_slot_ms,
+                    start_plan=timing.START_PLAN if self._clock_enabled else None,
                 )
                 log_file = PathMaker.client_log_file(i, id)
                 self._background_run(host, cmd, log_file)
+                clients.append((host, log_file))
+        self._clock_clients = clients
 
         # Start only authorities included in the launch plan.
         Print.info('Booting primaries...')
@@ -386,6 +685,7 @@ class Bench:
             )
             log_file = PathMaker.primary_log_file(i)
             self._background_run(host, cmd, log_file)
+            self._clock_primaries.append((host, log_file))
 
         # A1 omits workers together with their primary.
         Print.info('Booting workers...')
@@ -402,18 +702,26 @@ class Bench:
                 )
                 log_file = PathMaker.worker_log_file(i, id)
                 self._background_run(host, cmd, log_file)
+                self._clock_workers.append((host, log_file))
 
-        # Wait for all transactions to be processed.
+        # Use the same Start event and fixed cutoff as comparison_metrics.
         duration = bench_parameters.duration
-        for _ in progress_bar(range(20), prefix=f'Running benchmark ({duration} sec):'):
-            sleep(ceil(duration / 20))
-        self.kill(hosts=hosts, delete_logs=False)
+        Print.info(f'Running benchmark ({duration} sec)...')
+        self._wait_for_clients(clients, duration)
 
     def _logs(self, committee, faults, adversary=None):
+        collection = getattr(self, '_collection_directory', None)
+        if collection is not None:
+            Print.info('Parsing logs and computing performance...')
+            return LogParser.process(str(collection), faults=faults, adversary=adversary,
+                                     committee_size=committee.size())
         active = set(active_launch_ids(committee.size(), adversary))
         # Delete local logs (if any).
         cmd = CommandMaker.clean_logs()
         subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
+        if getattr(self, '_measurement_window', None):
+            timing.write_plan(Path(PathMaker.logs_path()) / timing.MEASUREMENT_WINDOW,
+                              self._measurement_window)
 
         # Download log files.
         workers_addresses = [(i, rows) for i, rows in enumerate(committee.workers_addresses(0))
@@ -424,11 +732,11 @@ class Bench:
                 host = Committee.ip(address)
                 c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
                 c.get(
-                    PathMaker.client_log_file(i, id), 
+                    self._remote_log(PathMaker.client_log_file(i, id)),
                     local=PathMaker.client_log_file(i, id)
                 )
                 c.get(
-                    PathMaker.worker_log_file(i, id), 
+                    self._remote_log(PathMaker.worker_log_file(i, id)),
                     local=PathMaker.worker_log_file(i, id)
                 )
 
@@ -439,13 +747,17 @@ class Bench:
             host = Committee.ip(address)
             c = Connection(host, user='ubuntu', connect_kwargs=self.connect)
             c.get(
-                PathMaker.primary_log_file(i), 
+                self._remote_log(PathMaker.primary_log_file(i)),
                 local=PathMaker.primary_log_file(i)
             )
 
         # Parse logs and return the parser.
         Print.info('Parsing logs and computing performance...')
         return LogParser.process(PathMaker.logs_path(), faults=faults, adversary=adversary, committee_size=committee.size())
+
+    def _remote_log(self, filename):
+        directory = getattr(self, '_run_dir', None)
+        return f'{directory}/{filename}' if directory else filename
 
     def run(self, bench_parameters_dict, node_parameters_dict, debug=False):
         assert isinstance(debug, bool)
@@ -475,12 +787,44 @@ class Bench:
         ]
         self._check_binaries(list(dict.fromkeys(ips)))
 
-        # Upload all configuration files.
+        self._remote_config = f'.orca-benchmark/{uuid4().hex}' if bench_parameters.common_clock else None
+        failure = None
+        try:
+            self._run_matrix(selected_hosts, bench_parameters, node_parameters,
+                             bench_parameters_dict, node_parameters_dict, adversary, debug)
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            if self._remote_config:
+                try:
+                    self._release_config_storage(list(dict.fromkeys(ips)))
+                except Exception as error:
+                    if failure is None:
+                        raise BenchError('Failed to remove uploaded benchmark configuration', error) from error
+                    Print.warn(f'Failed to remove uploaded benchmark configuration: {error}')
+
+    def _release_config_storage(self, hosts):
+        if not fullmatch(r'\.orca-benchmark/[0-9a-f]{32}', self._remote_config):
+            raise ExecutionError(f'Unexpected remote config directory: {self._remote_config}')
+        directory = quote(self._remote_config)
+        # Preserve child run logs retained for recovery.
+        command = (f'if test -d {directory}; then '
+                   f'rm -f -- {directory}/.committee.json {directory}/.parameters.json '
+                   f'{directory}/.node-*.json && '
+                   f'find {directory} -maxdepth 0 -type d -empty -delete; fi')
+        with Group(*hosts, user='ubuntu', connect_kwargs=self.connect,
+                   connect_timeout=10) as group:
+            group.run(command, hide=True, timeout=15)
+
+    def _run_matrix(self, selected_hosts, bench_parameters, node_parameters,
+                    bench_parameters_dict, node_parameters_dict, adversary, debug):
         try:
             committee = self._config(
                 selected_hosts, node_parameters, bench_parameters
             )
-        except (subprocess.SubprocessError, GroupException, ExecutionError, OSError) as e:
+        except (subprocess.SubprocessError, GroupException, ExecutionError, OSError,
+                Failure, SSHException) as e:
             e = FabricError(e) if isinstance(e, GroupException) else e
             raise BenchError('Failed to configure nodes', e)
 
@@ -496,6 +840,7 @@ class Bench:
                 # Run the benchmark.
                 for i in range(bench_parameters.runs):
                     Print.heading(f'Run {i+1}/{bench_parameters.runs}')
+                    self._snapshot = None
                     try:
                         if adversary_config is not None:
                             snapshot = write_run_snapshot(
@@ -503,6 +848,7 @@ class Bench:
                                 committee_copy.json['authorities'], adversary_config,
                                 n, r, i + 1, protocol='orca-b',
                             )
+                            self._snapshot = snapshot
                             Print.info(
                                 f"Adversary: {adversary_config['mode']}; fixed Byzantine IDs: "
                                 f"{adversary['byzantine_ids']}; seed: {adversary_config['seed']}; "
@@ -516,16 +862,26 @@ class Bench:
                         faults = bench_parameters.faults
                         logger = self._logs(committee_copy, faults, adversary=adversary)
                         print(logger.result())
-                        logger.print(PathMaker.result_file(
+                        result_file = PathMaker.result_file(
                             faults,
                             n, 
                             bench_parameters.workers,
                             bench_parameters.collocate,
                             r, 
                             bench_parameters.tx_size, 
-                        ))
-                    except (subprocess.SubprocessError, GroupException, ParseError) as e:
-                        self.kill(hosts=selected_hosts)
+                        )
+                        logger.print(result_file)
+                        logger.print_comparison(
+                            bench_parameters.duration,
+                            f'{result_file[:-4]}-run-{i + 1}.comparison.json',
+                        )
+                    except (OSError, subprocess.SubprocessError, GroupException,
+                            Failure, SSHException, ExecutionError, ParseError) as e:
+                        if not bench_parameters.common_clock:
+                            try:
+                                self.kill(hosts=committee_copy.ips())
+                            except Exception as cleanup_error:
+                                Print.warn(f'Failed to stop benchmark after error: {cleanup_error}')
                         if isinstance(e, GroupException):
                             e = FabricError(e)
                         raise BenchError('Benchmark failed', e) from e

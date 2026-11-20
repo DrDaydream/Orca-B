@@ -1,4 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+mod benchmark_clock;
 use anyhow::{Context, Result};
 use bytes::BufMut as _;
 use bytes::BytesMut;
@@ -23,6 +24,8 @@ async fn main() -> Result<()> {
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
         .args_from_usage("--rate=<INT> 'The rate (txs/s) at which to send the transactions'")
         .args_from_usage("--nodes=[ADDR]... 'Network addresses that must be reachable before starting the benchmark.'")
+        .arg(Arg::with_name("start-plan").long("start-plan").takes_value(true)
+             .help("Atomically published common-clock JSON plan; wait before releasing input"))
         .arg(
             Arg::with_name("silence-schedule")
                 .long("silence-schedule")
@@ -107,6 +110,7 @@ async fn main() -> Result<()> {
         nodes,
         silence_schedule,
         silence_slot_ms,
+        start_plan: matches.value_of("start-plan").map(std::path::PathBuf::from),
     };
 
     // Wait for all nodes to be online and synchronized.
@@ -123,6 +127,7 @@ struct Client {
     nodes: Vec<SocketAddr>,
     silence_schedule: Vec<u8>,
     silence_slot_ms: u64,
+    start_plan: Option<std::path::PathBuf>,
 }
 
 fn client_is_silent(schedule: &[u8], slot_ms: u64, elapsed: Duration) -> bool {
@@ -149,23 +154,49 @@ impl Client {
         let stream = TcpStream::connect(self.target)
             .await
             .context(format!("failed to connect to {}", self.target))?;
+        stream
+            .set_nodelay(true)
+            .context("Could not enable input TCP_NODELAY")?;
+        let plan = match &self.start_plan {
+            Some(path) => {
+                info!("Benchmark clock ready");
+                Some(benchmark_clock::arm_and_wait(path).await?)
+            }
+            None => None,
+        };
 
         // Submit all transactions.
         let burst = self.rate / PRECISION;
         let mut tx = BytesMut::with_capacity(self.size);
         let mut counter = 0;
+        let mut released_samples = 0;
         let mut r = rand::thread_rng().gen();
         let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
-        let interval = interval(Duration::from_millis(BURST_DURATION));
-        tokio::pin!(interval);
+        let mut interval = interval(Duration::from_millis(BURST_DURATION));
 
         // NOTE: This log entry is used to compute performance.
         info!("Start sending transactions");
         let schedule_start = Instant::now();
+        let input_end = async {
+            match &plan {
+                Some(plan) => benchmark_clock::wait_until(plan.end_us).await,
+                None => std::future::pending::<Result<()>>().await,
+            }
+        };
+        tokio::pin!(input_end);
 
         'main: loop {
-            interval.as_mut().tick().await;
+            tokio::select! {
+                biased;
+                result = &mut input_end => { result?; break; }
+                _ = interval.tick() => {}
+            }
             let now = Instant::now();
+            if let Some(plan) = &plan {
+                if benchmark_clock::now_us()? >= plan.end_us {
+                    break;
+                }
+            }
 
             if client_is_silent(
                 &self.silence_schedule,
@@ -178,11 +209,21 @@ impl Client {
             if burst > 0 {
                 // Release the whole active burst before any send can block.
                 match SystemTime::now().duration_since(UNIX_EPOCH) {
-                    Ok(released_at) => info!(
-                        "Benchmark sample released id {} at_us {}",
-                        counter,
-                        released_at.as_micros()
-                    ),
+                    Ok(released_at) => {
+                        if plan
+                            .as_ref()
+                            .map_or(false, |p| released_at.as_micros() >= p.end_us as u128)
+                        {
+                            break;
+                        }
+                        info!(
+                            "Benchmark sample released id {} at_us {}",
+                            counter,
+                            released_at.as_micros()
+                        );
+                        released_samples += 1;
+                    }
+                    Err(error) if plan.is_some() => return Err(error.into()),
                     Err(error) => warn!(
                         "Benchmark sample release timestamp unavailable id {}: {}",
                         counter, error
@@ -205,9 +246,12 @@ impl Client {
 
                 tx.resize(self.size, 0u8);
                 let bytes = tx.split().freeze();
-                if let Err(e) = transport.send(bytes).await {
-                    warn!("Failed to send transaction: {}", e);
-                    break 'main;
+                tokio::select! {
+                    biased;
+                    result = &mut input_end => { result?; break 'main; }
+                    result = transport.send(bytes) => {
+                        result.context("Failed to send transaction")?;
+                    }
                 }
             }
             if now.elapsed().as_millis() > BURST_DURATION as u128 {
@@ -215,6 +259,17 @@ impl Client {
                 warn!("Transaction rate too high for this client");
             }
             counter += 1;
+        }
+        if let Some(plan) = &plan {
+            info!(
+                "Benchmark input stopped at_us {} released_samples {}",
+                benchmark_clock::now_us()?,
+                released_samples
+            );
+            benchmark_clock::wait_until(plan.drain_end_us).await?;
+            // Keep process health observable until the runner captures the full
+            // drain window and cleans up only this run's processes.
+            std::future::pending::<()>().await;
         }
         Ok(())
     }

@@ -36,8 +36,12 @@ impl Store {
         let db = rocksdb::DB::open_default(path)?;
         let mut obligations = HashMap::<_, VecDeque<oneshot::Sender<_>>>::new();
         let (tx, mut rx) = channel(100);
-        tokio::spawn(async move {
-            while let Some(command) = rx.recv().await {
+        // RocksDB reads, writes and compactions may block. Keep their FIFO
+        // ordering on one worker without stalling protocol tasks or timers.
+        // The runtime joins blocking workers during shutdown, ensuring the DB
+        // is closed before RocksDB's process-wide state is destroyed.
+        tokio::task::spawn_blocking(move || {
+            while let Some(command) = rx.blocking_recv() {
                 match command {
                     StoreCommand::Write(key, value) => {
                         let _ = db.put(&key, &value);

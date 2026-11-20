@@ -2,6 +2,7 @@
 #[macro_use]
 mod error;
 pub mod adversary;
+mod aba_spool;
 mod aggregators;
 mod batch_bytes;
 mod core;

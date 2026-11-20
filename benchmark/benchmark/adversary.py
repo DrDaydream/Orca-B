@@ -90,7 +90,8 @@ def remote_parameters(*, nodes, workers, rate, tx_size, duration, faults, runs,
                       default_faults, protocol, adversary='', byzantine=0,
                       byzantine_ids='', seed=1, start_round=1, attack_rounds=0,
                       delay_ms=200, max_pending_messages=4096,
-                      max_pending_bytes=67108864, bullshark_alternating='true'):
+                      max_pending_bytes=67108864, bullshark_alternating='true',
+                      warmup=0, drain=0, common_clock=True):
     """Parse Fabric values without constructing an AWS manager."""
     mode = str(adversary).strip().lower() if adversary is not None else ''
     if mode and mode not in MODES:
@@ -107,6 +108,18 @@ def remote_parameters(*, nodes, workers, rate, tx_size, duration, faults, runs,
         tx_size=_integer(tx_size, 'tx-size', 9),
         duration=_integer(duration, 'duration', 1), runs=_integer(runs, 'runs', 1),
     )
+    for name, value in (('warmup', warmup), ('drain', drain)):
+        value = _integer(value, name)
+        if value:
+            params[name] = value
+    if isinstance(common_clock, str) and common_clock.lower() in ('true', 'false'):
+        common_clock = common_clock.lower() == 'true'
+    if type(common_clock) is not bool:
+        raise ValueError('common-clock must be true or false')
+    if not common_clock:
+        if params.get('warmup') or params.get('drain'):
+            raise ValueError('warmup and drain require the common clock')
+        params['common_clock'] = False
     count = _integer(byzantine, 'byzantine')
     ids = ([_integer(x.strip(), 'byzantine ID') for x in byzantine_ids.split(',')]
            if byzantine_ids else [])
@@ -236,7 +249,9 @@ def write_run_snapshot(directory, benchmark_parameters, node_parameters,
     output.parent.mkdir(parents=True, exist_ok=True)
     snapshot = dict(
         protocol=protocol, created_utc=stamp, nodes=nodes, rate=rate, run=run,
-        benchmark_parameters=benchmark_parameters, node_parameters=node_parameters,
+        benchmark_parameters=dict(benchmark_parameters,
+            warmup=benchmark_parameters.get('warmup', 0), drain=benchmark_parameters.get('drain', 0),
+            common_clock=benchmark_parameters.get('common_clock', True)), node_parameters=node_parameters,
         launch_authorities=list(launch_authorities), adversary=config,
     )
     legacy_faults = benchmark_parameters.get('faults', 0) if protocol.startswith('bullshark') else 0

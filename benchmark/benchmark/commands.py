@@ -1,6 +1,7 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from os import environ
 from os.path import join
+from shlex import quote
 
 from benchmark.utils import PathMaker
 from benchmark.adversary import adversary_environment
@@ -66,7 +67,8 @@ class CommandMaker:
                 f'--store {store} --parameters {parameters} worker --id {id}')
 
     @staticmethod
-    def run_client(address, size, rate, nodes, silence_schedule='', silence_slot_ms=0):
+    def run_client(address, size, rate, nodes, silence_schedule='', silence_slot_ms=0,
+                   start_plan=None):
         assert isinstance(address, str)
         assert isinstance(size, int) and size > 0
         assert isinstance(rate, int) and rate >= 0
@@ -81,8 +83,9 @@ class CommandMaker:
             f'--silence-slot-ms {silence_slot_ms}'
             if silence_schedule else ''
         )
+        clock = f'--start-plan {quote(start_plan)}' if start_plan else ''
         return (f'./benchmark_client {address} --size {size} --rate {rate} '
-                f'{silence} {nodes}')
+                f'{silence} {clock} {nodes}')
 
     @staticmethod
     def kill():

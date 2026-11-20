@@ -1,5 +1,7 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 import subprocess
+from pathlib import Path
+from uuid import uuid4
 from math import ceil
 from time import sleep
 
@@ -10,6 +12,7 @@ from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameter
 from benchmark.logs import LogParser, ParseError
 from benchmark.local_processes import LocalProcesses
 from benchmark.utils import Print, BenchError, PathMaker
+from benchmark import timing
 
 
 class LocalBench:
@@ -17,6 +20,7 @@ class LocalBench:
 
     def __init__(self, bench_parameters_dict, node_parameters_dict):
         self.processes = LocalProcesses()
+        self.snapshot = None
         try:
             self.bench_parameters = BenchParameters(bench_parameters_dict)
             self.node_parameters = NodeParameters(node_parameters_dict)
@@ -47,10 +51,15 @@ class LocalBench:
         try:
             Print.info('Setting up testbed...')
             nodes, rate = self.nodes[0], self.rate[0]
+            self.snapshot = None
+            run_id = uuid4().hex
 
             # Cleanup all files.
             cmd = f'{CommandMaker.clean_logs()} ; {CommandMaker.cleanup()}'
             subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
+            # An unremoved plan must never release clients before this run is ready.
+            if self.common_clock:
+                Path(timing.START_PLAN).unlink(missing_ok=True)
             sleep(0.5)  # Removing the store may take time.
 
             # Recompile the latest code.
@@ -81,6 +90,7 @@ class LocalBench:
                     PathMaker.results_path(), self.benchmark_input, self.node_parameters.json,
                     names, adversary_config, nodes, rate, 1, protocol='orca-b-local',
                 )
+                self.snapshot = snapshot
                 Print.info(f"Adversary: {adversary_config['mode']}; parameters: {snapshot}")
 
             # Run the clients (they will wait for the nodes to be ready).
@@ -92,7 +102,7 @@ class LocalBench:
                     self.node_parameters.json['max_header_delay']
                 )
                 silence_schedules = build_client_schedules(
-                    names, self.faults, self.duration, silence_slot_ms
+                    names, self.faults, self.warmup + self.duration, silence_slot_ms
                 )
             else:
                 silence_slot_ms = 0
@@ -106,11 +116,13 @@ class LocalBench:
                         [x for y in workers_addresses.values() for _, x in y],
                         silence_schedules[names[i]],
                         silence_slot_ms,
+                        start_plan=timing.START_PLAN if self.common_clock else None,
                     )
                     log_file = PathMaker.client_log_file(i, id)
                     self._background_run(cmd, log_file)
 
             # Run the primaries (except the faulty ones).
+            primary_logs = []
             for i, address in enumerate(committee.primary_addresses(0)):
                 if i not in active:
                     continue
@@ -125,6 +137,7 @@ class LocalBench:
                 )
                 log_file = PathMaker.primary_log_file(i)
                 self._background_run(cmd, log_file)
+                primary_logs.append(Path(log_file))
 
             # Run the workers (except the faulty ones).
             for i, addresses in workers_addresses.items():
@@ -142,6 +155,12 @@ class LocalBench:
 
             # Wait for all transactions to be processed.
             Print.info(f'Running benchmark ({self.duration} sec)...')
+            if self.common_clock:
+                def publish(plan):
+                    timing.save_plan(plan, PathMaker.logs_path(), PathMaker.results_path(), self.snapshot)
+                    timing.write_plan(timing.START_PLAN, plan)
+                self.processes.clock = dict(primaries=primary_logs, publish=publish,
+                    warmup=self.warmup, drain=self.drain, run_id=run_id)
             self.processes.wait(self.duration)
             self._kill_nodes()
 

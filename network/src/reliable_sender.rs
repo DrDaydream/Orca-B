@@ -141,9 +141,9 @@ impl ReliableSender {
             .expect("Failed to send internal message");
     }
 
-    /// Own the bounded connection queue without borrowing the sender while
-    /// waiting for capacity. The scheduler can poll all peers concurrently.
-    pub(crate) fn scheduled_send(
+    /// Enqueue a frame whose delivery policy already released it, and wait
+    /// for its acknowledgement. Dropping the future cancels the transfer.
+    pub fn send_released(
         &mut self,
         address: SocketAddr,
         data: Bytes,
@@ -246,6 +246,12 @@ impl Connection {
         loop {
             match TcpStream::connect(self.address).await {
                 Ok(stream) => {
+                    if let Err(error) = stream.set_nodelay(true) {
+                        warn!(
+                            "Could not enable TCP_NODELAY for {}: {}",
+                            self.address, error
+                        );
+                    }
                     info!("Outgoing connection established with {}", self.address);
 
                     // Reset the delay.

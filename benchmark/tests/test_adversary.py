@@ -280,6 +280,8 @@ class LaunchIntegrationTests(unittest.TestCase):
         bench._update = lambda hosts, collocate: None
         bench._check_binaries = lambda hosts: None
         bench._config = lambda *args: committee
+        bench._begin_clock_collection = lambda: None
+        bench._release_config_storage = lambda hosts: None
         bench.kill = lambda **kwargs: None
         bench._wait_for_clients = lambda clients, duration: None
         commands = []

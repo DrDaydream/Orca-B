@@ -6,12 +6,15 @@ import re
 import shlex
 import subprocess
 import time
+from benchmark import timing
 
 
 class LocalProcesses:
     def __init__(self):
         self.processes = []
         self.client_logs = []
+        self.logs = []
+        self.clock = None
 
     def start(self, command, log_file):
         args, env = shlex.split(command), os.environ.copy()
@@ -22,15 +25,24 @@ class LocalProcesses:
             env[key] = value
         with open(log_file, 'wb') as log:
             self.processes.append(subprocess.Popen(args, env=env, stderr=log))
+        self.logs.append(Path(log_file))
         if Path(log_file).name.startswith('client-'):
             self.client_logs.append(Path(log_file))
 
     def _check_alive(self):
-        for process in self.processes:
+        for process, logfile in zip(self.processes, self.logs):
             if process.poll() is not None:
-                raise RuntimeError(f'Benchmark process {process.pid} exited with {process.returncode}')
+                detail = logfile.read_text(encoding='utf-8', errors='replace')[-1000:]
+                raise RuntimeError(f'Benchmark process {process.pid} ({logfile}) exited '
+                                   f'with {process.returncode}: {detail}')
 
     def wait(self, duration):
+        if self.clock is not None:
+            def read_logs(timeout):
+                self._check_alive()
+                return {path: path.read_text(encoding='utf-8', errors='replace') for path in self.logs}
+            return timing.coordinate(self.client_logs, read_logs=read_logs,
+                                     duration=duration, **self.clock)
         # Start from the same event as comparison_metrics, not from process launch.
         if not self.client_logs:
             raise RuntimeError('No benchmark clients were launched')
@@ -68,3 +80,5 @@ class LocalProcesses:
                 process.wait()
         self.processes.clear()
         self.client_logs.clear()
+        self.logs.clear()
+        self.clock = None

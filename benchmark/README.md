@@ -6,6 +6,14 @@ For the fixed MystenLabs/narwhal comparison, use [COMPARISON.md](COMPARISON.md).
 Both runners accept `fab local --nodes 20 --header-size 20 --duration 20`
 and report final ordered commits in the same fixed measurement window.
 
+This branch now defaults to an acknowledged common UTC plan for both local and
+remote runs. Use `--warmup` and `--drain` around the fixed measurement duration.
+The final-ordered comparison and `logs/comparison.json` measure original client
+release to final ordered commit across all active replicas, with unfinished
+samples visible in the companion release cohort. See
+[A1_ACCEPTANCE.md](A1_ACCEPTANCE.md) for this measurement contract and the
+separate EC2 acceptance matrix; older comparison notes describe legacy timing.
+
 When running benchmarks, the codebase is automatically compiled with the feature flag `benchmark`. This enables the node to print some special log entries that are then read by the python scripts and used to compute performance. These special log entries are clearly indicated with comments in the code: make sure to not alter them (otherwise the benchmark scripts will fail to interpret the logs).
 
 ### Parametrize the benchmark
@@ -122,7 +130,7 @@ actually exists on the controller. An SSH key pair name is independent of an
 AWS credential profile name.
 
 The checked-in `settings.example.json` configures `orca-amazon`, its private key
-path, the Orca-B development branch, and `m5.8xlarge` in five regions. Copy it
+path, the `adversary-experiments` branch, and `m5.8xlarge` in five regions. Copy it
 once to create the local configuration:
 
 ```bash

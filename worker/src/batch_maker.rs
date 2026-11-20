@@ -134,7 +134,7 @@ impl BatchMaker {
             .current_batch
             .iter()
             .filter(|tx| tx.len() > 8 && tx[0] == 0u8)
-            .filter_map(|tx| tx[1..9].try_into().ok())
+            .map(|tx| u64::from_be_bytes(tx[1..9].try_into().unwrap()))
             .collect();
 
         // Serialize the batch.
@@ -152,13 +152,15 @@ impl BatchMaker {
                     .unwrap(),
             );
 
+            // Clocked measurements use one record, including batches without samples.
+            info!(
+                "Benchmark batch {:?} bytes {} samples {:?}",
+                digest, size, tx_ids
+            );
+
             for id in tx_ids {
-                // NOTE: This log entry is used to compute performance.
-                info!(
-                    "Batch {:?} contains sample tx {}",
-                    digest,
-                    u64::from_be_bytes(id)
-                );
+                // NOTE: This log entry is used to compute legacy performance.
+                info!("Batch {:?} contains sample tx {}", digest, id);
             }
 
             // NOTE: This log entry is used to compute performance.

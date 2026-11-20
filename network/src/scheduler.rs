@@ -133,7 +133,7 @@ impl Scheduler {
                     // Hold every scheduled frame (including SimpleSender repair)
                     // in the shared budget through the actual transport ACK.
                     // The independent handle also survives caller-side round GC.
-                    let received = reliable.scheduled_send(address, data);
+                    let received = reliable.send_released(address, data);
                     let budget = budget.clone();
                     acknowledgements.push(
                         async move {

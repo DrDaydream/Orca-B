@@ -2,10 +2,11 @@
 use crate::error::{DagError, DagResult};
 use crate::messages::{Certificate, Header, Proposal};
 use crate::primary::{PrimaryMessage, Round};
-use crate::proposal_store::{assemble_proposal, store_verified_proposal};
+use crate::proposal_store::{assemble_proposal, load_proposal, store_verified_proposal};
 use bytes::Bytes;
 use config::Committee;
 use crypto::{Digest, Hash as _, PublicKey};
+use futures::FutureExt;
 use log::{debug, warn};
 use network::{CancelHandler, ReliableSender};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -74,15 +75,12 @@ impl StoredProposalHeader {
     }
 }
 
-pub(crate) async fn prepare_proposal(
+async fn verify_and_serialize_proposal(
     proposal: Proposal,
     committee: Committee,
-    store: &mut Store,
-    outbound: Option<(&mut ReliableSender, Vec<SocketAddr>)>,
-    in_flight: Option<ProposalGuard>,
-) -> DagResult<(StoredProposalHeader, Vec<CancelHandler>)> {
-    let serialize = outbound.is_some();
-    let (proposal, bytes) = tokio::task::spawn_blocking(move || {
+    serialize: bool,
+) -> DagResult<(Proposal, Option<Bytes>)> {
+    tokio::task::spawn_blocking(move || {
         proposal.verify(&committee)?;
         let message = PrimaryMessage::Proposal(proposal);
         let bytes = if serialize {
@@ -96,7 +94,18 @@ pub(crate) async fn prepare_proposal(
         }
     })
     .await
-    .expect("Proposal validation task failed")?;
+    .expect("Proposal validation task failed")
+}
+
+pub(crate) async fn prepare_proposal(
+    proposal: Proposal,
+    committee: Committee,
+    store: &mut Store,
+    outbound: Option<(&mut ReliableSender, Vec<SocketAddr>)>,
+    in_flight: Option<ProposalGuard>,
+) -> DagResult<(StoredProposalHeader, Vec<CancelHandler>)> {
+    let (proposal, bytes) =
+        verify_and_serialize_proposal(proposal, committee, outbound.is_some()).await?;
     // Validation precedes both operations. Network transmission need not wait
     // for our disk, while Core still receives the header only after storage.
     // join! reuses this task and preserves backpressure on the local producer.
@@ -112,6 +121,98 @@ pub(crate) async fn prepare_proposal(
     };
     let (handlers, header) = tokio::join!(broadcast, store_verified_proposal(store, proposal));
     Ok((StoredProposalHeader(header?, in_flight), handlers))
+}
+
+/// The reliable sender takes ownership on its first successful enqueue. Poll
+/// each peer independently so a full connection cannot stall the remaining peers.
+pub(crate) fn try_broadcast(
+    network: &mut ReliableSender,
+    addresses: Vec<SocketAddr>,
+    bytes: Bytes,
+) -> (Vec<CancelHandler>, Vec<SocketAddr>) {
+    let mut handlers = Vec::new();
+    let mut deferred = Vec::new();
+    for address in addresses {
+        // Only poll the bounded enqueue. Existing connection tasks own the
+        // socket writes and retries. Bypass the task's cooperative budget so
+        // only actual enqueue backpressure causes a deferred send.
+        match tokio::task::unconstrained(network.send(address, bytes.clone())).now_or_never() {
+            Some(handler) => handlers.push(handler),
+            None => deferred.push(address),
+        }
+    }
+    (handlers, deferred)
+}
+
+pub(crate) async fn prepare_local_proposal(
+    proposal: Proposal,
+    committee: Committee,
+    store: &mut Store,
+    outbound: (&mut ReliableSender, Vec<SocketAddr>),
+    in_flight: ProposalGuard,
+    tx: &Sender<StoredProposalHeader>,
+) -> DagResult<(Vec<CancelHandler>, Vec<SocketAddr>)> {
+    let (proposal, bytes) = verify_and_serialize_proposal(proposal, committee, true).await?;
+    let (network, addresses) = outbound;
+    let dispatch = try_broadcast(
+        network,
+        addresses,
+        bytes.expect("Missing outbound proposal"),
+    );
+    let header = store_verified_proposal(store, proposal).await?;
+    tx.send(StoredProposalHeader(header, Some(in_flight)))
+        .await
+        .expect("Failed to deliver local proposal");
+    Ok(dispatch)
+}
+
+/// One recovery worker per peer. Its queue holds only on-disk digests and its
+/// single active value is cancelled when the round expires or the primary stops.
+pub(crate) fn spawn_proposal_retry(
+    mut network: ReliableSender,
+    address: SocketAddr,
+    mut store: Store,
+    consensus_round: Arc<AtomicU64>,
+    gc_depth: Round,
+) -> Sender<(Round, Digest)> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(Round, Digest)>(gc_depth.max(1) as usize);
+    tokio::spawn(async move {
+        let mut cleanup = tokio::time::interval(std::time::Duration::from_secs(1));
+        while let Some((round, digest)) = rx.recv().await {
+            let is_old = || {
+                round
+                    < consensus_round
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(gc_depth)
+            };
+            if is_old() {
+                continue;
+            }
+            let send = async {
+                if let Some(proposal) = load_proposal(&mut store, &digest).await? {
+                    let bytes = tokio::task::spawn_blocking(move || {
+                        bincode::serialize(&PrimaryMessage::Proposal(proposal))
+                    })
+                    .await
+                    .expect("Proposal serialization task failed")?;
+                    // Only an already-released frame can be deferred by try_broadcast.
+                    let _ = network.send_released(address, Bytes::from(bytes)).await;
+                }
+                Ok(())
+            };
+            tokio::pin!(send);
+            loop {
+                tokio::select! {
+                    result = &mut send => { report(result); break; }
+                    _ = cleanup.tick() => {
+                        if rx.is_closed() { return; }
+                        if is_old() { break; }
+                    }
+                }
+            }
+        }
+    });
+    tx
 }
 
 fn report(result: DagResult<()>) {
@@ -193,6 +294,22 @@ pub(crate) fn spawn_proposal_processors(
             .iter()
             .map(|(_, a)| a.primary_to_primary)
             .collect();
+        let retry: HashMap<_, _> = addresses
+            .iter()
+            .copied()
+            .map(|address| {
+                (
+                    address,
+                    spawn_proposal_retry(
+                        ReliableSender::new(),
+                        address,
+                        store.clone(),
+                        consensus_round.clone(),
+                        gc_depth,
+                    ),
+                )
+            })
+            .collect();
         let mut pending = BTreeMap::<Round, Vec<CancelHandler>>::new();
         let mut cleanup = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
@@ -203,13 +320,21 @@ pub(crate) fn spawn_proposal_processors(
                     report(async {
                         let round = header.round;
                         let guard = in_flight.track(&header);
+                        let digest = guard.digest.clone();
                         let proposal = assemble_proposal(&mut store, header).await?;
-                        let (header, handlers) = prepare_proposal(
+                        let (handlers, deferred) = prepare_local_proposal(
                             proposal, committee.clone(), &mut store,
-                            Some((&mut network, addresses.clone())), Some(guard),
+                            (&mut network, addresses.clone()), guard, &tx,
                         ).await?;
                         pending.entry(round).or_default().extend(handlers);
-                        tx.send(header).await.expect("Failed to deliver local proposal");
+                        for address in deferred {
+                            // A saturated replay queue leaves recovery to the
+                            // normal signed-vote/missing-proposal repair path.
+                            match retry[&address].try_send((round, digest.clone())) {
+                                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => panic!("Proposal retry worker stopped"),
+                            }
+                        }
                         Ok(())
                     }.await);
                 }

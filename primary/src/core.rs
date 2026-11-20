@@ -7,7 +7,7 @@ use crate::messages::{
     local_votes_key, Certificate, ConsensusCommand, ConsensusMessage, GrbcPhase, GrbcVote, Header,
 };
 use crate::primary::{PrimaryMessage, Round};
-use crate::proposal_processor::{ProposalTracker, StoredProposalHeader};
+use crate::proposal_processor::{try_broadcast, ProposalTracker, StoredProposalHeader};
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
 use crate::verified_vote::VerifiedGrbcVote;
@@ -33,6 +33,12 @@ const CORE_WORK_BUDGET: usize = 32;
 // Unverified arrivals may defer repair only for a bounded time after the first
 // authenticated vote. Repeated arrivals/votes cannot extend this deadline.
 const PROPOSAL_REPAIR_GRACE: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct SavedVotes {
+    votes: Vec<GrbcVote>,
+    sent: usize,
+}
 
 pub struct Core {
     /// The public key of this primary.
@@ -71,7 +77,7 @@ pub struct Core {
     tx_proposer: Sender<ProposerMessage>,
     rx_consensus: Receiver<ConsensusCommand>,
     /// Forward actual commits to GC only after publishing local completion.
-    tx_cleanup: Sender<Vec<Certificate>>,
+    tx_cleanup: tokio::sync::watch::Sender<Round>,
 
     /// The last garbage collected round.
     gc_round: Round,
@@ -82,7 +88,8 @@ pub struct Core {
     proposal_headers: HashMap<Digest, Header>,
     validated: HashSet<Digest>,
     last_ready: HashMap<Round, HashSet<PublicKey>>,
-    local_votes: HashMap<Digest, Vec<GrbcVote>>,
+    local_votes: HashMap<Digest, SavedVotes>,
+    deferred_vote_blocks: usize,
     missing_proposals: HashMap<Digest, (Round, Instant)>,
     pending_votes: HashMap<Digest, Vec<VerifiedGrbcVote>>,
     /// Aggregates certificates to use as parents for new headers.
@@ -91,6 +98,11 @@ pub struct Core {
     grade_one_certificates: HashMap<Digest, Certificate>,
     /// Header IDs whose broadcast no longer needs local processing.
     completed: HashSet<Digest>,
+    /// Own proposals already delivered locally but still owing normal GRBC
+    /// participation to other nodes. Local delivery is not network FINISH.
+    own_pending_grbc: HashSet<Digest>,
+    /// One locally delivered self proposal per round, including after FINISH.
+    own_local_deliveries: HashMap<Round, Digest>,
     /// Completed blocks not yet referenced by a weak edge.
     weak_edge_candidates: HashMap<Digest, Round>,
     /// Sender only for small synchronization requests.
@@ -118,7 +130,7 @@ impl Core {
         tx_consensus: Sender<ConsensusMessage>,
         tx_proposer: Sender<ProposerMessage>,
         rx_consensus: Receiver<ConsensusCommand>,
-        tx_cleanup: Sender<Vec<Certificate>>,
+        tx_cleanup: tokio::sync::watch::Sender<Round>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -150,11 +162,14 @@ impl Core {
                 validated: HashSet::new(),
                 last_ready: HashMap::new(),
                 local_votes: HashMap::new(),
+                deferred_vote_blocks: 0,
                 missing_proposals: HashMap::new(),
                 pending_votes: HashMap::new(),
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 grade_one_certificates: HashMap::new(),
                 completed: HashSet::new(),
+                own_pending_grbc: HashSet::new(),
+                own_local_deliveries: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
@@ -179,7 +194,7 @@ impl Core {
 
     async fn process_stored_proposal(&mut self, stored: StoredProposalHeader) -> DagResult<()> {
         let header = stored.into_header();
-        if self.completed.contains(&header.id) {
+        if self.grbc_finished(&header.id) {
             return Ok(());
         }
         ensure!(
@@ -214,6 +229,31 @@ impl Core {
                 if let Err(error) = self.record_vote(&vote) {
                     warn!("Ignoring invalid buffered GRBC vote: {}", error);
                 }
+            }
+        }
+        if header.author == self.name
+            && !self.completed.contains(&header.id)
+            && self
+                .own_local_deliveries
+                .get(&header.round)
+                .map_or(true, |id| id == &header.id)
+        {
+            // Our proposer already authenticated and stored the complete value.
+            // Deliver it locally now, while continuing ECHO/READY for peers.
+            let block = Certificate {
+                header: header.clone(),
+                votes: Vec::new(),
+            };
+            self.own_local_deliveries
+                .insert(header.round, header.id.clone());
+            self.own_pending_grbc.insert(header.id.clone());
+            self.deliver_grade_one(&header).await?;
+            if self.record_completed(&block).await? {
+                self.tx_consensus
+                    .send(ConsensusMessage::GradeTwo(block.clone()))
+                    .await
+                    .expect("Failed to deliver our local proposal");
+                self.try_advance_completed(block).await?;
             }
         }
         self.process_header(&header).await
@@ -252,21 +292,49 @@ impl Core {
 
     async fn save_local_vote(&mut self, vote: GrbcVote) -> DagResult<()> {
         let digest = vote.block_digest();
-        let votes = self.local_votes.entry(digest.clone()).or_default();
-        if !votes.iter().any(|v| v.phase == vote.phase) {
-            votes.push(vote.clone());
+        let saved = self.local_votes.entry(digest.clone()).or_default();
+        if saved.votes.iter().any(|v| v.phase == vote.phase) {
+            return Ok(());
         }
+        let already_pending = saved.sent < saved.votes.len();
+        saved.votes.push(vote.clone());
         self.store
-            .write(local_votes_key(&digest), bincode::serialize(votes)?)
+            .write(local_votes_key(&digest), bincode::serialize(&saved.votes)?)
             .await;
-        self.tx_votes
-            .send(VoteDispatch {
+        if !already_pending && self.deferred_vote_blocks != 0 {
+            self.deferred_vote_blocks += 1;
+        } else if !already_pending {
+            match self.tx_votes.try_send(VoteDispatch {
                 requestor: None,
                 votes: vec![vote],
-            })
-            .await
-            .expect("Failed to enqueue GRBC vote");
+            }) {
+                Ok(()) => saved.sent += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    self.deferred_vote_blocks += 1
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("Vote sender stopped")
+                }
+            }
+        }
         Ok(())
+    }
+
+    // A stalled vote stays in the existing repair cache, with at most two
+    // signed phases per round and author. Reserve capacity in the run loop so
+    // peer work cannot hold up a later stored-header callback.
+    fn dispatch_saved_votes(&mut self, permit: tokio::sync::mpsc::Permit<'_, VoteDispatch>) {
+        let saved = self
+            .local_votes
+            .values_mut()
+            .find(|saved| saved.sent < saved.votes.len())
+            .expect("Missing deferred vote");
+        permit.send(VoteDispatch {
+            requestor: None,
+            votes: saved.votes[saved.sent..].to_vec(),
+        });
+        saved.sent = saved.votes.len();
+        self.deferred_vote_blocks -= 1;
     }
 
     async fn process_consensus_command(&mut self, command: ConsensusCommand) -> DagResult<()> {
@@ -286,7 +354,8 @@ impl Core {
                 let request = PrimaryMessage::LeaderRequest(round, leader, self.name);
                 let bytes =
                     bincode::serialize(&request).expect("Failed to serialize leader request");
-                let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
+                // The request is retried by its originating protocol timer.
+                let (handlers, _) = try_broadcast(&mut self.network, addresses, Bytes::from(bytes));
                 self.cancel_handlers
                     .entry(round)
                     .or_default()
@@ -340,19 +409,40 @@ impl Core {
             }
             // Commitment also closes this author's voting slot; it must not
             // permit a later conflicting variant to elicit a fresh local vote.
-            self.last_voted
-                .entry(header.round)
-                .or_default()
-                .insert(header.author);
-            self.last_ready
-                .entry(header.round)
-                .or_default()
-                .insert(header.author);
+            // Our stored proposal may still be queued for Core registration.
+            // Preserve the real ECHO and READY contribution in that case too.
+            if header.author == self.name
+                && !self.completed.contains(&header.id)
+                && self
+                    .own_local_deliveries
+                    .get(&header.round)
+                    .map_or(true, |id| id == &header.id)
+            {
+                self.own_pending_grbc.insert(header.id.clone());
+                self.own_local_deliveries
+                    .entry(header.round)
+                    .or_insert_with(|| header.id.clone());
+            }
+            if header.author != self.name && !self.own_pending_grbc.contains(&header.id) {
+                self.last_voted
+                    .entry(header.round)
+                    .or_default()
+                    .insert(header.author);
+                self.last_ready
+                    .entry(header.round)
+                    .or_default()
+                    .insert(header.author);
+            }
             if self.record_completed(block).await? {
                 self.missing_proposals.remove(&digest);
-                if let Some(votes) = self.pending_votes.remove(&header.id) {
-                    for vote in votes {
-                        self.missing_proposals.remove(&vote.block_digest());
+                // A self proposal can be committed while its stored-header
+                // callback is queued. Its authenticated votes must survive
+                // until registration resumes the ordinary ECHO/READY path.
+                if !self.own_pending_grbc.contains(&header.id) {
+                    if let Some(votes) = self.pending_votes.remove(&header.id) {
+                        for vote in votes {
+                            self.missing_proposals.remove(&vote.block_digest());
+                        }
                     }
                 }
                 completed.push(block);
@@ -364,10 +454,10 @@ impl Core {
         for block in completed {
             self.try_advance_completed(block.clone()).await?;
         }
-        self.tx_cleanup
-            .send(blocks)
-            .await
-            .expect("Failed to send committed cleanup batch");
+        let round = blocks.iter().map(Certificate::round).max().unwrap_or(0);
+        if self.consensus_round.fetch_max(round, Ordering::Relaxed) < round {
+            self.tx_cleanup.send_replace(round);
+        }
         Ok(())
     }
 
@@ -392,10 +482,16 @@ impl Core {
             })
             .collect();
         if !digests.is_empty() {
-            self.tx_cert_requests
-                .send(crate::helper::RepairRequest::Proposals(digests, requestor))
-                .await
-                .expect("Failed to enqueue leader repair");
+            // The requestor retries leader recovery while the header is missing.
+            match self
+                .tx_cert_requests
+                .try_send(crate::helper::RepairRequest::Proposals(digests, requestor))
+            {
+                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("Repair helper stopped")
+                }
+            }
         }
         Ok(())
     }
@@ -424,7 +520,15 @@ impl Core {
 
     async fn process_header(&mut self, header: &Header) -> DagResult<()> {
         debug!("Processing {:?}", header);
-        if self.completed.contains(&header.id) || !self.proposal_headers.contains_key(&header.id) {
+        if self.grbc_finished(&header.id) || !self.proposal_headers.contains_key(&header.id) {
+            return Ok(());
+        }
+        if header.author == self.name
+            && self
+                .own_local_deliveries
+                .get(&header.round)
+                .map_or(false, |id| id != &header.id)
+        {
             return Ok(());
         }
         if self.validated.contains(&header.id) {
@@ -456,7 +560,7 @@ impl Core {
     async fn process_grbc_vote(&mut self, vote: GrbcVote) -> DagResult<()> {
         // Terminal instances cannot gain weight or trigger repair. No untrusted
         // vote fields are applied when dropping this obsolete message.
-        if self.completed.contains(&vote.id) {
+        if self.grbc_finished(&vote.id) {
             return Ok(());
         }
         ensure!(
@@ -499,7 +603,7 @@ impl Core {
     }
 
     async fn evaluate_grbc(&mut self, header: &Header) -> DagResult<()> {
-        if self.completed.contains(&header.id) || !self.validated.contains(&header.id) {
+        if self.grbc_finished(&header.id) || !self.validated.contains(&header.id) {
             return Ok(());
         }
         let state = match self.votes_aggregators.get(&header.id) {
@@ -537,11 +641,15 @@ impl Core {
                 header: header.clone(),
                 votes: Vec::new(),
             };
-            if !self.completed.contains(&header.id) {
+            if !self.grbc_finished(&header.id) {
                 self.process_certificate(block).await?;
             }
         }
         Ok(())
+    }
+
+    fn grbc_finished(&self, id: &Digest) -> bool {
+        self.completed.contains(id) && !self.own_pending_grbc.contains(id)
     }
 
     async fn deliver_grade_one(&mut self, header: &Header) -> DagResult<()> {
@@ -578,6 +686,7 @@ impl Core {
                     .map_or(false, |s| s.ready_weight >= self.quorum_threshold),
             DagError::CertificateRequiresQuorum
         );
+        self.own_pending_grbc.remove(&block.header.id);
         if self.completed.contains(&block.header.id) {
             return Ok(());
         }
@@ -603,7 +712,8 @@ impl Core {
             .collect();
         let message = PrimaryMessage::CertificatesRequest(vec![digest], self.name);
         let bytes = bincode::serialize(&message).expect("Failed to serialize proposal request");
-        let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
+        // The request is retried by its originating protocol timer.
+        let (handlers, _) = try_broadcast(&mut self.network, addresses, Bytes::from(bytes));
         self.cancel_handlers
             .entry(round)
             .or_default()
@@ -745,9 +855,14 @@ impl Core {
 
     // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
+        let tx_votes = self.tx_votes.clone();
         let mut repair = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             let result = tokio::select! {
+                permit = tx_votes.reserve(), if self.deferred_vote_blocks > 0 => {
+                    self.dispatch_saved_votes(permit.expect("Vote sender stopped"));
+                    Ok(())
+                }
                 // We receive here messages from other primaries.
                 Some(message) = self.rx_primaries.recv(), if self.vote_batch.len() == 0 =>
                     self.process_primary_burst(Some(message)).await,
@@ -794,12 +909,20 @@ impl Core {
         let headers = &self.proposal_headers;
         self.validated.retain(|id| headers.contains_key(id));
         self.completed.retain(|id| headers.contains_key(id));
+        self.own_pending_grbc.retain(|id| headers.contains_key(id));
+        self.own_local_deliveries
+            .retain(|round, _| *round >= gc_round);
         self.votes_aggregators
             .retain(|id, _| headers.contains_key(id));
         self.missing_proposals
             .retain(|_, (round, _)| *round >= gc_round);
         self.local_votes
-            .retain(|_, votes| votes.first().map_or(false, |v| v.round >= gc_round));
+            .retain(|_, saved| saved.votes.first().map_or(false, |v| v.round >= gc_round));
+        self.deferred_vote_blocks = self
+            .local_votes
+            .values()
+            .filter(|saved| saved.sent < saved.votes.len())
+            .count();
         self.pending_votes
             .retain(|_, votes| votes.first().map_or(false, |v| v.round >= gc_round));
         self.certificates_aggregators

@@ -7,7 +7,7 @@
     "repo": {
         "name": "Orca-B",
         "url": "https://github.com/DrDaydream/Orca-B.git",
-        "branch": "orca-b-preparsed-vote-keys"
+        "branch": "adversary-experiments"
     },
     "instances": {
         "type": "m5.8xlarge",
