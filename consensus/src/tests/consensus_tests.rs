@@ -136,7 +136,26 @@ fn vdag_stores_grade_one_deliveries() {
 }
 
 #[test]
-fn grade_two_waits_for_strong_and_weak_edges() {
+fn finalized_history_owner_is_removed_without_losing_pending_owner() {
+    let committee = mock_committee();
+    let mut state = State::new(Certificate::genesis(&committee));
+    let missing = Digest([55; 32]);
+    let (_, first) = mock_certificate(keys()[0].0, 2, [missing.clone()].iter().cloned().collect());
+    let (_, second) = mock_certificate(keys()[0].0, 3, [missing.clone()].iter().cloned().collect());
+    state.force_observed_history_to_dag(first.clone(), 2);
+    state.force_observed_history_to_dag(second.clone(), 3);
+    state.pending_leaders.insert(3, second);
+    state.committed_leaders.insert(2);
+    state.update(&[first], 50);
+    state.gc_protocol_state(50);
+    assert_eq!(
+        state.forced_history_waiters[&missing],
+        [3].iter().copied().collect()
+    );
+}
+
+#[test]
+fn grade_two_promotes_before_late_weak_dependency() {
     let committee = mock_committee();
     let genesis = Certificate::genesis(&committee);
     let genesis_parents = genesis.iter().map(|x| x.digest()).collect();
@@ -150,13 +169,13 @@ fn grade_two_waits_for_strong_and_weak_edges() {
 
     state.insert_grade_one(block);
     state.mark_grade_two(block_digest.clone());
-    assert!(state.promote_ready().is_empty());
-    assert!(state.vdag.get(&3).unwrap().contains_key(&authority));
+    assert_eq!(state.promote_ready().len(), 1);
+    assert!(state.dag_digests.contains(&block_digest));
 
     state.insert_grade_one(dependency);
     state.mark_grade_two(dependency_digest);
     let promoted = state.promote_ready();
-    assert_eq!(promoted.len(), 2);
+    assert_eq!(promoted.len(), 1);
     assert!(state.dag_digests.contains(&block_digest));
     assert!(state.vdag.get(&3).is_none());
 }
@@ -541,7 +560,7 @@ fn forced_admission_does_not_follow_virtual_edges() {
 }
 
 #[tokio::test]
-async fn commit_waits_for_missing_history_even_through_an_already_forced_parent() {
+async fn commit_does_not_wait_for_missing_history_through_an_already_forced_parent() {
     let committee = mock_committee();
     let (tx_primary, _rx_primary) = channel(100);
     let (tx_output, mut rx_output) = channel(100);
@@ -568,9 +587,8 @@ async fn commit_waits_for_missing_history_even_through_an_already_forced_parent(
     state.mark_skipped(1);
     state.mark_skipped(2);
     consensus.queue_leader_commit(leader, 1, &mut state).await;
-    assert!(rx_output.try_recv().is_err());
-    assert!(!state.committed_leaders.contains(&3));
-    assert!(state.forced_history_waiters[&late_digest].contains(&3));
+    assert!(state.committed_leaders.contains(&3));
+    assert!(state.forced_history_waiters.is_empty());
 
     let owners = state.observe(late);
     for owner in owners {
@@ -586,7 +604,7 @@ async fn commit_waits_for_missing_history_even_through_an_already_forced_parent(
     while let Ok(block) = rx_output.try_recv() {
         rounds.push(block.round());
     }
-    assert_eq!(rounds, vec![1, 2, 3]);
+    assert_eq!(rounds, vec![2, 3]);
 }
 
 #[test]
@@ -662,7 +680,7 @@ async fn aba_one_accepts_complete_observed_leader_before_local_ready() {
 }
 
 #[tokio::test]
-async fn aba_one_recovers_ungraded_leader_and_waits_only_for_missing_history() {
+async fn aba_one_recovers_ungraded_leader_without_waiting_for_history() {
     let committee = mock_committee();
     let (tx_primary, mut rx_primary) = channel(100);
     let (tx_output, mut rx_output) = channel(100);
@@ -694,18 +712,11 @@ async fn aba_one_recovers_ungraded_leader_and_waits_only_for_missing_history() {
     state.observe(leader.clone());
     assert!(!state.vdag.contains_key(&2));
     consensus.resolve_requested_leaders(&mut state).await;
-    assert!(state.pending_leaders.contains_key(&2));
+    assert!(state.committed_leaders.contains(&2));
     assert!(!state.missing_leader_requests.contains_key(&2));
-    assert!(rx_output.try_recv().is_err());
-    let owners = state.observe(parent);
-    for owner in owners {
-        let ordered = consensus.order_dag(&state.pending_leaders[&owner], &state);
-        state.pending_order.insert(owner, ordered);
-        state.wake_pending(owner);
-    }
-    consensus.drain_ready_leaders(&mut state).await;
-    assert_eq!(rx_output.try_recv().unwrap().digest(), parent_digest);
     assert_eq!(rx_output.try_recv().unwrap().digest(), leader.digest());
+    state.observe(parent);
+    consensus.drain_ready_leaders(&mut state).await;
     assert!(rx_output.try_recv().is_err());
 }
 
@@ -1200,4 +1211,69 @@ async fn missing_leader() {
         .expect("rule 3 did not release a later leader")
         .expect("consensus output closed");
     assert!(certificate.round() > 0);
+}
+
+#[test]
+fn no_wait_grade_two_promotes_with_missing_strong_and_weak_dependencies() {
+    for finish_first in [false, true] {
+        let committee = mock_committee();
+        let mut state = State::new(Certificate::genesis(&committee));
+        let (_, mut block) =
+            mock_certificate(keys()[0].0, 3, [Digest([40; 32])].iter().cloned().collect());
+        block.header.weak_edges.insert(Digest([41; 32]));
+        block.header.virtual_edges.insert(Digest([42; 32]));
+        let digest = block.digest();
+        if finish_first {
+            state.mark_grade_two(digest.clone());
+        }
+        state.insert_grade_one(block);
+        if !finish_first {
+            assert!(
+                state.promote_ready().is_empty(),
+                "Grade one alone cannot promote"
+            );
+            state.mark_grade_two(digest.clone());
+        }
+        assert_eq!(state.promote_ready().len(), 1);
+        assert!(state.dag_digests.contains(&digest));
+        assert!(state.promote_ready().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn no_wait_final_output_omits_unavailable_history() {
+    let committee = mock_committee();
+    let (tx_primary, _rx_primary) = channel(100);
+    let (tx_output, mut rx_output) = channel(100);
+    let mut consensus = Consensus {
+        name: keys()[0].0,
+        committee: committee.clone(),
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: Certificate::genesis(&committee),
+    };
+    let mut state = State::new(Certificate::genesis(&committee));
+    state.mark_skipped(1);
+    let (_, mut leader) = mock_certificate(
+        consensus.ordering_leader_authority(2),
+        2,
+        [Digest([40; 32])].iter().cloned().collect(),
+    );
+    leader.header.weak_edges.insert(Digest([41; 32]));
+    leader.header.virtual_edges.insert(Digest([42; 32]));
+    consensus
+        .queue_leader_commit(leader.clone(), 3, &mut state)
+        .await;
+    assert!(state.committed_leaders.contains(&2));
+    assert_eq!(rx_output.try_recv().unwrap(), leader);
+    assert!(
+        rx_output.try_recv().is_err(),
+        "No fabricated ancestor may be emitted"
+    );
+    assert!(
+        state.forced_history_waiters.is_empty(),
+        "A finalized leader must not retain unavailable-history owners forever"
+    );
 }

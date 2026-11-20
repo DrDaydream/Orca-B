@@ -2,7 +2,6 @@ use super::*;
 use crate::common::{committee, keys, proposal, votes};
 use crate::messages::{batch_key, proposal_header_key, GrbcVoteBatch};
 use crypto::Signature;
-use futures::FutureExt;
 use std::collections::BTreeMap;
 use tokio::sync::mpsc::channel;
 
@@ -26,7 +25,7 @@ impl Harness {
         let path = format!(".db_test_grbc_{}_{}_{}", label, node, std::process::id());
         let store = Store::new(&path).unwrap();
         let (tx_headers, headers) = channel(100);
-        let sync = Synchronizer::new(&c, store.clone(), tx_headers);
+        let sync = Synchronizer::new(tx_headers);
         let (tx_events, events) = channel(100);
         let (tx_parents, parents) = channel(100);
         let (tx_votes, outgoing) = channel(100);
@@ -67,7 +66,6 @@ impl Harness {
                 certificates_aggregators: HashMap::new(),
                 grade_one_certificates: HashMap::new(),
                 completed: HashSet::new(),
-                round_advance_pending: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::new(),
@@ -452,24 +450,11 @@ fn resign(proposal: &mut Proposal) {
 }
 
 #[tokio::test]
-async fn deduplicated_proposal_resumes_echo_through_waiter_when_parents_finish() {
-    use crate::header_waiter::HeaderWaiter;
+async fn deduplicated_proposal_echoes_once_without_waiting_for_parents() {
     use crate::proposal_processor::spawn_proposal_processors;
     use tokio::time::{timeout, Duration};
 
     let mut h = Harness::new("dedup_waiter", 0);
-    let (tx_resume, mut rx_resume) = channel(10);
-    HeaderWaiter::spawn(
-        h.core.name,
-        committee(),
-        h.core.store.clone(),
-        h.core.consensus_round.clone(),
-        50,
-        1000,
-        3,
-        std::mem::replace(&mut h._headers, channel(1).1),
-        tx_resume,
-    );
     let (tx_remote, rx_remote) = channel(2);
     let (tx_local, rx_local) = channel(1);
     let (tx_stored, mut rx_stored) = channel(2);
@@ -511,25 +496,6 @@ async fn deduplicated_proposal_resumes_echo_through_waiter_when_parents_finish()
         .await
         .unwrap()
         .is_none());
-    assert!(!h.core.validated.contains(&child.header.id));
-    assert!(h.outgoing().is_empty());
-    assert!(!h.core.in_flight.contains(&child.block().digest()));
-
-    for parent in &parents {
-        crate::proposal_store::store_verified_proposal(&mut h.core.store, parent.clone())
-            .await
-            .unwrap();
-    }
-    h.core
-        .process_committed(parents.iter().map(Proposal::block).collect())
-        .await
-        .unwrap();
-    let resumed = timeout(Duration::from_secs(5), rx_resume.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(resumed, child.header);
-    h.core.process_header(&resumed).await.unwrap();
     assert!(h.core.validated.contains(&child.header.id));
     let emitted = h.outgoing();
     assert_eq!(emitted.len(), 1);
@@ -538,50 +504,49 @@ async fn deduplicated_proposal_resumes_echo_through_waiter_when_parents_finish()
 }
 
 #[tokio::test]
-async fn invalid_parent_quorum_cannot_trigger_echo() {
+async fn parent_quorum_metadata_is_not_loaded_before_echo() {
     let mut h = Harness::new("invalid_observation", 0);
     let mut p = proposal();
     p.header.parents = p.header.parents.iter().take(2).cloned().collect();
     resign(&mut p);
-    assert!(h.core.process_proposal(p).await.is_err());
-    // Early observation is deliberately separate from the voting gate.
+    h.core.process_proposal(p).await.unwrap();
     assert!(matches!(
         h.events.try_recv().unwrap(),
         ConsensusMessage::Observed(_)
     ));
-    assert!(h.outgoing().is_empty());
+    assert_eq!(h.outgoing()[0].phase, GrbcPhase::Echo);
 }
 
 #[tokio::test]
-async fn genesis_weak_edge_cannot_skip_round_validation() {
+async fn parent_round_metadata_is_not_loaded_before_echo() {
     let mut h = Harness::new("genesis_weak", 0);
     let mut p = proposal();
     let genesis = p.header.parents.iter().next().unwrap().clone();
     p.header.parents.remove(&genesis);
     p.header.weak_edges.insert(genesis);
     resign(&mut p);
-    assert!(h.core.process_proposal(p).await.is_err());
+    h.core.process_proposal(p).await.unwrap();
     assert!(matches!(
         h.events.try_recv().unwrap(),
         ConsensusMessage::Observed(_)
     ));
-    assert!(h.outgoing().is_empty());
+    assert_eq!(h.outgoing()[0].phase, GrbcPhase::Echo);
 }
 
 #[tokio::test]
-async fn delayed_weak_edge_is_checked_before_echo() {
+async fn delayed_weak_edge_does_not_delay_or_repeat_echo() {
     let mut h = Harness::new("delayed_weak", 0);
     let dependency = proposal();
     let mut p = proposal();
     p.header.weak_edges.insert(dependency.block().digest());
     resign(&mut p);
     h.core.process_proposal(p.clone()).await.unwrap();
-    assert!(!h.core.validated.contains(&p.header.id));
+    assert!(h.core.validated.contains(&p.header.id));
     assert!(matches!(
         h.events.try_recv().unwrap(),
         ConsensusMessage::Observed(_)
     ));
-    assert!(h.outgoing().is_empty());
+    assert_eq!(h.outgoing()[0].phase, GrbcPhase::Echo);
     h.core
         .store
         .write(
@@ -589,25 +554,25 @@ async fn delayed_weak_edge_is_checked_before_echo() {
             bincode::serialize(&dependency.block()).unwrap(),
         )
         .await;
-    assert!(h.core.process_header(&p.header).await.is_err());
+    h.core.process_header(&p.header).await.unwrap();
     assert!(h.events.try_recv().is_err());
     assert!(h.outgoing().is_empty());
 }
 
 #[tokio::test]
-async fn delayed_virtual_edge_is_checked_before_echo() {
+async fn delayed_virtual_edge_does_not_delay_or_repeat_echo() {
     let mut h = Harness::new("delayed_virtual", 0);
     let dependency = proposal();
     let mut p = proposal();
     p.header.virtual_edges.insert(dependency.block().digest());
     resign(&mut p);
     h.core.process_proposal(p.clone()).await.unwrap();
-    assert!(!h.core.validated.contains(&p.header.id));
+    assert!(h.core.validated.contains(&p.header.id));
     assert!(matches!(
         h.events.try_recv().unwrap(),
         ConsensusMessage::Observed(_)
     ));
-    assert!(h.outgoing().is_empty());
+    assert_eq!(h.outgoing()[0].phase, GrbcPhase::Echo);
     h.core
         .store
         .write(
@@ -615,7 +580,7 @@ async fn delayed_virtual_edge_is_checked_before_echo() {
             bincode::serialize(&dependency.header).unwrap(),
         )
         .await;
-    assert!(h.core.process_header(&p.header).await.is_err());
+    h.core.process_header(&p.header).await.unwrap();
     assert!(h.events.try_recv().is_err());
     assert!(h.outgoing().is_empty());
 }
@@ -748,7 +713,7 @@ async fn commit_requires_the_exact_complete_local_proposal() {
 }
 
 #[tokio::test]
-async fn committed_parent_batch_unlocks_dependencies_and_counts_with_grbc_once() {
+async fn committed_parent_batch_counts_with_grbc_once_without_gating_child_echo() {
     let mut h = Harness::new("commit_parent_batch", 0);
     let parents: Vec<_> = crate::common::headers()
         .into_iter()
@@ -785,8 +750,8 @@ async fn committed_parent_batch_unlocks_dependencies_and_counts_with_grbc_once()
     child.header.parents = parents.iter().map(|p| p.block().digest()).collect();
     resign(&mut child);
     h.core.process_proposal(child.clone()).await.unwrap();
-    assert!(!h.core.validated.contains(&child.header.id));
-    assert!(h.outgoing().is_empty());
+    assert!(h.core.validated.contains(&child.header.id));
+    assert_eq!(h.outgoing()[0].phase, GrbcPhase::Echo);
     let committed: Vec<_> = parents.iter().map(Proposal::block).collect();
     h.core
         .process_consensus_command(ConsensusCommand::CleanupBatch(committed.clone()))
@@ -809,10 +774,10 @@ async fn committed_parent_batch_unlocks_dependencies_and_counts_with_grbc_once()
     }
     h.core.process_header(&child.header).await.unwrap();
     assert!(h.core.validated.contains(&child.header.id));
-    let outgoing = h.outgoing();
-    assert_eq!(outgoing.len(), 1);
-    assert_eq!(outgoing[0].id, child.header.id);
-    assert_eq!(outgoing[0].phase, GrbcPhase::Echo);
+    assert!(
+        h.outgoing().is_empty(),
+        "Parent arrival must not repeat ECHO"
+    );
     h.core
         .process_consensus_command(ConsensusCommand::CleanupBatch(committed))
         .await
@@ -852,93 +817,7 @@ async fn completed_parent_fixture(label: &str) -> (Harness, Proposal) {
 }
 
 #[tokio::test]
-async fn completed_parent_lookup_does_not_wait_for_storage() {
-    let (mut h, child) = completed_parent_fixture("cached_parent_lookup").await;
-    // A store actor cannot reply during this first poll on a current-thread
-    // runtime. Completion here proves known parents incur no storage wait.
-    let parents = h
-        .core
-        .synchronizer
-        .get_parents(
-            &child.header,
-            &h.core.grade_one_certificates,
-            &h.core.completed,
-        )
-        .now_or_never()
-        .expect("Completed parent metadata must be immediately available")
-        .unwrap();
-    assert_eq!(parents.len(), 3);
-    let mut mixed = child.header.clone();
-    let weak = mixed.parents.pop_first().unwrap();
-    mixed.weak_edges.insert(weak);
-    assert_eq!(
-        h.core
-            .synchronizer
-            .get_parents(&mixed, &h.core.grade_one_certificates, &h.core.completed,)
-            .now_or_never()
-            .expect("Completed weak metadata must also avoid storage waits")
-            .unwrap()
-            .len(),
-        3
-    );
-    h.core.process_proposal(child.clone()).await.unwrap();
-    let outgoing = h.outgoing();
-    assert_eq!(outgoing.len(), 1);
-    assert_eq!(outgoing[0].phase, GrbcPhase::Echo);
-    assert_eq!(outgoing[0].id, child.header.id);
-
-    // GC may remove both in-memory indices while the immutable record remains.
-    h.core
-        .consensus_round
-        .store(h.core.gc_depth + 2, Ordering::Relaxed);
-    h.core.cleanup();
-    assert!(h.core.grade_one_certificates.is_empty());
-    assert!(h.core.completed.is_empty());
-    assert_eq!(
-        h.core
-            .synchronizer
-            .get_parents(
-                &child.header,
-                &h.core.grade_one_certificates,
-                &h.core.completed,
-            )
-            .await
-            .unwrap()
-            .len(),
-        3
-    );
-    assert!(h
-        .core
-        .synchronizer
-        .ready_for_round_advance(
-            &child.block(),
-            &h.core.grade_one_certificates,
-            &h.core.completed,
-        )
-        .await
-        .unwrap());
-}
-
-#[tokio::test]
-async fn completed_parent_round_advance_does_not_wait_for_storage() {
-    let (mut h, child) = completed_parent_fixture("cached_parent_advance").await;
-    assert_eq!(
-        h.core
-            .synchronizer
-            .ready_for_round_advance(
-                &child.block(),
-                &h.core.grade_one_certificates,
-                &h.core.completed
-            )
-            .now_or_never()
-            .expect("Completed dependencies must not wait on the store")
-            .unwrap(),
-        true
-    );
-}
-
-#[tokio::test]
-async fn ready_only_parent_still_blocks_echo_and_round_advance() {
+async fn ready_only_parent_does_not_block_child_echo() {
     let (mut h, mut child) = completed_parent_fixture("cached_ready_only").await;
     let parent = Proposal {
         header: crate::common::headers().pop().unwrap(),
@@ -957,228 +836,10 @@ async fn ready_only_parent_still_blocks_echo_and_round_advance() {
     child.header.parents.insert(parent.block().digest());
     resign(&mut child);
     h.core.process_proposal(child.clone()).await.unwrap();
-    assert!(!h.core.validated.contains(&child.header.id));
-    assert!(h.outgoing().is_empty());
-    assert!(!h
-        .core
-        .synchronizer
-        .ready_for_round_advance(
-            &child.block(),
-            &h.core.grade_one_certificates,
-            &h.core.completed
-        )
-        .await
-        .unwrap());
-
-    child.header.parents.remove(&parent.block().digest());
-    child.header.weak_edges.insert(parent.block().digest());
-    assert!(h
-        .core
-        .synchronizer
-        .get_parents(
-            &child.header,
-            &h.core.grade_one_certificates,
-            &h.core.completed,
-        )
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(!h
-        .core
-        .synchronizer
-        .ready_for_round_advance(
-            &child.block(),
-            &h.core.grade_one_certificates,
-            &h.core.completed,
-        )
-        .await
-        .unwrap());
-
-    // A virtual edge needs authenticated metadata, not local FINISH.
-    child.header.weak_edges.clear();
-    child.header.virtual_edges.insert(parent.block().digest());
-    assert_eq!(
-        h.core
-            .synchronizer
-            .get_parents(
-                &child.header,
-                &h.core.grade_one_certificates,
-                &h.core.completed,
-            )
-            .now_or_never()
-            .expect("READY virtual metadata is already available")
-            .unwrap()
-            .len(),
-        4
-    );
-}
-
-#[tokio::test]
-async fn validated_finish_does_not_wait_for_parent_storage_again() {
-    let (mut h, child) = completed_parent_fixture("validated_finish").await;
-    let mut children = Vec::new();
-    for (author, _) in keys().into_iter().take(3) {
-        let mut child = child.clone();
-        child.header.author = author;
-        resign(&mut child);
-        h.core.process_proposal(child.clone()).await.unwrap();
-        assert!(h.core.validated.contains(&child.header.id));
-        children.push(child);
-    }
-    h.grades();
-    h.outgoing();
-    h._parents.try_recv().unwrap(); // The round-1 parent quorum.
-
-    // GC evicts round-1 metadata after validation, but immutable parent
-    // records remain on disk. Model its reader being busy during FINISH.
-    h.core
-        .consensus_round
-        .store(h.core.gc_depth + 2, Ordering::Relaxed);
-    h.core.cleanup();
-    assert!(h.core.grade_one_certificates.is_empty());
-    assert!(h.core.completed.is_empty());
-    let (tx_store, mut storage) = channel(10);
-    h.core.synchronizer =
-        Synchronizer::new(&committee(), Store::from_channel(tx_store), channel(10).0);
-    let finish = async {
-        for child in &children {
-            for vote in votes(&child.header, GrbcPhase::Ready)
-                .into_iter()
-                .skip(1)
-                .take(2)
-            {
-                h.core.process_grbc_vote(vote).await.unwrap();
-            }
-            assert!(h.core.completed.contains(&child.header.id));
-        }
-    };
-    tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(2), finish) => result.unwrap(),
-        request = storage.recv() => {
-            assert!(matches!(request, Some(store::StoreCommand::Read(_, _))));
-            panic!("Already validated FINISH waited for a redundant parent read");
-        }
-    }
-    assert_eq!(h.grades(), vec![1, 2, 1, 2, 1, 2]);
-    let (parents, _, _, round) = h._parents.try_recv().unwrap();
-    assert_eq!(round, 2);
-    assert_eq!(parents.len(), 3);
-    assert!(h.core.round_advance_pending.is_empty());
-}
-
-#[tokio::test]
-async fn unvalidated_commits_wait_for_strong_and_weak_dependencies() {
-    let (mut h, template) = completed_parent_fixture("unvalidated_commit_dependencies").await;
-    let parents: Vec<_> = keys()
-        .into_iter()
-        .take(3)
-        .map(|(author, _)| {
-            let mut parent = template.clone();
-            parent.header.author = author;
-            resign(&mut parent);
-            parent
-        })
-        .collect();
-    let weak = proposal();
-    let mut child = proposal();
-    child.header.round = 3;
-    child.header.parents = parents
-        .iter()
-        .map(|parent| parent.block().digest())
-        .collect();
-    child.header.weak_edges = [weak.block().digest()].iter().cloned().collect();
-    resign(&mut child);
-    h.core.process_proposal(child.clone()).await.unwrap();
-    assert!(!h.core.validated.contains(&child.header.id));
-
-    h.core.process_committed(vec![child.block()]).await.unwrap();
-    assert!(h.core.completed.contains(&child.header.id));
-    assert!(h
-        .core
-        .round_advance_pending
-        .contains_key(&child.block().digest()));
-    assert!(!h.core.certificates_aggregators.contains_key(&3));
-
-    for dependency in parents.iter().chain(std::iter::once(&weak)) {
-        h.core
-            .store
-            .write(
-                dependency.block().digest().to_vec(),
-                bincode::serialize(&dependency.block()).unwrap(),
-            )
-            .await;
-        h.core.retry_round_advance_pending().await.unwrap();
-        if dependency.header.round == 2 {
-            assert!(h
-                .core
-                .round_advance_pending
-                .contains_key(&child.block().digest()));
-            assert!(!h.core.certificates_aggregators.contains_key(&3));
-        }
-    }
-    assert!(h.core.round_advance_pending.is_empty());
-    assert!(h.core.certificates_aggregators.contains_key(&3));
-    assert!(h.grades().is_empty());
-    assert!(h.outgoing().is_empty());
-}
-
-#[tokio::test]
-#[ignore = "manual dependency-processing microbenchmark, not end-to-end TPS"]
-async fn benchmark_completed_dependency_processing() {
-    for references in [10, 11, 20] {
-        let mut h = Harness::new(&format!("dependency_bench_{}", references), 0);
-        let mut child = proposal();
-        child.header.round = 2;
-        child.header.parents.clear();
-        for index in 0..references {
-            let mut parent = proposal().block();
-            // Unique immutable records with committee-sized reference sets.
-            parent.header.payload.insert(Digest([index as u8; 32]), 0);
-            parent.header.parents = (0..references).map(|i| Digest([i as u8; 32])).collect();
-            parent.header.id = parent.header.digest();
-            let digest = parent.digest();
-            h.core
-                .store
-                .write(digest.to_vec(), bincode::serialize(&parent).unwrap())
-                .await;
-            h.core.completed.insert(parent.header.id.clone());
-            h.core.grade_one_certificates.insert(digest.clone(), parent);
-            child.header.parents.insert(digest);
-        }
-        // Flush setup writes before starting the measurements.
-        h.core.store.read(vec![]).await.unwrap();
-        let block = child.block();
-        let iterations = 100 * references;
-        let start = Instant::now();
-        for _ in 0..iterations {
-            assert_eq!(
-                h.core
-                    .synchronizer
-                    .get_parents(
-                        &child.header,
-                        &h.core.grade_one_certificates,
-                        &h.core.completed
-                    )
-                    .await
-                    .unwrap()
-                    .len(),
-                references
-            );
-            assert!(h
-                .core
-                .synchronizer
-                .ready_for_round_advance(&block, &h.core.grade_one_certificates, &h.core.completed)
-                .await
-                .unwrap());
-        }
-        println!(
-            "DEPENDENCY_BENCH references={} pairs={} total_us={} us_per_pair={:.2}",
-            references,
-            iterations,
-            start.elapsed().as_micros(),
-            start.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64
-        );
-    }
+    assert!(h.core.validated.contains(&child.header.id));
+    let outgoing = h.outgoing();
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].phase, GrbcPhase::Echo);
 }
 
 #[tokio::test]
@@ -1209,7 +870,6 @@ async fn late_commit_after_gc_releases_dependencies_without_reviving_old_state()
     assert!(h.core.last_voted.is_empty());
     assert!(h.core.last_ready.is_empty());
     assert!(h.core.weak_edge_candidates.is_empty());
-    assert!(h.core.round_advance_pending.is_empty());
     assert!(h._parents.try_recv().is_err());
     assert!(h._headers.try_recv().is_ok());
     // Repeated data and votes below that boundary cannot restart broadcasting.
@@ -1555,84 +1215,99 @@ async fn proposal_completed_during_a_vote_burst_is_serviced_by_the_next_burst() 
 }
 
 #[tokio::test]
-async fn virtual_metadata_recovers_without_requiring_a_local_ready_grade() {
-    for phase in [GrbcPhase::Echo, GrbcPhase::Ready] {
-        let mut h = Harness::new(&format!("virtual_recovery_{:?}", phase), 0);
-        let parents = crate::common::headers();
-        for header in &parents[..3] {
-            let block = Certificate {
-                header: header.clone(),
-                votes: vec![],
-            };
-            h.core
-                .store
-                .write(block.digest().to_vec(), bincode::serialize(&block).unwrap())
-                .await;
-        }
-        let dependency = Proposal {
-            header: parents[3].clone(),
-            batches: BTreeMap::new(),
-        };
+async fn no_wait_grbc_aggregates_distinct_voters_with_missing_dependencies() {
+    for edge in ["strong", "weak", "virtual"] {
+        let mut h = Harness::new(&format!("no_wait_{}", edge), 0);
         let mut p = proposal();
-        p.header.round = 2;
-        p.header.parents = parents[..3]
-            .iter()
-            .map(|header| {
-                Certificate {
-                    header: header.clone(),
-                    votes: vec![],
-                }
-                .digest()
-            })
-            .collect();
-        p.header.virtual_edges.insert(dependency.block().digest());
+        match edge {
+            "strong" => p.header.parents = (40..43).map(|n| Digest([n; 32])).collect(),
+            "weak" => {
+                p.header.weak_edges.insert(Digest([43; 32]));
+            }
+            _ => {
+                p.header.virtual_edges.insert(Digest([44; 32]));
+            }
+        }
         resign(&mut p);
         h.core.process_proposal(p.clone()).await.unwrap();
-        assert!(matches!(
-            h.events.try_recv().unwrap(),
-            ConsensusMessage::Observed(_)
-        ));
-        assert!(h.outgoing().is_empty());
-        for vote in votes(&p.header, phase).into_iter().skip(1) {
-            h.core.process_grbc_vote(vote).await.unwrap();
-        }
-        assert!(
-            h.core.pending_votes.is_empty(),
-            "known proposal must count votes while dependencies are pending"
-        );
-        assert!(h.events.try_recv().is_err());
-        h.core
-            .store
-            .write(
-                proposal_header_key(&dependency.block().digest()),
-                bincode::serialize(&dependency.header).unwrap(),
-            )
-            .await;
-        assert!(h
-            .core
-            .store
-            .read(crate::messages::grade_one_key(&dependency.block().digest()))
-            .await
-            .unwrap()
-            .is_none());
-        h.core.process_header(&p.header).await.unwrap();
-        if phase == GrbcPhase::Echo {
-            assert_eq!(h.grades(), vec![1]);
-            for vote in votes(&p.header, GrbcPhase::Ready)
-                .into_iter()
-                .skip(1)
-                .take(2)
-            {
-                h.core.process_grbc_vote(vote).await.unwrap();
-            }
-            assert_eq!(h.grades(), vec![2]);
-        } else {
-            assert_eq!(h.grades(), vec![1, 2]);
-        }
-        assert!(h.core.validated.contains(&p.header.id));
         let outgoing = h.outgoing();
-        assert_eq!(outgoing.len(), 2);
+        assert_eq!(
+            outgoing.len(),
+            1,
+            "ECHO must not wait for {} dependencies",
+            edge
+        );
         assert_eq!(outgoing[0].phase, GrbcPhase::Echo);
-        assert_eq!(outgoing[1].phase, GrbcPhase::Ready);
+        assert!(h.grades().is_empty());
+
+        let echoes = votes(&p.header, GrbcPhase::Echo);
+        h.core.process_grbc_vote(echoes[3].clone()).await.unwrap();
+        h.core.process_grbc_vote(echoes[3].clone()).await.unwrap();
+        assert!(
+            h.grades().is_empty(),
+            "Duplicate signer cannot supply quorum"
+        );
+        h.core.process_grbc_vote(echoes[1].clone()).await.unwrap();
+        assert_eq!(h.grades(), vec![1]);
+        let outgoing = h.outgoing();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].phase, GrbcPhase::Ready);
+
+        let ready = votes(&p.header, GrbcPhase::Ready);
+        h.core.process_grbc_vote(ready[3].clone()).await.unwrap();
+        h.core.process_grbc_vote(ready[3].clone()).await.unwrap();
+        assert!(!h.core.completed.contains(&p.header.id));
+        h.core.process_grbc_vote(ready[1].clone()).await.unwrap();
+        assert_eq!(h.grades(), vec![2]);
+        assert!(h.core.completed.contains(&p.header.id));
+        assert!(
+            h._headers.try_recv().is_err(),
+            "GRBC must not queue dependency waits"
+        );
     }
+}
+
+#[tokio::test]
+async fn no_wait_committed_quorum_advances_without_local_dependencies() {
+    let mut h = Harness::new("no_wait_advance", 0);
+    let mut blocks = Vec::new();
+    for (author, _) in keys().into_iter().take(3) {
+        let mut p = proposal();
+        p.header.author = author;
+        p.header.round = 3;
+        p.header.parents = (40..43).map(|n| Digest([n; 32])).collect();
+        p.header.weak_edges.insert(Digest([43; 32]));
+        p.header.virtual_edges.insert(Digest([44; 32]));
+        resign(&mut p);
+        crate::proposal_store::store_verified_proposal(&mut h.core.store, p.clone())
+            .await
+            .unwrap();
+        blocks.push(p.block());
+    }
+    h.core
+        .process_committed(blocks[..2].to_vec())
+        .await
+        .unwrap();
+    assert!(
+        h._parents.try_recv().is_err(),
+        "Round advance still requires distinct authors' quorum"
+    );
+    h.core
+        .process_committed(vec![blocks[0].clone()])
+        .await
+        .unwrap();
+    assert!(
+        h._parents.try_recv().is_err(),
+        "Duplicate block cannot supply quorum"
+    );
+    h.core
+        .process_committed(vec![blocks[2].clone()])
+        .await
+        .unwrap();
+    let (parents, _, _, round) = h
+        ._parents
+        .try_recv()
+        .expect("Completed quorum must advance without its local dependencies");
+    assert_eq!(round, 3);
+    assert_eq!(parents.len(), 3);
 }

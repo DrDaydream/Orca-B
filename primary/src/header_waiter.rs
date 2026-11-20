@@ -28,6 +28,8 @@ const TIMER_RESOLUTION: u64 = 1_000;
 #[derive(Debug)]
 pub enum WaiterMessage {
     // Local completion records for strong/weak edges, proposal markers for virtual edges.
+    // Retained for repair regression tests; the no-wait Core never queues it.
+    #[cfg_attr(not(test), allow(dead_code))]
     SyncParents(Vec<Digest>, Vec<Digest>, Header),
     // (block digest, header ID) completed by local consensus commit.
     Committed(Vec<(Digest, Digest)>),

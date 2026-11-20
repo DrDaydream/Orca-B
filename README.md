@@ -1,5 +1,7 @@
 # Orca-B
 
+> Current experiment (2026-11-20): local dependency waits are removed from GRBC, round advancement, Dag admission and final output. See [NO-DEPENDENCY-WAIT.md](NO-DEPENDENCY-WAIT.md) for the exact changes, quorum semantics and effects on missing-history output. The dependency waiting behavior and historical validation results below describe the earlier baseline.
+
 [![Rust](https://anonymous.4open.science/r/Orca-B-BDE4/actions/workflows/rust.yml/badge.svg)](https://anonymous.4open.science/r/Orca-B-BDE4/actions/workflows/rust.yml)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-24.04-E95420?style=flat-square&logo=ubuntu)](https://ubuntu.com/)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg?style=flat-square)](LICENSE)

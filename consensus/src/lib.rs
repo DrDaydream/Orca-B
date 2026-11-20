@@ -65,14 +65,10 @@ struct State {
     dag_strong_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
     observed_direct_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
     dag_direct_support: HashMap<(Round, Digest), HashSet<PublicKey>>,
-    /// Number of strong/weak dependencies not yet known to have entered Dag.
-    missing_dependencies: HashMap<Digest, usize>,
-    /// Reverse dependency index used to wake only blocks affected by a newly
-    /// promoted Dag certificate.
-    dependency_waiters: HashMap<Digest, HashSet<Digest>>,
-    /// Missing causal history authorized for direct Dag admission by a
-    /// commit-ready leader. Arrival at any verified GRBC stage wakes it.
+    /// Late causal data may refresh a leader still waiting for predecessor order.
+    /// This index is not a final-output availability barrier.
     forced_history_waiters: HashMap<Digest, HashSet<Round>>,
+    /// Grade-2 blocks awaiting local Dag insertion, regardless of dependencies.
     promotion_queue: VecDeque<Digest>,
     aba_support: HashMap<(Round, Digest), AbaSupport>,
     /// The authority designated as leader for every round.
@@ -177,8 +173,6 @@ impl State {
             dag_strong_support: HashMap::new(),
             observed_direct_support: HashMap::new(),
             dag_direct_support: HashMap::new(),
-            missing_dependencies: HashMap::new(),
-            dependency_waiters: HashMap::new(),
             forced_history_waiters: HashMap::new(),
             promotion_queue: VecDeque::new(),
             aba_support: HashMap::new(),
@@ -363,23 +357,7 @@ impl State {
         if self.dag_digests.contains(&digest) {
             return self.observe(certificate);
         }
-        let missing: HashSet<_> = certificate
-            .header
-            .parents
-            .iter()
-            .chain(&certificate.header.weak_edges)
-            .filter(|dependency| !self.dag_digests.contains(*dependency))
-            .cloned()
-            .collect();
-        for dependency in &missing {
-            self.dependency_waiters
-                .entry(dependency.clone())
-                .or_default()
-                .insert(digest.clone());
-        }
-        self.missing_dependencies
-            .insert(digest.clone(), missing.len());
-        if missing.is_empty() && self.grade_two.contains(&digest) {
+        if self.grade_two.contains(&digest) {
             self.promotion_queue.push_back(digest.clone());
         }
         self.vdag
@@ -444,16 +422,6 @@ impl State {
                 .or_default()
                 .insert(origin);
         }
-        if let Some(waiters) = self.dependency_waiters.remove(&digest) {
-            for waiter in waiters {
-                if let Some(missing) = self.missing_dependencies.get_mut(&waiter) {
-                    *missing = missing.saturating_sub(1);
-                    if *missing == 0 && self.grade_two.contains(&waiter) {
-                        self.promotion_queue.push_back(waiter);
-                    }
-                }
-            }
-        }
         self.wake_pending(round);
     }
 
@@ -484,24 +452,17 @@ impl State {
                 self.mark_aba_support_dirty(digest.clone(), round);
             }
         }
-        if inserted
-            && self.missing_dependencies.get(&digest) == Some(&0)
-            && self.observed.contains_key(&digest)
-        {
+        if inserted && self.observed.contains_key(&digest) {
             self.promotion_queue.push_back(digest);
         }
         inserted
     }
 
-    /// Promote every grade-2 VDag block whose strong and weak dependencies are
-    /// already present in Dag. Repeat because one promotion may unblock another.
+    /// Promote local grade-2 blocks without waiting for strong/weak history.
     fn promote_ready(&mut self) -> Vec<Certificate> {
         let mut promoted = Vec::new();
         while let Some(digest) = self.promotion_queue.pop_front() {
-            if self.dag_digests.contains(&digest)
-                || !self.grade_two.contains(&digest)
-                || self.missing_dependencies.get(&digest) != Some(&0)
-            {
+            if self.dag_digests.contains(&digest) || !self.grade_two.contains(&digest) {
                 continue;
             }
             let certificate = match self.observed.get(&digest).cloned() {
@@ -509,7 +470,6 @@ impl State {
                 None => continue,
             };
             self.promote_to_dag(certificate.clone());
-            self.missing_dependencies.remove(&digest);
             promoted.push(certificate);
         }
         promoted
@@ -539,6 +499,14 @@ impl State {
     }
 
     fn gc_protocol_state(&mut self, gc_depth: Round) {
+        // Finalized owners no longer wait for history. Release them even if
+        // another leader keeps the rest of protocol GC temporarily suspended.
+        let committed = &self.committed_leaders;
+        let skipped = &self.skipped_leaders;
+        self.forced_history_waiters.retain(|_, owners| {
+            owners.retain(|round| !committed.contains(round) && !skipped.contains(round));
+            !owners.is_empty()
+        });
         if !self.pending_leaders.is_empty() {
             return;
         }
@@ -567,12 +535,6 @@ impl State {
         self.strong_children.retain(|digest, children| {
             children.retain(|child| observed.contains_key(child));
             observed.contains_key(digest) || !children.is_empty()
-        });
-        self.missing_dependencies
-            .retain(|digest, _| retained.contains(digest));
-        self.dependency_waiters.retain(|_, waiters| {
-            waiters.retain(|digest| retained.contains(digest));
-            !waiters.is_empty()
         });
         let dag_digests = &self.dag_digests;
         self.forced_history_waiters.retain(|digest, owners| {
@@ -1594,10 +1556,6 @@ impl Consensus {
                 .map_or(false, |leader| {
                     state.predecessor_resolved(ready_round)
                         && state.dag_digests.contains(&leader.digest())
-                        && !state
-                            .forced_history_waiters
-                            .values()
-                            .any(|owners| owners.contains(&ready_round))
                 });
             if !leader_ready {
                 continue;
@@ -1731,7 +1689,7 @@ impl Consensus {
             for parent in x.header.parents.iter().chain(&x.header.weak_edges) {
                 let certificate = match state.dag_by_digest.get(parent) {
                     Some(certificate) => certificate,
-                    None => continue, // We already ordered or GC up to here.
+                    None => continue, // Missing history does not block experimental output.
                 };
 
                 // We skip the certificate if we (1) already processed it or (2) we reached a round that we already
