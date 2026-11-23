@@ -10,6 +10,52 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::TryInto;
 use std::fmt;
 
+// Shared ABA wire schema: the broadcaster needs the instance round for scheduling.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub enum BinaryValue {
+    Zero,
+    One,
+}
+
+impl BinaryValue {
+    pub fn index(self) -> usize {
+        match self {
+            Self::Zero => 0,
+            Self::One => 1,
+        }
+    }
+}
+
+impl From<bool> for BinaryValue {
+    fn from(value: bool) -> Self {
+        if value {
+            Self::One
+        } else {
+            Self::Zero
+        }
+    }
+}
+impl From<BinaryValue> for bool {
+    fn from(value: BinaryValue) -> Self {
+        value == BinaryValue::One
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum AbaMessageKind {
+    BVal(BinaryValue),
+    Aux(BinaryValue),
+    /// Sent after local decision; receivers require f+1 authenticated votes.
+    Decide(BinaryValue),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AbaMessage {
+    pub instance: u64,
+    pub round: u64,
+    pub kind: AbaMessageKind,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConsensusNetworkMessage {
     pub author: PublicKey,

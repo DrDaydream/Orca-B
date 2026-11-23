@@ -1,5 +1,7 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
+import json
 from datetime import datetime
+from pathlib import Path
 from glob import glob
 from multiprocessing import Pool
 from os.path import join
@@ -7,6 +9,7 @@ from re import findall, search
 from statistics import mean
 
 from benchmark.utils import Print
+from benchmark.adversary import crash_population
 
 
 class ParseError(Exception):
@@ -422,7 +425,7 @@ class LogParser:
             f.write(self.result())
 
     @classmethod
-    def process(cls, directory, faults=0):
+    def process(cls, directory, faults=0, adversary=None, committee_size=None):
         assert isinstance(directory, str)
 
         clients = []
@@ -438,4 +441,20 @@ class LogParser:
             with open(filename, 'r') as f:
                 workers += [f.read()]
 
-        return cls(clients, primaries, workers, faults=faults)
+        result = cls(clients, primaries, workers, faults=faults)
+        population_path = Path(directory) / 'measurement-population.json'
+        if (adversary and adversary.get('fault_model') == 'crash-stop') or population_path.exists():
+            try:
+                primary_ids = sorted(int(p.stem.split('-')[1]) for p in Path(directory).glob('primary-*.log'))
+                population = crash_population(directory, primary_ids, adversary, committee_size)
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                raise ParseError(f'Invalid crash population: {error}') from error
+            if population is not None:
+                result.committee_size = population['committee_size']
+                result.faults = len(population['crashed_primary_ids'])
+                result.workers = len(workers) // len(primaries)
+                if adversary is not None:
+                    tmp = population_path.with_suffix('.json.tmp')
+                    tmp.write_text(json.dumps(population, indent=2) + '\n', encoding='utf-8')
+                    tmp.replace(population_path)
+        return result

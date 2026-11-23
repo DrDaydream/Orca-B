@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::NetworkError;
+use crate::scheduler::{Outbound, Scheduler};
 use bytes::Bytes;
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
@@ -29,6 +30,7 @@ pub type CancelHandler = oneshot::Receiver<Bytes>;
 /// This sender is 'reliable' in the sense that it keeps trying to re-transmit messages for which it didn't
 /// receive an ACK back (until they succeed or are canceled).
 pub struct ReliableSender {
+    scheduler: Option<Scheduler>,
     /// A map holding the channels to our connections.
     connections: HashMap<SocketAddr, Sender<InnerMessage>>,
     /// Small RNG just used to shuffle nodes and randomize connections (not crypto related).
@@ -42,8 +44,18 @@ impl std::default::Default for ReliableSender {
 }
 
 impl ReliableSender {
+    pub fn with_schedule(
+        policy: std::sync::Arc<dyn crate::DeliveryPolicy>,
+        budget: crate::DelayBudget,
+    ) -> Self {
+        let mut sender = Self::new();
+        sender.scheduler = Some(Scheduler::new(policy, budget));
+        sender
+    }
+
     pub fn new() -> Self {
         Self {
+            scheduler: None,
             connections: HashMap::new(),
             rng: SmallRng::from_entropy(),
         }
@@ -59,6 +71,32 @@ impl ReliableSender {
     /// Reliably send a message to a specific address.
     pub async fn send(&mut self, address: SocketAddr, data: Bytes) -> CancelHandler {
         let (sender, receiver) = oneshot::channel();
+        let outbound = Outbound {
+            address,
+            data,
+            acknowledgement: Some(sender),
+        };
+        let outbound = match &self.scheduler {
+            Some(scheduler) => scheduler.submit(outbound),
+            None => Some(outbound),
+        };
+        if let Some(outbound) = outbound {
+            self.send_inner(
+                outbound.address,
+                outbound.data,
+                outbound.acknowledgement.unwrap(),
+            )
+            .await;
+        }
+        receiver
+    }
+
+    pub(crate) async fn send_inner(
+        &mut self,
+        address: SocketAddr,
+        data: Bytes,
+        sender: oneshot::Sender<Bytes>,
+    ) {
         self.connections
             .entry(address)
             .or_insert_with(|| Self::spawn_connection(address))
@@ -68,7 +106,31 @@ impl ReliableSender {
             })
             .await
             .expect("Failed to send internal message");
-        receiver
+    }
+
+    /// Own the bounded connection queue without borrowing the sender while
+    /// waiting for capacity. The scheduler can poll all peers concurrently.
+    pub(crate) fn scheduled_send(
+        &mut self,
+        address: SocketAddr,
+        data: Bytes,
+    ) -> impl std::future::Future<Output = Result<Bytes, oneshot::error::RecvError>> + Send + 'static
+    {
+        let tx = self
+            .connections
+            .entry(address)
+            .or_insert_with(|| Self::spawn_connection(address))
+            .clone();
+        let (sender, receiver) = oneshot::channel();
+        async move {
+            let _ = tx
+                .send(InnerMessage {
+                    data,
+                    cancel_handler: sender,
+                })
+                .await;
+            receiver.await
+        }
     }
 
     /// Broadcast the message to all specified addresses in a reliable manner. It returns a vector of

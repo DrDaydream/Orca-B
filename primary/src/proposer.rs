@@ -126,6 +126,9 @@ impl Proposer {
     }
 
     fn compute_silence(&self, round: Round) -> bool {
+        if let Some(silent) = adversary::fixed_silence(self.name, round) {
+            return silent;
+        }
         if !adversary::selected(
             &self.name,
             &self.leader_schedule,

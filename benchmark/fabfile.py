@@ -1,5 +1,8 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from fabric import task
+from invoke import Exit
+
+from benchmark.adversary import local_parameters, remote_parameters
 
 from benchmark.local import LocalBench
 from benchmark.logs import ParseError, LogParser
@@ -9,8 +12,15 @@ from benchmark.instance import InstanceManager
 from benchmark.remote import Bench, BenchError
 
 
-@task
-def local(ctx, debug=False):
+@task(help={
+    'adversary': 'Mode: none/A0, silent/A1 (full-run crashes), targeted/A3, network/A5; omitted keeps legacy behavior.',
+    'bullshark-alternating': 'Bullshark: true or false for alternate unavailable leader slots.',
+})
+def local(ctx, debug=False, nodes=None, workers=None, rate=None, tx_size=None,
+          duration=None, faults=None, adversary='', byzantine=0,
+          byzantine_ids='', seed=1, start_round=1, attack_rounds=0,
+          delay_ms=200, max_pending_messages=4096, max_pending_bytes=67108864,
+          bullshark_alternating='true'):
     ''' Run benchmarks on localhost '''
     bench_params = {
         'faults': 0,
@@ -29,6 +39,17 @@ def local(ctx, debug=False):
         'batch_size': 500_000,  # bytes
         'max_batch_delay': 200  # ms
     }
+    try:
+        bench_params = local_parameters(
+            bench_params, nodes=nodes, workers=workers,
+            rate=rate, tx_size=tx_size, duration=duration, faults=faults,
+            adversary=adversary, byzantine=byzantine, byzantine_ids=byzantine_ids,
+            seed=seed, start_round=start_round, attack_rounds=attack_rounds,
+            delay_ms=delay_ms, max_pending_messages=max_pending_messages,
+            max_pending_bytes=max_pending_bytes, bullshark_alternating=bullshark_alternating,
+        )
+    except ValueError as e:
+        raise Exit(str(e), code=2) from e
     try:
         ret = LocalBench(bench_params, node_params).run(debug)
         print(ret.result())
@@ -90,8 +111,22 @@ def install(ctx):
         Print.error(e)
 
 
-@task
-def remote(ctx, debug=False):
+@task(help={
+    'adversary': 'Explicit mode: none/A0, silent/A1 (full-run crashes), targeted/A3, network/A5; omitted preserves legacy behavior.',
+    'fault': 'Alias for --faults.',
+    'faults': 'Legacy faults (original default when mode omitted); explicit modes default to 0.',
+    'delay-ms': 'Selected message delay in milliseconds, 1..86400000.',
+    'byzantine': 'Fixed count (A1: last launch IDs; A3/A5: first IDs), at most floor((nodes-1)/3).',
+    'byzantine-ids': 'Comma-separated zero-based launch IDs; mutually exclusive with byzantine.',
+    'bullshark-alternating': 'Bullshark only: true or false; alternate normal/unavailable leader slots.',
+    'attack-rounds': 'A3/A5 round window; 0 is unbounded. A1 requires 0 and start-round=1.',
+    'rate': 'Input transactions per second; comma-separated values run a sweep.',
+})
+def remote(ctx, debug=False, nodes=None, workers=None, rate=None, tx_size=None,
+           duration=None, faults=None, runs=None, adversary='', byzantine=0,
+           byzantine_ids='', seed=1, start_round=1, attack_rounds=0,
+           delay_ms=200, max_pending_messages=4096, max_pending_bytes=67108864,
+           bullshark_alternating='true', fault=None):
     ''' Run benchmarks on AWS '''
     bench_params = {
         'faults': 3,
@@ -103,6 +138,24 @@ def remote(ctx, debug=False):
         'duration': 300,
         'runs': 2,
     }
+    try:
+        if fault is not None:
+            if faults is not None:
+                raise ValueError('Choose either --fault or --faults')
+            faults = fault
+        overrides = dict(nodes=nodes, workers=workers, rate=rate, tx_size=tx_size,
+                         duration=duration, runs=runs)
+        bench_params.update({k: v for k, v in overrides.items() if v is not None})
+        default_faults = bench_params.pop('faults')
+        bench_params = remote_parameters(
+            **bench_params, faults=faults, default_faults=default_faults, adversary=adversary,
+            byzantine=byzantine, byzantine_ids=byzantine_ids, seed=seed,
+            start_round=start_round, attack_rounds=attack_rounds, delay_ms=delay_ms,
+            max_pending_messages=max_pending_messages, max_pending_bytes=max_pending_bytes,
+            bullshark_alternating=bullshark_alternating,
+        )
+    except ValueError as e:
+        raise Exit(str(e), code=2) from e
     node_params = {
         'header_size': 1_000,  # bytes
         'max_header_delay': 200,  # ms

@@ -3,6 +3,7 @@ from os import environ
 from os.path import join
 
 from benchmark.utils import PathMaker
+from benchmark.adversary import adversary_environment
 
 
 class CommandMaker:
@@ -29,12 +30,17 @@ class CommandMaker:
         return f'./node generate_keys --filename {filename}'
 
     @staticmethod
-    def run_primary(keys, committee, store, parameters, debug=False, faults=0):
+    def run_primary(keys, committee, store, parameters, debug=False, faults=0,
+                    adversary_config=None):
         assert isinstance(keys, str)
         assert isinstance(committee, str)
         assert isinstance(parameters, str)
         assert isinstance(debug, bool)
         v = '-vvv' if debug else '-vv'
+        if adversary_config is not None:
+            return (f'{adversary_environment(adversary_config)}ORCA_FAULTS=0 '
+                    f'./node {v} run --keys {keys} --committee {committee} '
+                    f'--store {store} --parameters {parameters} primary')
         rule3_behavior = environ.get('ORCA_RULE3_BEHAVIOR', 'mixed').lower()
         if rule3_behavior not in {'mixed', 'silent', 'participate'}:
             raise ValueError('ORCA_RULE3_BEHAVIOR must be mixed, silent, or participate')

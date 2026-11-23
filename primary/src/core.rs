@@ -131,7 +131,7 @@ impl Core {
                 grade_two: HashSet::new(),
                 round_advance_pending: HashMap::new(),
                 weak_edge_candidates: HashMap::new(),
-                network: ReliableSender::new(),
+                network: crate::adversary::reliable_sender(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
             }
             .run()
