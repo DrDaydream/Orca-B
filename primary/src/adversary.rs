@@ -294,6 +294,18 @@ pub(crate) fn reliable_sender() -> ReliableSender {
     }
 }
 
+#[cfg(feature = "benchmark")]
+pub(crate) fn reliable_sender_with_counter(
+    sent_bytes: Arc<std::sync::atomic::AtomicU64>,
+) -> ReliableSender {
+    match RUNTIME.lock().unwrap().clone() {
+        Some(runtime) if runtime.policy.schedules_local_sender() => {
+            ReliableSender::with_schedule_and_counter(runtime.policy, runtime.budget, sent_bytes)
+        }
+        _ => ReliableSender::with_sent_byte_counter(sent_bytes),
+    }
+}
+
 pub(crate) fn simple_sender() -> SimpleSender {
     match RUNTIME.lock().unwrap().clone() {
         Some(runtime) if runtime.policy.schedules_local_sender() => {

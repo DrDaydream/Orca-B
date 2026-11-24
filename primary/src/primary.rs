@@ -23,7 +23,11 @@ use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::sync::atomic::AtomicU64;
+#[cfg(feature = "benchmark")]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+#[cfg(feature = "benchmark")]
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration};
@@ -65,11 +69,57 @@ pub enum WorkerPrimaryMessage {
     OthersBatch(Digest, WorkerId),
 }
 
+/// Per-primary counters for the dedicated ABA transport, shared only by its
+/// sender, ingress handler, and observer. Local ABA self-delivery uses no socket.
+#[cfg(feature = "benchmark")]
+#[derive(Clone, Default)]
+struct AbaByteCounters {
+    sent: Arc<AtomicU64>,
+    received: Arc<AtomicU64>,
+}
+
+#[cfg(feature = "benchmark")]
+impl AbaByteCounters {
+    fn spawn() -> Self {
+        let counters = Self::default();
+        let started = Instant::now();
+        info!("Benchmark ABA instrumentation version 1");
+        // Establish a zero baseline before starting either ABA socket task.
+        counters.log_sample(started);
+        let observer = counters.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(1)).await;
+                // Keep sampling during idle periods as well. Rate denominators
+                // use the monotonic elapsed delta, never ABA active duration.
+                observer.log_sample(started);
+            }
+        });
+        counters
+    }
+
+    fn log_sample(&self, started: Instant) {
+        // Wall time aligns observations with other logs; only Instant provides
+        // the denominator, so a wall-clock correction cannot change the rate.
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(at) => info!(
+                "Benchmark ABA bytes at_us {} elapsed_us {} sent {} received {}",
+                at.as_micros(),
+                started.elapsed().as_micros(),
+                self.sent.load(Ordering::Relaxed),
+                self.received.load(Ordering::Relaxed),
+            ),
+            Err(error) => log::warn!("Benchmark ABA timestamp unavailable: {}", error),
+        }
+    }
+}
+
 fn spawn_aba_broadcaster(
     name: PublicKey,
     committee: Committee,
     mut signature_service: SignatureService,
     mut rx_messages: Receiver<Vec<Vec<u8>>>,
+    #[cfg(feature = "benchmark")] aba_bytes: AbaByteCounters,
 ) {
     tokio::spawn(async move {
         let addresses: Vec<_> = committee
@@ -77,7 +127,10 @@ fn spawn_aba_broadcaster(
             .iter()
             .map(|(_, address)| address.aba_to_aba)
             .collect();
+        #[cfg(not(feature = "benchmark"))]
         let mut network = crate::adversary::reliable_sender();
+        #[cfg(feature = "benchmark")]
+        let mut network = crate::adversary::reliable_sender_with_counter(aba_bytes.sent);
         let mut pending = FuturesUnordered::new();
 
         loop {
@@ -198,6 +251,8 @@ impl Primary {
         // Atomic variable use to synchronizer all tasks with the latest consensus round. This is only
         // used for cleanup. The only tasks that write into this variable is `GarbageCollector`.
         let consensus_round = Arc::new(AtomicU64::new(0));
+        #[cfg(feature = "benchmark")]
+        let aba_bytes = AbaByteCounters::spawn();
 
         // Spawn the network receiver listening to messages from the other primaries.
         let mut address = committee
@@ -229,6 +284,8 @@ impl Primary {
             AbaReceiverHandler {
                 committee: committee.clone(),
                 tx_consensus: tx_consensus.clone(),
+                #[cfg(feature = "benchmark")]
+                aba_bytes: aba_bytes.clone(),
             },
         );
         info!("Primary {} listening to ABA messages on {}", name, address);
@@ -268,6 +325,8 @@ impl Primary {
             committee.clone(),
             signature_service.clone(),
             rx_aba_broadcast,
+            #[cfg(feature = "benchmark")]
+            aba_bytes,
         );
 
         // The `Core` receives and handles headers, votes, and certificates from the other primaries.
@@ -359,11 +418,20 @@ struct PrimaryReceiverHandler {
 struct AbaReceiverHandler {
     committee: Committee,
     tx_consensus: Sender<ConsensusMessage>,
+    #[cfg(feature = "benchmark")]
+    aba_bytes: AbaByteCounters,
 }
 
 #[async_trait]
 impl MessageHandler for AbaReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+        // The receiver has decoded one complete frame and removed its default
+        // four-byte length prefix. Count the signed envelope before validation,
+        // including complete invalid frames and duplicate/retried deliveries.
+        #[cfg(feature = "benchmark")]
+        self.aba_bytes
+            .received
+            .fetch_add(serialized.len() as u64 + 4, Ordering::Relaxed);
         let message: ConsensusNetworkMessage =
             bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
         message.verify(&self.committee)?;

@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from glob import glob
+from math import ceil
 from multiprocessing import Pool
 from os.path import join
 from re import findall, search
@@ -10,10 +11,26 @@ from statistics import mean
 
 from benchmark.utils import Print
 from benchmark.adversary import crash_population
+from benchmark.aba_traffic import counter_window, format_aba_traffic
 
 
 class ParseError(Exception):
     pass
+
+
+def _latency_summary(label, seconds):
+    ordered = sorted(seconds)
+    average_ms = mean(ordered) * 1_000 if ordered else 0
+    lines = [f' {label} latency: {round(average_ms):,} ms\n']
+    for p in (50, 99):
+        if ordered:
+            # Nearest rank, as in the adversary-experiments measurements.
+            sample = ordered[ceil(p * len(ordered) / 100) - 1]
+            value = f'{round(sample * 1_000):,} ms'
+        else:
+            value = 'N/A'
+        lines.append(f' {label} latency P{p}: {value}\n')
+    return ''.join(lines)
 
 
 class LogParser:
@@ -24,6 +41,8 @@ class LogParser:
         assert all(x for x in inputs)
 
         self.faults = faults
+        self.aba_windows = [counter_window(log) for log in primaries]
+        self.primary_ids = list(range(len(primaries)))
         if isinstance(faults, int):
             self.committee_size = len(primaries)
             self.workers =  len(workers) // len(primaries)
@@ -275,8 +294,11 @@ class LogParser:
         tps = bps / self.size[0]
         return tps, bps, duration
 
+    def _consensus_latency_samples(self):
+        return [c - self.proposals[d] for d, c in self.commits.items()]
+
     def _consensus_latency(self):
-        latency = [c - self.proposals[d] for d, c in self.commits.items()]
+        latency = self._consensus_latency_samples()
         return mean(latency) if latency else 0
 
     def _final_consensus_latency(self):
@@ -297,7 +319,7 @@ class LogParser:
         tps = bps / self.size[0]
         return tps, bps, duration
 
-    def _end_to_end_latency(self):
+    def _end_to_end_latency_samples(self):
         latency = []
         for sent, received in zip(self.sent_samples, self.received_samples):
             for tx_id, batch_id in received.items():
@@ -306,6 +328,10 @@ class LogParser:
                     start = sent[tx_id]
                     end = self.commits[batch_id]
                     latency += [end-start]
+        return latency
+
+    def _end_to_end_latency(self):
+        latency = self._end_to_end_latency_samples()
         return mean(latency) if latency else 0
 
     def _final_end_to_end_latency(self):
@@ -361,10 +387,10 @@ class LogParser:
         batch_size = self.configs[0]['batch_size']
         max_batch_delay = self.configs[0]['max_batch_delay']
 
-        consensus_latency = self._consensus_latency() * 1_000
+        consensus_latency = _latency_summary('Consensus', self._consensus_latency_samples())
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
-        end_to_end_latency = self._end_to_end_latency() * 1_000
+        end_to_end_latency = _latency_summary('End-to-end', self._end_to_end_latency_samples())
         leader_latency, non_leader_latency, all_header_latency, leader_interval, rule_order_latency = (x * 1_000 for x in self._header_latency_stats())
         rule_leaders, rule_blocks = self._commit_rule_ratios()
         aba_average = mean(self.aba_durations) if self.aba_durations else 0
@@ -396,7 +422,7 @@ class LogParser:
             ' + RESULTS:\n'
             f' Consensus TPS: {round(consensus_tps):,} tx/s\n'
             f' Consensus BPS: {round(consensus_bps):,} B/s\n'
-            f' Consensus latency: {round(consensus_latency):,} ms\n'
+            f'{consensus_latency}'
             f' Leader commit latency: {round(leader_latency):,} ms\n'
             f' Non-leader commit latency: {round(non_leader_latency):,} ms\n'
             f' All committed headers latency: {round(all_header_latency):,} ms\n'
@@ -412,10 +438,11 @@ class LogParser:
             f' ABA average duration: {round(aba_average):,} ms\n'
             f' ABA maximum duration: {round(aba_maximum):,} ms\n'
             f' ABA minimum duration: {round(aba_minimum):,} ms\n'
+            f'{format_aba_traffic(dict(zip(self.primary_ids, self.aba_windows)))}'
             '\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
-            f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
+            f'{end_to_end_latency}'
             '-----------------------------------------\n'
         )
 
@@ -433,7 +460,8 @@ class LogParser:
             with open(filename, 'r') as f:
                 clients += [f.read()]
         primaries = []
-        for filename in sorted(glob(join(directory, 'primary-*.log'))):
+        primary_files = sorted(Path(directory).glob('primary-*.log'))
+        for filename in primary_files:
             with open(filename, 'r') as f:
                 primaries += [f.read()]
         workers = []
@@ -442,10 +470,11 @@ class LogParser:
                 workers += [f.read()]
 
         result = cls(clients, primaries, workers, faults=faults)
+        result.primary_ids = [int(path.stem.split('-')[1]) for path in primary_files]
         population_path = Path(directory) / 'measurement-population.json'
         if (adversary and adversary.get('fault_model') == 'crash-stop') or population_path.exists():
             try:
-                primary_ids = sorted(int(p.stem.split('-')[1]) for p in Path(directory).glob('primary-*.log'))
+                primary_ids = sorted(result.primary_ids)
                 population = crash_population(directory, primary_ids, adversary, committee_size)
             except (OSError, ValueError, TypeError, KeyError) as error:
                 raise ParseError(f'Invalid crash population: {error}') from error

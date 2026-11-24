@@ -71,7 +71,7 @@ class Bench:
             'rustup default stable',
 
             # This is missing from the Rocksdb installer (needed for Rocksdb).
-            'sudo apt-get install -y clang',
+            'sudo apt-get install -y clang-14 libclang-14-dev',
 
             # Clone the repo.
             f'(git clone {self.settings.repo_url} || (cd {self.settings.repo_name} ; git pull))'

@@ -84,7 +84,7 @@ impl Scheduler {
         Self::start(policy, budget, ReliableSender::new())
     }
 
-    fn start(
+    pub(crate) fn start(
         policy: Arc<dyn DeliveryPolicy>,
         budget: DelayBudget,
         mut reliable: ReliableSender,
@@ -230,6 +230,47 @@ mod tests {
                 _ => Delivery::Send,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn delayed_transport_counts_only_real_frames_and_counts_retries() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sent = Arc::new(AtomicU64::new(0));
+        let mut sender = ReliableSender::with_schedule_and_counter(
+            Arc::new(Policy),
+            DelayBudget::new(2, 1024),
+            sent.clone(),
+        );
+        let ack = sender
+            .send(
+                listener.local_addr().unwrap(),
+                Bytes::from_static(b"delayed-aba"),
+            )
+            .await;
+        assert_eq!(sent.load(Ordering::Relaxed), 0);
+        let (socket, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut first = Framed::new(socket, LengthDelimitedCodec::new());
+        assert_eq!(
+            first.next().await.unwrap().unwrap().as_ref(),
+            b"delayed-aba"
+        );
+        drop(first); // No ACK: the identical envelope is retransmitted.
+        let (socket, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut retry = Framed::new(socket, LengthDelimitedCodec::new());
+        assert_eq!(
+            retry.next().await.unwrap().unwrap().as_ref(),
+            b"delayed-aba"
+        );
+        retry.send(Bytes::from_static(b"Ack")).await.unwrap();
+        assert!(ack.await.is_ok());
+        assert_eq!(sent.load(Ordering::Relaxed), 30);
     }
 
     #[tokio::test]
