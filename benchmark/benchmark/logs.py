@@ -10,13 +10,28 @@ from re import findall, search
 from statistics import mean
 
 from benchmark.utils import Print
-from benchmark.adversary import crash_population
-from benchmark.measurements import (Measurements, format_measurements,
+from benchmark.adversary import MODES, crash_population
+from benchmark.measurements import (Measurements, aba_counter_samples, format_measurements,
                                     format_clock_metrics, validate_clock_plan)
 
 
 class ParseError(Exception):
     pass
+
+
+def _logged_runtime_adversary(primaries):
+    # Old runtime manifests stored the replica population. Their configure
+    # records identify the mode and set size, but omit the individual IDs.
+    previous = None
+    for log in primaries:
+        matches = findall(r'BENCH_ADVERSARY mode=(\w+) action=configure sender=\S+ fixed_byzantine=(\d+)', log)
+        if len(matches) != 1 or (previous is not None and matches[0] != previous):
+            return None, None
+        previous = matches[0]
+    if previous is None:
+        return None, None
+    raw_mode, count = previous
+    return MODES.get(raw_mode.lower()), [] if int(count) == 0 else None
 
 
 class LogParser:
@@ -36,6 +51,8 @@ class LogParser:
                 or not set(excluded) < set(self.primary_ids)):
             raise ParseError('Invalid primary IDs or silent replica exclusions')
         self.excluded_primary_ids = sorted(excluded)
+        self.adversary_mode = 'unknown'
+        self.byzantine_ids = None
         self.included_primary_ids = [i for i in self.primary_ids if i not in excluded]
         included = lambda values: [value for ident, value in zip(self.primary_ids, values)
                                    if ident not in excluded]
@@ -82,6 +99,11 @@ class LogParser:
         # Keep every completed node-instance sample. Unfinished ABA instances
         # have no duration log and are intentionally excluded.
         self.aba_durations = [duration for values in included(aba_durations) for duration in values]
+        # Silent authorities still run and may send ABA traffic.
+        self.excluded_aba_counters = {
+            ident: aba_counter_samples(log) for ident, log in zip(self.primary_ids, primaries)
+            if ident in self.excluded_primary_ids
+        }
 
         # Parse the workers logs.
         try:
@@ -132,7 +154,34 @@ class LogParser:
         if metrics['aba'] is not None:
             for row, ident in zip(metrics['aba']['replicas'], self.included_primary_ids):
                 row['replica'] = ident
+        average, total = self.aba_send_rates(metrics)
+        size = self.size[0] if len(set(self.size)) == 1 and self.size[0] > 0 else None
+        metrics['aba_committee'] = {
+            'committee_size': self.committee_size,
+            'total_sent_bytes_per_second': total,
+            'mean_sent_bytes_per_second': average,
+            'total_equivalent_tx_per_second': total / size if total is not None and size else None,
+            'mean_equivalent_tx_per_second': average / size if average is not None and size else None,
+        }
         return metrics
+
+    def aba_send_rates(self, release):
+        """Mean and total B/s require usable counters from every running authority."""
+        aba = release['aba']
+        if aba is None or not aba['all_replicas_available']:
+            return None, None
+        total = aba['sum_replica_sent_bytes_per_second']
+        if self.excluded_aba_counters:
+            silent = Measurements.aba_metrics(
+                self.excluded_aba_counters.values(),
+                [f'primary-{i}.log' for i in self.excluded_aba_counters],
+                release['window_start_us'], release['window_end_us'])
+            if silent is None or not silent['all_replicas_available']:
+                return None, None
+            total += silent['sum_replica_sent_bytes_per_second']
+        if self.committee_size != len(self.primary_ids) + len(self.crashed_primary_ids):
+            return None, None
+        return total / self.committee_size, total
 
     def clock_metrics(self, plan=None):
         """Public planned windows using the included primary launch IDs."""
@@ -338,18 +387,34 @@ class LogParser:
         return datetime.timestamp(x)
 
     def _consensus_throughput(self):
+        if self.commits.keys() - self.proposals.keys():
+            return None, None, None
+        return self._throughput_since(self.proposals.values())
+
+    def _throughput_since(self, starts):
         if not self.commits:
             return 0, 0, 0
-        start, end = min(self.proposals.values()), max(self.commits.values())
-        duration = end - start
-        bytes = sum(self.sizes.values())
-        bps = bytes / duration
-        tps = bps / self.size[0]
+        if not starts:
+            return None, None, None
+        duration = max(self.commits.values()) - min(starts)
+        if duration <= 0:
+            return None, None, None
+        if self.commits.keys() - self.sizes.keys():
+            return None, None, duration
+        bps = sum(self.sizes[digest] for digest in self.commits) / duration
+        tps = bps / self.size[0] if len(set(self.size)) == 1 and self.size[0] > 0 else None
         return tps, bps, duration
 
+    def _consensus_latency_samples(self):
+        # One proposal-to-rule-ready observation per distinct committed batch.
+        if self.commits.keys() - self.proposals.keys():
+            return []
+        samples = [ready - self.proposals[digest] for digest, ready in self.commits.items()]
+        return samples if all(delay >= 0 for delay in samples) else []
+
     def _consensus_latency(self):
-        latency = [c - self.proposals[d] for d, c in self.commits.items()]
-        return mean(latency) if latency else 0
+        samples = self._consensus_latency_samples()
+        return mean(samples) if samples else 0
 
     def _final_consensus_latency(self):
         latency = [
@@ -360,14 +425,7 @@ class LogParser:
         return mean(latency) if latency else 0
 
     def _end_to_end_throughput(self):
-        if not self.commits:
-            return 0, 0, 0
-        start, end = min(self.start), max(self.commits.values())
-        duration = end - start
-        bytes = sum(self.sizes.values())
-        bps = bytes / duration
-        tps = bps / self.size[0]
-        return tps, bps, duration
+        return self._throughput_since(self.start)
 
     def _end_to_end_latency(self):
         latency = []
@@ -436,7 +494,7 @@ class LogParser:
             'sample_completion_ratio': completed / sent_count if sent_count else None,
         }
 
-    def print_comparison(self, duration, filename='comparison.json'):
+    def print_comparison(self, duration, filename='comparison.json', *, verbose=True):
         from json import dump
 
         if self.measurement_plan is not None:
@@ -444,13 +502,16 @@ class LogParser:
             with open(filename, 'w', encoding='utf-8') as output:
                 dump(metrics, output, indent=2, allow_nan=False)
                 output.write('\n')
-            print(format_clock_metrics(metrics))
+            if verbose:
+                print(format_clock_metrics(metrics))
             return
         metrics = self.comparison_metrics(duration)
         metrics['measurement_stats'] = self.measurement_metrics(duration=duration)
         with open(filename, 'w') as output:
             dump(metrics, output, indent=2, allow_nan=False)
             output.write('\n')
+        if not verbose:
+            return
         print(format_measurements(metrics['measurement_stats']))
         display = lambda value: f'{value:,.1f}' if value is not None else 'N/A'
         print(
@@ -482,7 +543,7 @@ class LogParser:
         rule_order = [t - self.header_proposals[d] for d, t in self.rule_orders.items() if d in self.header_proposals]
         leader_times.sort()
         intervals = [b - a for a, b in zip(leader_times, leader_times[1:])]
-        avg = lambda values: mean(values) if values else 0
+        avg = lambda values: mean(values) if values and min(values) >= 0 else None
         return avg(leaders), avg(non_leaders), avg(all_headers), avg(intervals), avg(rule_order)
 
     def _commit_rule_ratios(self):
@@ -494,93 +555,109 @@ class LogParser:
             matches = lambda value: value[0] == rule and (outcome is None or value[1] == outcome)
             leaders = sum(matches(value) for value in self.commit_rules.values())
             blocks = sum(value[2] for value in self.commit_rules.values() if matches(value))
-            leader_ratios.append(100 * leaders / leader_total if leader_total else 0)
-            block_ratios.append(100 * blocks / block_total if block_total else 0)
+            leader_ratios.append(100 * leaders / leader_total if leader_total else None)
+            block_ratios.append(100 * blocks / block_total if block_total else None)
         return leader_ratios, block_ratios
 
     def result(self):
-        if self.measurement_plan is not None:
-            return ('\n-----------------------------------------\n SUMMARY:\n'
-                    '-----------------------------------------\n'
-                    f' Committee size: {self.committee_size} node(s)\n'
-                    f' Commit replicas included: {len(self.included_primary_ids)} node(s)\n'
-                    f' Input rate: {sum(self.rate):,} tx/s\n'
-                    f' Transaction size: {self.size[0]:,} B\n'
-                    + format_clock_metrics(self.clock_metrics())
-                    + '-----------------------------------------\n')
-        header_size = self.configs[0]['header_size']
-        max_header_delay = self.configs[0]['max_header_delay']
-        gc_depth = self.configs[0]['gc_depth']
-        sync_retry_delay = self.configs[0]['sync_retry_delay']
-        sync_retry_nodes = self.configs[0]['sync_retry_nodes']
-        batch_size = self.configs[0]['batch_size']
-        max_batch_delay = self.configs[0]['max_batch_delay']
+        from benchmark.measurements import _distribution
 
-        consensus_latency = self._consensus_latency() * 1_000
+        def display(value, digits=3):
+            return f'{value:,.{digits}f}' if value is not None else 'N/A'
+
+        def ids(values):
+            if values is None:
+                return 'unknown'
+            return ','.join(map(str, values)) or 'none'
+
+        consensus = _distribution(round(seconds * 1_000_000)
+                                  for seconds in self._consensus_latency_samples())
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
-        end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
-        end_to_end_latency = self._end_to_end_latency() * 1_000
-        measurements = self.measurement_metrics()
-        main_ms = measurements['pooled']['release_to_final']['mean_ms']
-        main_latency = f'{main_ms:,.3f}' if main_ms is not None else 'N/A'
-        leader_latency, non_leader_latency, all_header_latency, leader_interval, rule_order_latency = (x * 1_000 for x in self._header_latency_stats())
-        rule_leaders, rule_blocks = self._commit_rule_ratios()
-        aba_average = mean(self.aba_durations) if self.aba_durations else 0
-        aba_maximum = max(self.aba_durations) if self.aba_durations else 0
-        aba_minimum = min(self.aba_durations) if self.aba_durations else 0
+        clock_lines = []
+        if self.measurement_plan is None:
+            release = self.measurement_metrics()
+            e2e_tps, e2e_bps, duration = self._end_to_end_throughput()
+            e2e = release['pooled']['release_to_final']
+            e2e_mean, e2e_p50, e2e_p99 = e2e['mean_ms'], e2e['p50_ms'], e2e['p99_ms']
+        else:
+            clock = self.clock_metrics()
+            release, commit = clock['release_window'], clock['commit_window']
+            e2e_tps, e2e_bps = commit['mean_replica_final_tps'], commit['mean_replica_final_bps']
+            duration = commit['window_seconds']
+            e2e_mean = commit['mean_replica_release_to_final_ms']
+            e2e = commit['pooled_release_to_final']
+            e2e_p50 = e2e['p50_ms'] if e2e is not None else None
+            e2e_p99 = e2e['p99_ms'] if e2e is not None else None
+            plan = clock['plan']
+            clock_lines = [
+                f" Run ID: {clock['run_id']}",
+                f" Clocked measurement window: {duration:.3f} s; "
+                f"fixed drain {(plan['drain_end_us'] - plan['end_us']) / 1_000_000:.3f} s",
+                f" E2E evidence: {commit['status']} "
+                f"({commit['matched_samples']}/{commit['selected_samples']} matched samples)",
+            ]
 
-        return (
-            '\n'
-            '-----------------------------------------\n'
-            ' SUMMARY:\n'
-            '-----------------------------------------\n'
-            ' + CONFIG:\n'
-            f' Faults: {self.faults} node(s)\n'
-            f' Crashed authority IDs: {",".join(map(str, self.crashed_primary_ids)) or "none"}\n'
-            f' Committee size: {self.committee_size} node(s)\n'
-            f' Commit replicas included: {len(self.included_primary_ids)} node(s)\n'
-            f' Excluded A1 silent replica IDs: {",".join(map(str, self.excluded_primary_ids)) or "none"}\n'
-            f' Worker(s) per node: {self.workers} worker(s)\n'
-            f' Collocate primary and workers: {self.collocate}\n'
-            f' Input rate: {sum(self.rate):,} tx/s\n'
-            f' Transaction size: {self.size[0]:,} B\n'
-            f' Execution time: {round(duration):,} s\n'
-            '\n'
-            f' Header size: {header_size:,} B\n'
-            f' Max header delay: {max_header_delay:,} ms\n'
-            f' GC depth: {gc_depth:,} round(s)\n'
-            f' Sync retry delay: {sync_retry_delay:,} ms\n'
-            f' Sync retry nodes: {sync_retry_nodes:,} node(s)\n'
-            f' batch size: {batch_size:,} B\n'
-            f' Max batch delay: {max_batch_delay:,} ms\n'
-            '\n'
-            ' + RESULTS:\n'
-            f' Consensus TPS: {round(consensus_tps):,} tx/s\n'
-            f' Consensus BPS: {round(consensus_bps):,} B/s\n'
-            f' Consensus latency: {round(consensus_latency):,} ms\n'
-            f' Leader commit latency: {round(leader_latency):,} ms\n'
-            f' Non-leader commit latency: {round(non_leader_latency):,} ms\n'
-            f' All committed headers latency: {round(all_header_latency):,} ms\n'
-            f' Leader commit interval: {round(leader_interval):,} ms\n'
-            f' Non-leader rule-order latency: {round(rule_order_latency):,} ms\n'
-            f' Rule 1 leader ratio: {rule_leaders[0]:.2f}%\n'
-            f' Rule 2 leader ratio: {rule_leaders[1]:.2f}%\n'
-            f' Rule 3 commit leader ratio: {rule_leaders[2]:.2f}%\n'
-            f' Rule 3 skip leader ratio: {rule_leaders[3]:.2f}%\n'
-            f' Rule 1 block ratio: {rule_blocks[0]:.2f}%\n'
-            f' Rule 2 block ratio: {rule_blocks[1]:.2f}%\n'
-            f' Rule 3 block ratio: {rule_blocks[2]:.2f}%\n'
-            f' ABA average duration: {round(aba_average):,} ms\n'
-            f' ABA maximum duration: {round(aba_maximum):,} ms\n'
-            f' ABA minimum duration: {round(aba_minimum):,} ms\n'
-            '\n'
-            f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
-            f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
-            f' Legacy send-based latency: {round(end_to_end_latency):,} ms\n'
-            f' End-to-end latency: {main_latency} ms\n'
-            + format_measurements(measurements)
-            + '-----------------------------------------\n'
-        )
+        config = self.configs[0]
+        headers = self._header_latency_stats()
+        rule_leaders, rule_blocks = self._commit_rule_ratios()
+        lines = [
+            '', '-----------------------------------------', ' SUMMARY:',
+            '-----------------------------------------', ' + CONFIG:',
+            f' Faults: {self.faults} node(s)',
+            f' Adversary mode: {self.adversary_mode}',
+            f" Byzantine authority IDs: {self.byzantine_ids if self.byzantine_ids is not None else 'unknown'}",
+            f' Crashed authority IDs: {ids(self.crashed_primary_ids)}',
+            f' Committee size: {self.committee_size} node(s)',
+            f' Commit replicas included: {len(self.included_primary_ids)} node(s)',
+            f' Excluded A1 silent replica IDs: {ids(self.excluded_primary_ids)}',
+            f' Worker(s) per node: {self.workers} worker(s)',
+            f' Collocate primary and workers: {self.collocate}',
+            f' Input rate: {sum(self.rate):,} tx/s',
+            f' Transaction size: {self.size[0]:,} B',
+            f' Execution time: {duration:g} s' if duration is not None else ' Execution time: N/A s',
+            *clock_lines, '',
+            f" Header size: {config['header_size']:,} B",
+            f" Max header delay: {config['max_header_delay']:,} ms",
+            f" GC depth: {config['gc_depth']:,} round(s)",
+            f" Sync retry delay: {config['sync_retry_delay']:,} ms",
+            f" Sync retry nodes: {config['sync_retry_nodes']:,} node(s)",
+            f" batch size: {config['batch_size']:,} B",
+            f" Max batch delay: {config['max_batch_delay']:,} ms",
+            '', ' + RESULTS:',
+            f' Consensus TPS: {display(consensus_tps)} tx/s',
+            f' Consensus BPS: {display(consensus_bps)} B/s',
+            f" Consensus latency: {display(consensus['mean_ms'])} ms",
+            f" Consensus latency P50: {display(consensus['p50_ms'])} ms",
+            f" Consensus latency P99: {display(consensus['p99_ms'])} ms",
+        ]
+        for label, seconds in zip(('Leader commit latency', 'Non-leader commit latency',
+                                   'All committed headers latency', 'Leader commit interval',
+                                   'Non-leader rule-order latency'), headers):
+            lines.append(f' {label}: {display(seconds * 1000 if seconds is not None else None)} ms')
+        for label, percentage in zip(('Rule 1 leader', 'Rule 2 leader', 'Rule 3 commit leader',
+                                      'Rule 3 skip leader'), rule_leaders):
+            lines.append(f' {label} ratio: {display(percentage, 2)}%')
+        for rule, percentage in enumerate(rule_blocks[:3], start=1):
+            lines.append(f' Rule {rule} block ratio: {display(percentage, 2)}%')
+        for label, reducer in (('average', mean), ('maximum', max), ('minimum', min)):
+            duration_ms = reducer(self.aba_durations) if self.aba_durations else None
+            lines.append(f' ABA {label} duration: {display(duration_ms, 0)} ms')
+        traffic = release['aba_committee']
+        for label, prefix in (('ABA mean send rate per committee node', 'mean'),
+                              ('ABA total send rate', 'total')):
+            sent = traffic[f'{prefix}_sent_bytes_per_second']
+            equivalent = traffic[f'{prefix}_equivalent_tx_per_second']
+            lines.append(f' {label}: {display(sent)} B/s ({display(equivalent)} tx/s equivalent)')
+        lines.extend([
+            '',
+            f' End-to-end TPS: {display(e2e_tps)} tx/s',
+            f' End-to-end BPS: {display(e2e_bps)} B/s',
+            f' End-to-end latency: {display(e2e_mean)} ms',
+            f' End-to-end latency P50: {display(e2e_p50)} ms',
+            f' End-to-end latency P99: {display(e2e_p99)} ms',
+            '-----------------------------------------', '',
+        ])
+        return '\n'.join(lines)
 
     def print(self, filename):
         assert isinstance(filename, str)
@@ -614,12 +691,14 @@ class LogParser:
             primary_ids.append(int(match.group(1)))
         population_path = Path(directory) / 'measurement-population.json'
         excluded = []
+        mode_options = adversary
         try:
             crash = crash_population(directory, primary_ids, adversary, committee_size)
         except (OSError, ValueError, TypeError, KeyError) as error:
             raise ParseError(f'Invalid crash population: {error}') from error
         if crash is not None:
-            pass
+            mode_options = dict(mode='silent', byzantine_ids=crash['crashed_primary_ids'])
+            faults = len(crash['crashed_primary_ids'])
         elif adversary is not None:
             if str(adversary.get('mode', '')).lower() in ('silent', 'a1'):
                 excluded = adversary['byzantine_ids']
@@ -632,8 +711,30 @@ class LogParser:
                 excluded = population['excluded_primary_ids']
                 if not isinstance(excluded, list):
                     raise ValueError('Saved exclusions must be a list of launch IDs')
+                mode_options = population.get('adversary')
+                if mode_options is None and excluded:
+                    mode_options = dict(mode='silent', byzantine_ids=excluded)
+                if faults == '?' and sorted(primary_ids) == list(range(len(primary_ids))):
+                    # A v1 manifest was written only for explicit runtime
+                    # modes. Orca required faults=0 and launched all primaries.
+                    faults = population.get('faults', 0)
             except (OSError, ValueError, TypeError, KeyError) as error:
                 raise ParseError(f'Invalid measurement population: {error}') from error
+
+        mode, ids = None, None
+        if mode_options is not None:
+            if not isinstance(mode_options, dict):
+                raise ParseError('Invalid adversary configuration')
+            mode = MODES.get(str(mode_options.get('mode', '')).lower())
+            ids = mode_options.get('byzantine_ids')
+            launch_ids = set(primary_ids) if crash is None else set(range(crash['committee_size']))
+            if (mode is None or not isinstance(ids, list)
+                    or any(type(i) is not int or i not in launch_ids for i in ids)
+                    or len(set(ids)) != len(ids) or (mode == 'none' and ids)):
+                raise ParseError('Invalid adversary mode or Byzantine launch IDs')
+            if crash is None and set(excluded) != (set(ids) if mode == 'silent' else set()):
+                raise ParseError('Adversary does not match the saved replica exclusions')
+            ids = sorted(ids)
 
         client_files = sorted(glob(join(directory, 'client-*.log')))
         worker_files = sorted(glob(join(directory, 'worker-*.log')))
@@ -661,25 +762,28 @@ class LogParser:
             raise ParseError('Clocked client logs require measurement-window.json')
         result = cls(clients, primaries, workers, faults=faults,
                      primary_ids=primary_ids, excluded_primary_ids=excluded)
+        if mode is None and population_path.exists():
+            mode, ids = _logged_runtime_adversary(primaries)
+        if mode is not None:
+            label = {'none': 'A0', 'silent': 'A1', 'targeted': 'A3', 'network': 'A5'}[mode]
+            result.adversary_mode = f'{label} ({mode})'
+            result.byzantine_ids = ids
         result.measurements.source_logs = [
             {'client': c, 'worker': w} for c, w in zip(client_files, worker_files)
         ]
         result.measurements.replica_logs = [path for ident, path in zip(primary_ids, primary_files)
                                            if ident not in result.excluded_primary_ids]
         result.measurement_plan = plan
-        if plan is not None:
-            result.clock_metrics()  # Reject missing or inconsistent run evidence before reporting.
-        if adversary is not None and crash is None:
-            population = dict(schema_version=1, primary_ids=primary_ids,
-                              excluded_primary_ids=result.excluded_primary_ids)
-            temporary = population_path.with_suffix('.json.tmp')
-            temporary.write_text(json.dumps(population, indent=2) + '\n', encoding='utf-8')
-            temporary.replace(population_path)
         if crash is not None:
             result.crashed_primary_ids = crash['crashed_primary_ids']
             result.committee_size = crash['committee_size']
-            result.faults = len(crash['crashed_primary_ids'])
-            temporary = Path(directory) / 'measurement-population.json.tmp'
-            temporary.write_text(json.dumps(crash, indent=2) + '\n', encoding='utf-8')
-            temporary.replace(Path(directory) / 'measurement-population.json')
+        if plan is not None:
+            result.clock_metrics()  # Reject missing or inconsistent run evidence before reporting.
+        if adversary is not None:
+            population = crash or dict(schema_version=1, primary_ids=primary_ids,
+                                       excluded_primary_ids=result.excluded_primary_ids, faults=faults,
+                                       adversary=dict(mode=mode, byzantine_ids=ids))
+            temporary = population_path.with_suffix('.json.tmp')
+            temporary.write_text(json.dumps(population, indent=2) + '\n', encoding='utf-8')
+            temporary.replace(population_path)
         return result

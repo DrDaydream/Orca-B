@@ -288,7 +288,7 @@ class LaunchIntegrationTests(unittest.TestCase):
         bench._background_run = lambda host, command, log: commands.append(command)
         bench._logs = lambda *args, **kwargs: SimpleNamespace(
             result=lambda: '', print=lambda *args: None,
-            print_comparison=lambda *args: None,
+            print_comparison=lambda duration, filename, *, verbose: None,
         )
         with TemporaryDirectory() as directory:
             with patch('benchmark.remote.PathMaker.results_path', return_value=directory), \

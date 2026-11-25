@@ -53,6 +53,11 @@ def _samples(log, kind):
     return result
 
 
+def aba_counter_samples(log):
+    return [tuple(map(int, values)) for values in re.findall(
+        r'Benchmark ABA bytes at_us (\d+) elapsed_us (\d+) sent (\d+) received (\d+)', log)]
+
+
 def _distribution(values):
     ordered = sorted(values)
     n = len(ordered)
@@ -119,9 +124,7 @@ class Measurements:
                 commits[batch] = min(commits.get(batch, stamp), stamp)
             self.final.append(commits)
             self.last_log_us = max(self.last_log_us, max(commits.values(), default=0))
-            self.aba.append([tuple(map(int, values)) for values in re.findall(
-                r'Benchmark ABA bytes at_us (\d+) elapsed_us (\d+) sent (\d+) received (\d+)',
-                primary)])
+            self.aba.append(aba_counter_samples(primary))
             self.last_log_us = max(self.last_log_us, max((s[0] for s in self.aba[-1]), default=0))
 
     def metrics(self, duration=None, warmup=0, drain=0):
@@ -235,6 +238,7 @@ class Measurements:
         if any(size % tx_size for size in batch_sizes.values()):
             raise ValueError('Batch bytes are not a whole number of fixed-size transactions')
         replicas = []
+        pooled_release_to_final = []
         for replica, all_final in enumerate(finals):
             final = {batch: at for batch, at in all_final.items() if start <= at < end}
             values, selected, missing_release, missing_ingress, invalid = [], 0, 0, 0, 0
@@ -255,6 +259,7 @@ class Measurements:
                         invalid += 1
                         continue
                     values.append(committed - released)
+            pooled_release_to_final.extend(values)
             byte_count = sum(batch_sizes[batch] for batch in final)
             complete = (bool(values) and not (missing_release or missing_ingress or invalid)
                         and release['instrumented_source_pairs'] == len(self.sources))
@@ -274,6 +279,8 @@ class Measurements:
         complete = bool(replicas) and all(row['coverage_complete'] for row in replicas)
         throughput_complete = bool(replicas) and all(row['throughput_coverage_complete'] for row in replicas)
         matched = sum(row['matched_samples'] for row in replicas)
+        selected = sum(row['selected_samples'] for row in replicas)
+        pooled_complete = bool(matched) and matched == selected and release['status'] == 'available'
         commit = {
             'window_basis': 'planned_final_commit_window',
             'window_start_us': start, 'window_end_us': end, 'window_seconds': seconds,
@@ -281,11 +288,12 @@ class Measurements:
             'coverage_basis': 'selected transaction-replica samples have release, ingress, final and batch bytes; process uptime is verified by the runner',
             'expected_replicas': len(replicas),
             'replicas_with_samples': sum(row['matched_samples'] > 0 for row in replicas),
-            'selected_samples': sum(row['selected_samples'] for row in replicas),
+            'selected_samples': selected,
             'matched_samples': matched, 'coverage_complete': complete,
             'throughput_coverage_complete': throughput_complete,
             'status': 'available' if complete else 'partial' if matched else 'unavailable',
             'mean_replica_release_to_final_ms': mean(row['release_to_final']['mean_ms'] for row in replicas) if complete else None,
+            'pooled_release_to_final': _distribution(pooled_release_to_final) if pooled_complete else None,
             'mean_replica_final_tps': mean(row['final_tps'] for row in replicas) if throughput_complete else None,
             'mean_replica_final_bps': mean(row['final_bps'] for row in replicas) if throughput_complete else None,
             'replicas': replicas,
@@ -394,12 +402,16 @@ class Measurements:
         return clocks, sources, batch_sizes, finals
 
     def _aba_metrics(self, start, end):
-        if not any(self.aba):
+        return self.aba_metrics(self.aba, self.replica_logs, start, end)
+
+    @staticmethod
+    def aba_metrics(counters, replica_logs, start, end):
+        if not any(counters):
             return None
         replicas = []
-        for replica, samples in enumerate(self.aba):
+        for replica, samples in enumerate(counters):
             row = {
-                'replica': replica, 'replica_log': self.replica_logs[replica],
+                'replica': replica, 'replica_log': replica_logs[replica],
                 'status': 'insufficient_samples',
                 'window_start_us': None, 'window_end_us': None, 'window_seconds': None,
                 'sent_bytes': None, 'received_bytes': None,

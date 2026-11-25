@@ -874,6 +874,7 @@ class Bench:
                         logger.print_comparison(
                             bench_parameters.duration,
                             f'{result_file[:-4]}-run-{i + 1}.comparison.json',
+                            verbose=False,
                         )
                     except (OSError, subprocess.SubprocessError, GroupException,
                             Failure, SSHException, ExecutionError, ParseError) as e:

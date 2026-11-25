@@ -61,7 +61,7 @@ def local(ctx, debug=False, nodes=None, workers=None, rate=None, tx_size=None,
     try:
         ret = LocalBench(bench_params, node_params).run(debug)
         print(ret.result())
-        ret.print_comparison(bench_params['duration'], 'logs/comparison.json')
+        ret.print_comparison(bench_params['duration'], 'logs/comparison.json', verbose=False)
     except BenchError as e:
         Print.error(e)
         raise
