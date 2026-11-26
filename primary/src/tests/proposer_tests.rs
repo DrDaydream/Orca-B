@@ -1,6 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crate::common::{committee, keys};
+use std::collections::BTreeMap;
 use tokio::sync::mpsc::channel;
 
 #[tokio::test]
@@ -152,4 +153,47 @@ async fn payload_budget_keeps_remaining_batches_for_the_next_round() {
     assert_eq!(two.round, 2);
     assert_eq!(two.payload.len(), 1);
     assert!(two.payload.contains_key(&second));
+}
+
+#[tokio::test]
+async fn payload_budget_allows_fourteen_full_batches_within_wire_limit() {
+    const FULL_BATCH_BYTES: usize = 508_052;
+    const BATCH_COUNT: usize = 14;
+
+    let (name, secret) = keys().pop().unwrap();
+    let (_tx_parents, rx_parents) = channel(1);
+    let (tx_batches, rx_batches) = channel(BATCH_COUNT);
+    let (tx_headers, mut rx_headers) = channel(1);
+    let mut batches = BTreeMap::new();
+
+    Proposer::spawn(
+        name,
+        &committee(),
+        SignatureService::new(secret),
+        BATCH_COUNT * 32,
+        1_000_000,
+        rx_parents,
+        rx_batches,
+        tx_headers,
+    );
+
+    for id in 0..BATCH_COUNT {
+        let mut bytes = vec![0; FULL_BATCH_BYTES];
+        bytes[0] = id as u8;
+        let digest = crate::messages::batch_digest(&bytes);
+        tx_batches
+            .send((digest.clone(), 0, bytes.len()))
+            .await
+            .unwrap();
+        batches.insert(digest, bytes);
+    }
+
+    let header = tokio::time::timeout(Duration::from_secs(2), rx_headers.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(header.payload.len(), BATCH_COUNT);
+
+    let proposal = crate::messages::Proposal { header, batches };
+    assert!(proposal.verify(&committee()).is_ok());
 }

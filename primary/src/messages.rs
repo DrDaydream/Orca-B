@@ -221,7 +221,7 @@ impl fmt::Display for Header {
 }
 
 /// Bound the data portion so a complete proposal fits the network frame limit.
-pub const MAX_PROPOSAL_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PROPOSAL_BYTES: usize = 7_200_000;
 /// Leave room for the message tag below the transport's 8 MiB frame limit.
 pub const MAX_PROPOSAL_WIRE_BYTES: u64 = 7 * 1024 * 1024;
 

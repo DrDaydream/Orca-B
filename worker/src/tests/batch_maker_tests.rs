@@ -97,7 +97,7 @@ async fn full_batches_fit_propose_and_preserve_transactions_across_splits() {
         rx_silent,
         tx_message,
     );
-    let transaction = vec![1; 3 * 1024 * 1024];
+    let transaction = vec![1; primary::MAX_PROPOSAL_BYTES / 2 + 1];
     tx_transaction.send(transaction.clone()).await.unwrap();
     tx_transaction.send(transaction.clone()).await.unwrap();
     for _ in 0..2 {
