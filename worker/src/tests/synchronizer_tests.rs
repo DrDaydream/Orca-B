@@ -28,6 +28,7 @@ async fn synchronize() {
         /* sync_retry_delay */ 1_000_000, // Ensure it is not triggered.
         /* sync_retry_nodes */ 3, // Not used in this test.
         rx_message,
+        channel(1).0,
     );
 
     // Spawn a listener to receive our batch requests.
@@ -44,4 +45,34 @@ async fn synchronize() {
 
     // Ensure the target receives the sync request.
     assert!(handle.await.is_ok());
+}
+
+#[tokio::test]
+async fn a_worker_with_an_existing_batch_restores_the_primary_receipt() {
+    let (name, _) = keys().pop().unwrap();
+    let c = committee_with_base_port(9200);
+    let mut store = Store::new(&format!(
+        ".db_test_existing_worker_batch_{}",
+        std::process::id()
+    ))
+    .unwrap();
+    let digest = batch_digest();
+    store
+        .write(digest.to_vec(), crate::common::serialized_batch())
+        .await;
+    let (tx, rx) = channel(4);
+    let (notices, mut received) = channel(4);
+    Synchronizer::spawn(name, 0, c, store, 50, 1000, 3, rx, notices);
+    tx.send(PrimaryWorkerMessage::Synchronize(
+        vec![digest.clone()],
+        keys()[0].0,
+    ))
+    .await
+    .unwrap();
+    let bytes = tokio::time::timeout(Duration::from_secs(2), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(bincode::deserialize(&bytes).unwrap(),
+        WorkerPrimaryMessage::OthersBatch(found, 0) if found == digest));
 }

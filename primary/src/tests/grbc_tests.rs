@@ -69,20 +69,19 @@ fn signatures_bind_phase_sender_instance_and_header() {
 }
 
 #[test]
-fn proposal_requires_exact_payload_and_fixed_dag_metadata() {
+fn proposal_signature_binds_batch_digests_worker_ids_and_dag_edges() {
     let mut p = proposal();
     let bytes = bincode::serialize(&(0u32, vec![vec![42u8; 32]])).unwrap();
     let digest = batch_digest(&bytes);
     p.header.payload.insert(digest.clone(), 0);
-    p.batches.insert(digest.clone(), bytes);
     p.header.id = p.header.digest();
     p.header.signature = Signature::new(&p.header.id, &keys().pop().unwrap().1);
     p.verify(&committee()).unwrap();
     let mut missing = p.clone();
-    missing.batches.clear();
+    missing.header.payload.clear();
     assert!(missing.verify(&committee()).is_err());
     let mut changed = p.clone();
-    changed.batches.get_mut(&digest).unwrap()[0] ^= 1;
+    changed.header.payload.insert(digest, 1);
     assert!(changed.verify(&committee()).is_err());
     p.header.parents.clear();
     assert!(p.verify(&committee()).is_err());

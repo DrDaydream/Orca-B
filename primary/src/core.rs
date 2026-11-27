@@ -84,7 +84,7 @@ pub struct Core {
     /// The authors of the last voted headers.
     last_voted: HashMap<Round, HashSet<PublicKey>>,
     votes_aggregators: HashMap<Digest, GrbcVotesAggregator>,
-    /// Metadata of complete proposals; payload bytes live only in batch storage.
+    /// Authenticated headers whose payload is available on our workers.
     proposal_headers: HashMap<Digest, Header>,
     validated: HashSet<Digest>,
     last_ready: HashMap<Round, HashSet<PublicKey>>,
@@ -181,11 +181,10 @@ impl Core {
 
     #[cfg(test)]
     async fn process_proposal(&mut self, proposal: Proposal) -> DagResult<()> {
-        let (header, _) = crate::proposal_processor::prepare_proposal(
+        let header = crate::proposal_processor::prepare_proposal(
             proposal,
             self.committee.clone(),
             &mut self.store,
-            None,
             None,
         )
         .await?;
@@ -238,7 +237,7 @@ impl Core {
                 .get(&header.round)
                 .map_or(true, |id| id == &header.id)
         {
-            // Our proposer already authenticated and stored the complete value.
+            // Our worker quorum and local storage already confirmed this proposal.
             // Deliver it locally now, while continuing ECHO/READY for peers.
             let block = Certificate {
                 header: header.clone(),
@@ -536,7 +535,7 @@ impl Core {
         }
         // Experimental no-wait path: parent availability and parent metadata
         // validation do not gate ECHO, READY or FINISH. The signed proposal
-        // and its own complete payload were verified by ProposalProcessor.
+        // was authenticated and its payload confirmed by our workers.
         self.validated.insert(header.id.clone());
         if self
             .last_voted
@@ -586,7 +585,7 @@ impl Core {
                 std::collections::hash_map::Entry::Occupied(_) => false,
             };
             if first && !self.in_flight.contains(&digest) {
-                // A correct voter already has the complete proposal. Try it
+                // A correct voter already has the authenticated header. Try it
                 // first; the existing retry path still queries every peer.
                 self.request_proposal(digest, vote.round, Some(vote.author))
                     .await;

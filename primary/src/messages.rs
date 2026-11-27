@@ -220,17 +220,22 @@ impl fmt::Display for Header {
     }
 }
 
-/// Bound the data portion so a complete proposal fits the network frame limit.
-pub const MAX_PROPOSAL_BYTES: usize = 7_200_000;
-/// Leave room for the message tag below the transport's 8 MiB frame limit.
+/// Maximum digest proposal frame, including the primary message tag.
 pub const MAX_PROPOSAL_WIRE_BYTES: u64 = 7 * 1024 * 1024;
 
+#[cfg(test)]
 pub fn batch_digest(bytes: &[u8]) -> Digest {
     Digest(Sha512::digest(bytes).as_slice()[..32].try_into().unwrap())
 }
 
-pub fn batch_key(digest: &Digest) -> Vec<u8> {
-    [b"orca-batch-v2/".as_ref(), digest.as_ref()].concat()
+/// Receipts identify the actual worker that retained these bytes.
+pub fn worker_batch_key(digest: &Digest, worker: WorkerId) -> Vec<u8> {
+    [
+        b"orca-worker-batch-v1/".as_ref(),
+        digest.as_ref(),
+        &worker.to_le_bytes(),
+    ]
+    .concat()
 }
 
 #[cfg(test)] // Retired storage key, used only to check compatibility in tests.
@@ -238,10 +243,9 @@ pub fn grade_one_key(digest: &Digest) -> Vec<u8> {
     [b"orca-ready-v2/".as_ref(), digest.as_ref()].concat()
 }
 
-/// A signed Header published only after its complete payload is retained.
-/// A distinct prefix avoids interpreting legacy full proposals as headers.
+/// An authenticated header whose batch digests were confirmed by local workers.
 pub fn proposal_header_key(digest: &Digest) -> Vec<u8> {
-    [b"orca-proposal-header-v3/".as_ref(), digest.as_ref()].concat()
+    [b"orca-proposal-header-v4/".as_ref(), digest.as_ref()].concat()
 }
 
 pub fn local_votes_key(digest: &Digest) -> Vec<u8> {
@@ -251,30 +255,15 @@ pub fn local_votes_key(digest: &Digest) -> Vec<u8> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Proposal {
     pub header: Header,
-    #[serde(with = "crate::batch_bytes")]
-    pub batches: BTreeMap<Digest, Vec<u8>>,
 }
 
 impl Proposal {
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
         self.header.verify(committee)?;
         ensure!(
-            bincode::serialized_size(self)? <= MAX_PROPOSAL_WIRE_BYTES,
+            bincode::serialized_size(self)? + 4 <= MAX_PROPOSAL_WIRE_BYTES,
             DagError::MalformedHeader(self.header.id.clone())
         );
-        ensure!(
-            self.batches.len() == self.header.payload.len()
-                && self.batches.values().map(Vec::len).sum::<usize>() <= MAX_PROPOSAL_BYTES,
-            DagError::MalformedHeader(self.header.id.clone())
-        );
-        for digest in self.header.payload.keys() {
-            ensure!(
-                self.batches
-                    .get(digest)
-                    .map_or(false, |bytes| batch_digest(bytes) == *digest),
-                DagError::MalformedHeader(self.header.id.clone())
-            );
-        }
         Ok(())
     }
 

@@ -1,8 +1,8 @@
 # Orca-B
 
-Orca-B is a research implementation of a DAG-based consensus protocol built on Narwhal. Workers collect transactions into batches and primaries propose them using graded reliable broadcast (GRBC). Orca-B combines the Good, Deferred and Fallback leader rules with asynchronous binary agreement (ABA) for recovery. The protocol is written in Rust. The Python benchmark uses Fabric to run a whole committee on one machine.
+Orca-B is a research implementation of a DAG-based consensus protocol built on Narwhal. Workers broadcast transaction batches to peer workers. After a stake quorum acknowledges a batch, its author forwards the digest and worker ID to its primary. GRBC proposals and proposal-repair replies carry the signed header with these references. A receiver waits for its local workers to store any missing batches before it can ECHO. Pending batch recovery allows other available proposals to progress. Orca-B combines the Good, Deferred and Fallback leader rules with asynchronous binary agreement (ABA) for recovery. The protocol is written in Rust. The Python benchmark uses Fabric to run a whole committee on one machine.
 
-This guide covers the `adversary-experiments` branch on Ubuntu 24.04 x86-64. The repository enables SSE4.2 and PCLMUL for this build. [Narwhal and Tusk paper](https://arxiv.org/abs/2105.11827)
+Deploy matching primary and worker binaries throughout the committee. This digest proposal format changes the wire protocol. The commands below target Ubuntu 24.04 x86-64. The repository enables SSE4.2 and PCLMUL for this build. [Narwhal and Tusk paper](https://arxiv.org/abs/2105.11827)
 
 ## Quick start
 

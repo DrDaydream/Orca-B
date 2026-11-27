@@ -51,7 +51,7 @@ impl Helper {
 
     async fn run(&mut self) {
         while let Some(request) = self.rx_primaries.recv().await {
-            let (digests, origin, include_payload) = match request {
+            let (digests, origin, include_header) = match request {
                 RepairRequest::Proposals(digests, origin) => (digests, origin, true),
                 RepairRequest::Votes(digests, origin) => (digests, origin, false),
             };
@@ -68,7 +68,7 @@ impl Helper {
 
             // Reply to the request (the best we can).
             for digest in digests {
-                // Queue saved votes before reading or serializing the full payload.
+                // Queue saved votes before reading or serializing the signed header.
                 if let Some(data) = self
                     .store
                     .read(local_votes_key(&digest))
@@ -86,7 +86,7 @@ impl Helper {
                         .await
                         .expect("Failed to enqueue repair votes");
                 }
-                if !include_payload {
+                if !include_header {
                     continue;
                 }
                 match load_proposal(&mut self.store, &digest).await {

@@ -3,7 +3,7 @@ use crate::common::{committee, keys, proposal};
 use crate::messages::{batch_digest, local_votes_key, GrbcPhase};
 use crate::primary::PrimaryMessage;
 use bytes::Bytes;
-use crypto::Signature;
+use crypto::{Hash as _, Signature};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::channel;
@@ -23,7 +23,6 @@ fn with_payload() -> Proposal {
     for bytes in [vec![7; 1024 * 1024], vec![9; 128 * 1024]] {
         let digest = batch_digest(&bytes);
         p.header.payload.insert(digest.clone(), 0);
-        p.batches.insert(digest, bytes);
     }
     p.header.id = p.header.digest();
     p.header.signature = Signature::new(&p.header.id, &keys().pop().unwrap().1);
@@ -56,38 +55,29 @@ async fn local_proposal_broadcast_does_not_wait_for_storage_but_delivery_does() 
         Arc::new(AtomicU64::new(0)),
         50,
         rx_remote,
+        channel(1).1,
+        1000,
         rx_local,
         tx_stored,
         tracker.clone(),
     );
     tx_local.send(p.header.clone()).await.unwrap();
 
-    // Serve the already sealed local batches, then hold the atomic write ACK.
-    let ack = loop {
-        match timeout(Duration::from_secs(5), rx_store.recv())
-            .await
-            .unwrap()
-            .unwrap()
-        {
-            StoreCommand::Read(key, response) => {
-                let bytes = p
-                    .batches
-                    .iter()
-                    .find(|(d, _)| batch_key(d) == key)
-                    .unwrap()
-                    .1;
-                response.send(Ok(Some(bytes.clone()))).unwrap();
-            }
-            StoreCommand::WriteBatchIfAbsent(entries, response) => {
-                assert_eq!(entries.len(), p.batches.len() + 1);
-                assert_eq!(
-                    entries[&proposal_header_key(&p.block().digest())],
-                    bincode::serialize(&p.header).unwrap()
-                );
-                break response;
-            }
-            _ => panic!("Unexpected storage operation"),
+    // The primary writes just its signed header. Hold the durable write acknowledgement.
+    let ack = match timeout(Duration::from_secs(5), rx_store.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        StoreCommand::WriteBatchIfAbsent(entries, ack) => {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                entries[&proposal_header_key(&p.block().digest())],
+                bincode::serialize(&p.header).unwrap()
+            );
+            ack
         }
+        _ => panic!("Local proposal attempted to read transaction bytes"),
     };
     let (socket, _) = timeout(Duration::from_secs(2), listener.accept())
         .await
@@ -109,7 +99,7 @@ async fn local_proposal_broadcast_does_not_wait_for_storage_but_delivery_does() 
         "Core must not ECHO before storage succeeds"
     );
     assert!(tracker.contains(&p.block().digest()));
-    ack.send(Ok(p.batches.len() + 1)).unwrap();
+    ack.send(Ok(1)).unwrap();
     let stored = timeout(Duration::from_secs(2), rx_stored.recv())
         .await
         .unwrap()
@@ -223,7 +213,7 @@ async fn runtime_review_two_local_rounds_progress_while_peer_enqueue_is_saturate
                 _ => panic!("Unexpected storage operation"),
             };
             assert!(rx_stored.try_recv().is_err());
-            ack.send(Ok(3)).unwrap();
+            ack.send(Ok(1)).unwrap();
             assert_eq!(rx_stored.recv().await.unwrap().into_header(), header);
         }
     };
@@ -345,12 +335,12 @@ async fn local_proposal_storage_failure_returns_while_peer_enqueue_is_saturated(
 }
 
 #[tokio::test]
-async fn local_proposal_rejects_invalid_bytes_before_storage_or_publication() {
+async fn local_proposal_rejects_invalid_signature_before_storage_or_publication() {
     use crate::proposal_processor::{prepare_local_proposal, ProposalTracker};
     use network::ReliableSender;
 
     let mut p = with_payload();
-    p.batches.values_mut().next().unwrap()[0] ^= 1;
+    p.header.signature = Signature::default();
     let digest = p.block().digest();
     let tracker = ProposalTracker::default();
     let guard = tracker.track(&p.header);
@@ -413,23 +403,15 @@ async fn local_proposal_failed_storage_does_not_publish() {
 #[tokio::test]
 async fn failed_proposal_storage_does_not_deliver_header_and_releases_tracker() {
     use crate::proposal_processor::{prepare_proposal, ProposalTracker};
-    use network::ReliableSender;
     use store::StoreCommand;
 
-    let p = with_payload();
+    let p = proposal();
     let digest = p.block().digest();
     let tracker = ProposalTracker::default();
     let guard = tracker.track(&p.header);
     let (tx_store, mut rx_store) = channel(1);
     let mut store = Store::from_channel(tx_store);
-    let mut network = ReliableSender::new();
-    let prepare = prepare_proposal(
-        p,
-        committee(),
-        &mut store,
-        Some((&mut network, Vec::new())),
-        Some(guard),
-    );
+    let prepare = prepare_proposal(p, committee(), &mut store, Some(guard));
     let fail_write = async {
         match rx_store.recv().await.unwrap() {
             StoreCommand::WriteBatchIfAbsent(_, ack) => {
@@ -447,169 +429,45 @@ async fn failed_proposal_storage_does_not_deliver_header_and_releases_tracker() 
 }
 
 #[test]
-fn complete_proposal_decoding_reads_payloads_in_bulk() {
-    struct CountingReader<'a> {
-        bytes: &'a [u8],
-        calls: usize,
-    }
-    impl std::io::Read for CountingReader<'_> {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            self.calls += 1;
-            std::io::Read::read(&mut self.bytes, buffer)
-        }
-    }
+fn digest_proposal_wire_matches_header_and_rejects_legacy_inline_or_truncated_frames() {
     let p = with_payload();
-    let wire = bincode::serialize(&p).unwrap();
-    let mut reader = CountingReader {
-        bytes: &wire,
-        calls: 0,
-    };
-    let decoded: Proposal = bincode::deserialize_from(&mut reader).unwrap();
-    assert_eq!(decoded.header, p.header);
-    assert_eq!(decoded.batches, p.batches);
-    assert!(reader.bytes.is_empty());
-    assert!(
-        reader.calls < 1024,
-        "Payload decoding must not perform one read per byte; used {} reads",
-        reader.calls
-    );
-}
-
-#[test]
-fn complete_proposal_codec_preserves_legacy_bytes_and_rejects_truncation() {
-    #[derive(serde::Serialize, serde::Deserialize)]
-    struct LegacyProposal {
-        header: Header,
-        batches: std::collections::BTreeMap<Digest, Vec<u8>>,
-    }
-    for p in [proposal(), with_payload()] {
-        let legacy = LegacyProposal {
-            header: p.header.clone(),
-            batches: p.batches.clone(),
-        };
-        let wire = bincode::serialize(&legacy).unwrap();
-        assert_eq!(bincode::serialize(&p).unwrap(), wire);
-        assert_eq!(bincode::serialized_size(&p).unwrap(), wire.len() as u64);
-        let decoded: Proposal = bincode::deserialize(&wire).unwrap();
-        assert_eq!(decoded.header, p.header);
-        assert_eq!(decoded.batches, p.batches);
-        let restored: LegacyProposal =
-            bincode::deserialize(&bincode::serialize(&p).unwrap()).unwrap();
-        assert_eq!(restored.header, p.header);
-        assert_eq!(restored.batches, p.batches);
-        assert!(bincode::deserialize::<Proposal>(&wire[..wire.len() - 1]).is_err());
-    }
-}
-
-#[test]
-fn complete_proposal_codec_preserves_duplicate_key_resolution() {
-    // A malformed map can repeat a digest: retain BTreeMap's last-value behavior.
-    let mut wire = bincode::serialize(&Header::default()).unwrap();
-    wire.extend_from_slice(&2u64.to_le_bytes());
-    let digest = Digest([7; 32]);
-    for bytes in [vec![1u8; 16], vec![2u8; 32]] {
-        wire.extend_from_slice(&bincode::serialize(&(digest.clone(), bytes)).unwrap());
-    }
-    let decoded: Proposal = bincode::deserialize(&wire).unwrap();
-    assert_eq!(decoded.batches.len(), 1);
-    assert_eq!(decoded.batches[&digest], vec![2u8; 32]);
-}
-
-#[test]
-fn complete_proposal_slice_decoder_rejects_an_impossible_payload_length() {
-    // Construct the existing layout up to the first batch length. The frame
-    // contains no payload bytes; decoding must fail before allocating the claim.
-    let mut wire = bincode::serialize(&Header::default()).unwrap();
-    wire.extend_from_slice(&1u64.to_le_bytes());
-    wire.extend_from_slice(&bincode::serialize(&Digest([0; 32])).unwrap());
-    wire.extend_from_slice(&u64::MAX.to_le_bytes());
-    assert!(bincode::deserialize::<Proposal>(&wire).is_err());
+    let message = bincode::serialize(&PrimaryMessage::Proposal(p.clone())).unwrap();
+    assert_eq!(&message[4..], &bincode::serialize(&p.header).unwrap()[..]);
+    assert!(crate::primary::decode_frame::<PrimaryMessage>(&message).is_ok());
+    assert!(crate::primary::decode_frame::<PrimaryMessage>(&message[..message.len() - 1]).is_err());
+    let mut legacy = message;
+    legacy.extend_from_slice(&bincode::serialize(&BTreeMap::<Digest, Vec<u8>>::new()).unwrap());
+    assert!(crate::primary::decode_frame::<PrimaryMessage>(&legacy).is_err());
 }
 
 #[tokio::test]
-async fn compact_header_and_shared_batches_reconstruct_complete_wire_proposal() {
-    let mut store = store("roundtrip");
+async fn old_signed_metadata_can_serve_repair_but_is_not_worker_availability() {
+    let mut storage = store("legacy_metadata");
     let p = with_payload();
     let digest = p.block().digest();
-    store_verified_proposal(&mut store, p.clone())
-        .await
-        .unwrap();
-    let metadata = store
+    let key = [b"orca-proposal-header-v3/".as_ref(), digest.as_ref()].concat();
+    storage
+        .write(key, bincode::serialize(&p.header).unwrap())
+        .await;
+    assert_eq!(
+        load_proposal(&mut storage, &digest)
+            .await
+            .unwrap()
+            .unwrap()
+            .header,
+        p.header
+    );
+    assert!(storage
         .read(proposal_header_key(&digest))
         .await
         .unwrap()
-        .unwrap();
-    assert_eq!(metadata, bincode::serialize(&p.header).unwrap());
-    assert!(metadata.len() < 1024);
-    let old_key = [b"orca-proposal-v2/".as_ref(), digest.as_ref()].concat();
-    assert!(store.read(old_key).await.unwrap().is_none());
-
-    // A second signed proposal can reference exactly the same stored batches.
-    let mut other = p.clone();
-    other.header.round += 1;
-    other.header.id = other.header.digest();
-    other.header.signature = Signature::new(&other.header.id, &keys().pop().unwrap().1);
-    other.verify(&committee()).unwrap();
-    store_verified_proposal(&mut store, other.clone())
-        .await
-        .unwrap();
-    let batch_entries = p
-        .batches
-        .iter()
-        .map(|(d, b)| (batch_key(d), b.clone()))
-        .collect();
-    assert_eq!(store.write_batch_if_absent(batch_entries).await.unwrap(), 0);
-    for expected in [p, other] {
-        let rebuilt = load_proposal(&mut store, &expected.block().digest())
+        .is_none());
+    assert_eq!(
+        verify_worker_payload(&committee(), &mut storage, &p)
             .await
-            .unwrap()
-            .unwrap();
-        rebuilt.verify(&committee()).unwrap();
-        assert_eq!(
-            bincode::serialize(&PrimaryMessage::Proposal(rebuilt)).unwrap(),
-            bincode::serialize(&PrimaryMessage::Proposal(expected)).unwrap()
-        );
-    }
-}
-
-#[tokio::test]
-async fn complete_header_notification_exposes_all_payload_bytes() {
-    let mut store = store("notification");
-    let p = with_payload();
-    let digest = p.block().digest();
-    let mut reader = store.clone();
-    let expected = p.clone();
-    let waiting = async move {
-        reader
-            .notify_read(proposal_header_key(&digest))
-            .await
-            .unwrap();
-        let rebuilt = load_proposal(&mut reader, &digest).await.unwrap().unwrap();
-        assert_eq!(rebuilt.batches, expected.batches);
-    };
-    let writing = store_verified_proposal(&mut store, p);
-    let (_, result) = tokio::join!(waiting, writing);
-    result.unwrap();
-}
-
-#[tokio::test]
-async fn proposal_repair_rejects_metadata_without_batch_bytes() {
-    let mut store = store("metadata_only");
-    let dependency = with_payload();
-    let digest = dependency.block().digest();
-    // Install only the trusted metadata fixture. Production writes this marker
-    // atomically with data; omitting data here detects accidental payload reads.
-    store
-        .write(
-            proposal_header_key(&digest),
-            bincode::serialize(&dependency.header).unwrap(),
-        )
-        .await;
-    // A recovery reply must still refuse to send an incomplete proposal.
-    assert!(matches!(
-        load_proposal(&mut store, &digest).await,
-        Err(DagError::MissingBatch(_))
-    ));
+            .unwrap(),
+        p.header.payload
+    );
 }
 
 #[tokio::test]
@@ -676,7 +534,6 @@ async fn helper_recovers_complete_proposal_before_local_ready() {
             PrimaryMessage::Proposal(rebuilt) => {
                 rebuilt.verify(&committee()).unwrap();
                 assert_eq!(rebuilt.header, p.header);
-                assert_eq!(rebuilt.batches, p.batches);
                 saw_proposal = true;
             }
             PrimaryMessage::GrbcVoteBatch(batch) => {
@@ -698,22 +555,27 @@ async fn helper_recovers_complete_proposal_before_local_ready() {
 }
 
 #[tokio::test]
-async fn proposal_processor_rejects_changed_bytes_even_for_a_known_header() {
+async fn proposal_processor_rejects_a_changed_signature_even_for_a_known_header() {
     let mut store = store("processor_revalidation");
     let p = with_payload();
     let digest = p.block().digest();
+    for (digest, &worker) in &p.header.payload {
+        store
+            .write(worker_batch_key(digest, worker), Vec::new())
+            .await;
+    }
     let prepare = crate::proposal_processor::prepare_proposal;
-    let (stored, _) = prepare(p.clone(), committee(), &mut store, None, None)
+    let stored = prepare(p.clone(), committee(), &mut store, None)
         .await
         .unwrap();
     assert_eq!(stored.into_header(), p.header);
     let mut forged = p.clone();
-    forged.batches.values_mut().next().unwrap()[0] ^= 1;
-    assert!(prepare(forged, committee(), &mut store, None, None)
+    forged.header.signature = Signature::default();
+    assert!(prepare(forged, committee(), &mut store, None)
         .await
         .is_err());
     let restored = load_proposal(&mut store, &digest).await.unwrap().unwrap();
-    assert_eq!(restored.batches, p.batches);
+    assert_eq!(restored.header, p.header);
     restored.verify(&committee()).unwrap();
 }
 
@@ -735,6 +597,8 @@ async fn remote_processor_delivers_known_proposals_once_and_rejects_invalid_firs
         Arc::new(AtomicU64::new(0)),
         50,
         rx_remote,
+        channel(1).1,
+        1000,
         rx_local,
         tx_stored,
         tracker.clone(),
@@ -742,7 +606,12 @@ async fn remote_processor_delivers_known_proposals_once_and_rejects_invalid_firs
     drop(tx_local);
     let p = with_payload();
     let mut invalid = p.clone();
-    invalid.batches.values_mut().next().unwrap()[0] ^= 1;
+    for (digest, &worker) in &p.header.payload {
+        storage
+            .write(worker_batch_key(digest, worker), Vec::new())
+            .await;
+    }
+    invalid.header.signature = Signature::default();
     let mut next = p.clone();
     next.header.round += 1;
     next.header.id = next.header.digest();
@@ -765,7 +634,6 @@ async fn remote_processor_delivers_known_proposals_once_and_rejects_invalid_firs
         assert!(!tracker.contains(&digest));
         let recovered = load_proposal(&mut storage, &digest).await.unwrap().unwrap();
         assert_eq!(recovered.header, expected.header);
-        assert_eq!(recovered.batches, expected.batches);
     }
 }
 
@@ -791,6 +659,8 @@ async fn remote_duplicate_cache_eviction_and_restart_do_not_prevent_recovery() {
             Arc::new(AtomicU64::new(0)),
             1,
             rx_remote,
+            channel(1).1,
+            1000,
             rx_local,
             tx_stored,
             tracker.clone(),

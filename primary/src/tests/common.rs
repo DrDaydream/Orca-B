@@ -182,8 +182,5 @@ pub fn listener(address: SocketAddr) -> JoinHandle<Bytes> {
 }
 
 pub fn proposal() -> Proposal {
-    Proposal {
-        header: header(),
-        batches: Default::default(),
-    }
+    Proposal { header: header() }
 }

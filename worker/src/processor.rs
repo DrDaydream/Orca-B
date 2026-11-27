@@ -6,7 +6,7 @@ use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
 use primary::WorkerPrimaryMessage;
 use std::convert::TryInto;
-use store::Store;
+use store::{Store, StoreError};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[cfg(test)]
@@ -34,24 +34,41 @@ impl Processor {
     ) {
         tokio::spawn(async move {
             while let Some(batch) = rx_batch.recv().await {
-                // Hash the batch.
-                let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());
-
-                // Store the batch.
-                store.write(digest.to_vec(), batch.clone()).await;
-
-                // Deliver the batch's digest.
-                let message = match own_digest {
-                    true => WorkerPrimaryMessage::OurBatch(batch, id),
-                    false => WorkerPrimaryMessage::OthersBatch(digest, id),
-                };
-                let message = bincode::serialize(&message)
-                    .expect("Failed to serialize our own worker-primary message");
-                tx_digest
-                    .send(message)
+                Self::process(&mut store, id, batch, own_digest, &tx_digest)
                     .await
-                    .expect("Failed to send digest");
+                    .expect("Failed to persist worker batch");
             }
         });
+    }
+
+    pub(crate) async fn process(
+        store: &mut Store,
+        id: WorkerId,
+        batch: SerializedBatchMessage,
+        own: bool,
+        tx_primary: &Sender<SerializedBatchDigestMessage>,
+    ) -> Result<(), StoreError> {
+        let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());
+        store
+            .write_batch_if_absent(std::iter::once((digest.to_vec(), batch)).collect())
+            .await?;
+        #[cfg(feature = "benchmark")]
+        if own {
+            log::info!(
+                "Benchmark author batch available {:?} worker {}",
+                digest,
+                id
+            );
+        }
+        let notice = if own {
+            WorkerPrimaryMessage::OurBatch(digest, id)
+        } else {
+            WorkerPrimaryMessage::OthersBatch(digest, id)
+        };
+        tx_primary
+            .send(bincode::serialize(&notice).expect("Failed to encode worker digest"))
+            .await
+            .expect("Failed to deliver worker digest");
+        Ok(())
     }
 }

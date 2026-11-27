@@ -7,7 +7,7 @@ use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
 use network::SimpleSender;
-use primary::PrimaryWorkerMessage;
+use primary::{PrimaryWorkerMessage, WorkerPrimaryMessage};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{Store, StoreError};
@@ -40,6 +40,7 @@ pub struct Synchronizer {
     sync_retry_nodes: usize,
     /// Input channel to receive the commands from the primary.
     rx_message: Receiver<PrimaryWorkerMessage>,
+    tx_primary: Sender<Vec<u8>>,
     /// A network sender to send requests to the other workers.
     network: SimpleSender,
     /// Loosely keep track of the primary's round number (only used for cleanup).
@@ -61,6 +62,7 @@ impl Synchronizer {
         sync_retry_delay: u64,
         sync_retry_nodes: usize,
         rx_message: Receiver<PrimaryWorkerMessage>,
+        tx_primary: Sender<Vec<u8>>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -72,6 +74,7 @@ impl Synchronizer {
                 sync_retry_delay,
                 sync_retry_nodes,
                 rx_message,
+                tx_primary,
                 network: SimpleSender::new(),
                 round: Round::default(),
                 pending: HashMap::new(),
@@ -128,7 +131,11 @@ impl Synchronizer {
                                     debug!("Requesting sync for batch {}", digest);
                                 },
                                 Ok(Some(_)) => {
-                                    // The batch arrived in the meantime: no need to request it.
+                                    // Restore the primary's availability marker after a missed notice or restart.
+                                    let notice = WorkerPrimaryMessage::OthersBatch(digest.clone(), self.id);
+                                    self.tx_primary.send(bincode::serialize(&notice).expect("Failed to encode worker digest"))
+                                        .await.expect("Failed to deliver worker digest");
+                                    continue;
                                 },
                                 Err(e) => {
                                     error!("{}", e);
@@ -144,6 +151,7 @@ impl Synchronizer {
                             self.pending.insert(digest, (self.round, tx_cancel, now));
                         }
 
+                        if missing.is_empty() { continue; }
                         // Send sync request to a single node. If this fails, we will send it
                         // to other nodes when a timer times out.
                         let address = match self.committee.worker(&target, &self.id) {

@@ -2,9 +2,11 @@
 use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
-use crate::processor::{Processor, SerializedBatchMessage};
+use crate::processor::Processor;
+use crate::quorum_waiter::QuorumWaiter;
 use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
+use bincode::Options;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
@@ -77,7 +79,7 @@ impl Worker {
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
         let (tx_batch_silent, rx_batch_silent) = watch::channel((Round::default(), false));
-        worker.handle_primary_messages(tx_batch_silent);
+        worker.handle_primary_messages(tx_batch_silent, tx_primary.clone());
         worker.handle_clients_transactions(tx_primary.clone(), rx_batch_silent);
         worker.handle_workers_messages(tx_primary);
 
@@ -105,7 +107,11 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self, tx_batch_silent: watch::Sender<(Round, bool)>) {
+    fn handle_primary_messages(
+        &self,
+        tx_batch_silent: watch::Sender<(Round, bool)>,
+        tx_primary: Sender<SerializedBatchDigestMessage>,
+    ) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
         // Receive incoming messages from our primary.
@@ -135,6 +141,7 @@ impl Worker {
             self.parameters.sync_retry_delay,
             self.parameters.sync_retry_nodes,
             /* rx_message */ rx_synchronizer,
+            tx_primary,
         );
 
         info!(
@@ -149,6 +156,7 @@ impl Worker {
         tx_primary: Sender<SerializedBatchDigestMessage>,
         rx_batch_silent: watch::Receiver<(Round, bool)>,
     ) {
+        let (tx_quorum, rx_quorum) = channel(CHANNEL_CAPACITY);
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
@@ -164,12 +172,23 @@ impl Worker {
             /* handler */ TxReceiverHandler { tx_batch_maker },
         );
 
-        // Assemble locally; the primary broadcasts the complete GRBC proposal.
+        // Workers disseminate batches while the primary advances DAG rounds.
         BatchMaker::spawn(
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
             rx_batch_maker,
             rx_batch_silent,
+            tx_quorum,
+            self.committee
+                .others_workers(&self.name, &self.id)
+                .into_iter()
+                .map(|(name, address)| (name, address.worker_to_worker))
+                .collect(),
+        );
+        QuorumWaiter::spawn(
+            self.committee.clone(),
+            self.committee.stake(&self.name),
+            rx_quorum,
             tx_processor,
         );
 
@@ -192,7 +211,6 @@ impl Worker {
     /// Spawn all tasks responsible to handle messages from other workers.
     fn handle_workers_messages(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
-        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
         // Receive incoming messages from other workers.
         let mut address = self
@@ -206,7 +224,9 @@ impl Worker {
             /* handler */
             WorkerReceiverHandler {
                 tx_helper,
-                tx_processor,
+                store: self.store.clone(),
+                id: self.id,
+                tx_primary,
             },
         );
 
@@ -216,16 +236,6 @@ impl Worker {
             self.committee.clone(),
             self.store.clone(),
             /* rx_request */ rx_helper,
-        );
-
-        // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
-        // batch's digest to the `PrimaryConnector` that will send it to our primary.
-        Processor::spawn(
-            self.id,
-            self.store.clone(),
-            /* rx_batch */ rx_processor,
-            /* tx_digest */ tx_primary,
-            /* own_batch */ false,
         );
 
         info!(
@@ -280,29 +290,39 @@ impl MessageHandler for TxReceiverHandler {
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
-    tx_processor: Sender<SerializedBatchMessage>,
+    store: Store,
+    id: WorkerId,
+    tx_primary: Sender<SerializedBatchDigestMessage>,
 }
 
 #[async_trait]
 impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
-        // Reply with an ACK.
-        let _ = writer.send(Bytes::from("Ack")).await;
-
-        // Deserialize and parse the message.
-        match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(..)) => self
-                .tx_processor
-                .send(serialized.to_vec())
-                .await
-                .expect("Failed to send batch"),
-            Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
-                .tx_helper
-                .send((missing, requestor))
-                .await
-                .expect("Failed to send batch request"),
-            Err(e) => warn!("Serialization error: {}", e),
+        match bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(serialized.len() as u64)
+            .reject_trailing_bytes()
+            .deserialize(&serialized)?
+        {
+            WorkerMessage::Batch(_) => {
+                let mut store = self.store.clone();
+                Processor::process(
+                    &mut store,
+                    self.id,
+                    serialized.to_vec(),
+                    false,
+                    &self.tx_primary,
+                )
+                .await?;
+            }
+            WorkerMessage::BatchRequest(missing, requestor) => {
+                self.tx_helper
+                    .send((missing, requestor))
+                    .await
+                    .expect("Failed to send batch request");
+            }
         }
+        writer.send(Bytes::from_static(b"Ack")).await?;
         Ok(())
     }
 }

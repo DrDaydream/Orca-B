@@ -18,6 +18,7 @@ async fn make_batch() {
         rx_transaction,
         rx_batch_silent,
         tx_message,
+        Vec::new(),
     );
 
     // Send enough transactions to seal a batch.
@@ -26,7 +27,7 @@ async fn make_batch() {
 
     // Ensure the batch is as expected.
     let expected_batch = vec![transaction(), transaction()];
-    let batch = rx_message.recv().await.unwrap();
+    let batch = rx_message.recv().await.unwrap().batch;
     match bincode::deserialize(&batch).unwrap() {
         WorkerMessage::Batch(batch) => assert_eq!(batch, expected_batch),
         _ => panic!("Unexpected message"),
@@ -46,6 +47,7 @@ async fn batch_timeout() {
         rx_transaction,
         rx_batch_silent,
         tx_message,
+        Vec::new(),
     );
 
     // Do not send enough transactions to seal a batch..
@@ -53,7 +55,7 @@ async fn batch_timeout() {
 
     // Ensure the batch is as expected.
     let expected_batch = vec![transaction()];
-    let batch = rx_message.recv().await.unwrap();
+    let batch = rx_message.recv().await.unwrap().batch;
     match bincode::deserialize(&batch).unwrap() {
         WorkerMessage::Batch(batch) => assert_eq!(batch, expected_batch),
         _ => panic!("Unexpected message"),
@@ -66,7 +68,14 @@ async fn silent_batch_maker_resumes_without_dropping_transactions() {
     let (tx_message, mut rx_message) = channel(1);
     let (tx_batch_silent, rx_batch_silent) = watch::channel((1, true));
 
-    BatchMaker::spawn(200, 20, rx_transaction, rx_batch_silent, tx_message);
+    BatchMaker::spawn(
+        200,
+        20,
+        rx_transaction,
+        rx_batch_silent,
+        tx_message,
+        Vec::new(),
+    );
 
     tx_transaction.send(transaction()).await.unwrap();
     tx_transaction.send(transaction()).await.unwrap();
@@ -78,7 +87,8 @@ async fn silent_batch_maker_resumes_without_dropping_transactions() {
     let batch = timeout(Duration::from_millis(200), rx_message.recv())
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .batch;
     match bincode::deserialize(&batch).unwrap() {
         WorkerMessage::Batch(batch) => assert_eq!(batch, vec![transaction(), transaction()]),
         _ => panic!("Unexpected message"),
@@ -86,18 +96,19 @@ async fn silent_batch_maker_resumes_without_dropping_transactions() {
 }
 
 #[tokio::test]
-async fn full_batches_fit_propose_and_preserve_transactions_across_splits() {
+async fn worker_frames_preserve_transactions_across_splits() {
     let (tx_transaction, rx_transaction) = channel(3);
     let (tx_message, mut rx_message) = channel(3);
     let (_tx_silent, rx_silent) = watch::channel((0, false));
     BatchMaker::spawn(
-        primary::MAX_PROPOSAL_BYTES,
+        MAX_BATCH_WIRE_BYTES,
         50,
         rx_transaction,
         rx_silent,
         tx_message,
+        Vec::new(),
     );
-    let transaction = vec![1; primary::MAX_PROPOSAL_BYTES / 2 + 1];
+    let transaction = vec![1; MAX_BATCH_WIRE_BYTES / 2 + 1];
     tx_transaction.send(transaction.clone()).await.unwrap();
     tx_transaction.send(transaction.clone()).await.unwrap();
     for _ in 0..2 {
@@ -105,7 +116,8 @@ async fn full_batches_fit_propose_and_preserve_transactions_across_splits() {
             .await
             .unwrap()
             .unwrap();
-        assert!(bytes.len() <= primary::MAX_PROPOSAL_BYTES);
+        let bytes = bytes.batch;
+        assert!(bytes.len() <= MAX_BATCH_WIRE_BYTES);
         match bincode::deserialize(&bytes).unwrap() {
             WorkerMessage::Batch(batch) => assert_eq!(batch, vec![transaction.clone()]),
             _ => panic!("Unexpected message"),

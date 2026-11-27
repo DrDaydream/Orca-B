@@ -1,7 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crate::common::{committee, keys};
-use std::collections::BTreeMap;
 use tokio::sync::mpsc::channel;
 
 #[tokio::test]
@@ -57,7 +56,7 @@ async fn propose_payload() {
     let digest = Digest(name.0);
     let worker_id = 0;
     tx_our_digests
-        .send((digest.clone(), worker_id, 100))
+        .send((digest.clone(), worker_id))
         .await
         .unwrap();
 
@@ -111,89 +110,36 @@ async fn propose_grbc_edges() {
 }
 
 #[tokio::test]
-async fn payload_budget_keeps_remaining_batches_for_the_next_round() {
-    let (name, secret) = keys().pop().unwrap();
-    let (tx_parents, rx_parents) = channel(10);
-    let (tx_batches, rx_batches) = channel(10);
-    let (tx_headers, mut rx_headers) = channel(10);
-    Proposer::spawn(
-        name,
-        &committee(),
-        SignatureService::new(secret),
-        64,
-        50,
-        rx_parents,
-        rx_batches,
-        tx_headers,
-    );
-    let first = Digest([1; 32]);
-    let second = Digest([2; 32]);
-    tx_batches
-        .send((first.clone(), 0, MAX_PROPOSAL_BYTES / 2 + 1))
-        .await
-        .unwrap();
-    tx_batches
-        .send((second.clone(), 0, MAX_PROPOSAL_BYTES / 2 + 1))
-        .await
-        .unwrap();
-    let one = tokio::time::timeout(Duration::from_secs(2), rx_headers.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(one.payload.len(), 1);
-    assert!(one.payload.contains_key(&first));
-    tx_parents
-        .send((vec![Digest([3; 32])], vec![], vec![], 1))
-        .await
-        .unwrap();
-    let two = tokio::time::timeout(Duration::from_secs(2), rx_headers.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(two.round, 2);
-    assert_eq!(two.payload.len(), 1);
-    assert!(two.payload.contains_key(&second));
-}
-
-#[tokio::test]
-async fn payload_budget_allows_fourteen_full_batches_within_wire_limit() {
-    const FULL_BATCH_BYTES: usize = 508_052;
-    const BATCH_COUNT: usize = 14;
-
+async fn proposal_carries_seventy_eight_batch_references_as_header_metadata() {
     let (name, secret) = keys().pop().unwrap();
     let (_tx_parents, rx_parents) = channel(1);
-    let (tx_batches, rx_batches) = channel(BATCH_COUNT);
+    let (tx_batches, rx_batches) = channel(78);
     let (tx_headers, mut rx_headers) = channel(1);
-    let mut batches = BTreeMap::new();
-
     Proposer::spawn(
         name,
         &committee(),
         SignatureService::new(secret),
-        BATCH_COUNT * 32,
+        78 * 32,
         1_000_000,
         rx_parents,
         rx_batches,
         tx_headers,
     );
-
-    for id in 0..BATCH_COUNT {
-        let mut bytes = vec![0; FULL_BATCH_BYTES];
-        bytes[0] = id as u8;
-        let digest = crate::messages::batch_digest(&bytes);
-        tx_batches
-            .send((digest.clone(), 0, bytes.len()))
-            .await
-            .unwrap();
-        batches.insert(digest, bytes);
+    for n in 0..78u8 {
+        tx_batches.send((Digest([n; 32]), 0)).await.unwrap();
     }
-
     let header = tokio::time::timeout(Duration::from_secs(2), rx_headers.recv())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(header.payload.len(), BATCH_COUNT);
-
-    let proposal = crate::messages::Proposal { header, batches };
-    assert!(proposal.verify(&committee()).is_ok());
+    assert_eq!(header.payload.len(), 78);
+    header.verify(&committee()).unwrap();
+    let wire = bincode::serialize(&crate::primary::PrimaryMessage::Proposal(
+        crate::messages::Proposal {
+            header: header.clone(),
+        },
+    ))
+    .unwrap();
+    assert_eq!(&wire[4..], &bincode::serialize(&header).unwrap()[..]);
+    assert!(wire.len() < 4096);
 }

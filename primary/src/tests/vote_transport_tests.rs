@@ -33,7 +33,6 @@ async fn dependency_repair_with_local_payload_does_not_download_it_again() {
     let payload = vec![7; 512 * 1024];
     let batch = batch_digest(&payload);
     p.header.payload.insert(batch.clone(), 0);
-    p.batches.insert(batch, payload);
     p.header.id = p.header.digest();
     p.header.signature = Signature::new(&p.header.id, &keys().pop().unwrap().1);
     p.verify(&committee()).unwrap();
@@ -180,7 +179,6 @@ async fn echo_and_ready_bypass_a_blocked_proposal_connection() {
     let batch = vec![42; 512 * 1024];
     let digest = batch_digest(&batch);
     p.header.payload.insert(digest.clone(), 0);
-    p.batches.insert(digest, batch);
     p.header.id = p.header.digest();
     p.header.signature = Signature::new(&p.header.id, &keys().pop().unwrap().1);
     p.verify(&committee()).unwrap();

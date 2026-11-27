@@ -289,8 +289,8 @@ impl HeaderWaiter {
         let mut proposals = Vec::new();
         let mut votes = Vec::new();
         for digest in digests {
-            // This marker is published atomically with all verified payload
-            // bytes. A missing FINISH needs votes, not another payload copy.
+            // A published header already has local worker availability.
+            // Once it is present, repair needs only the missing votes.
             if self
                 .store
                 .read(crate::messages::proposal_header_key(&digest))

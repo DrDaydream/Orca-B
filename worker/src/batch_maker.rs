@@ -1,14 +1,18 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::processor::SerializedBatchMessage;
+use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::WorkerMessage;
+use bytes::Bytes;
 #[cfg(feature = "benchmark")]
 use crypto::Digest;
+use crypto::PublicKey;
 #[cfg(feature = "benchmark")]
 use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
+use network::ReliableSender;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
+use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration, Instant};
@@ -20,6 +24,9 @@ pub mod batch_maker_tests;
 pub type Transaction = Vec<u8>;
 pub type Batch = Vec<Transaction>;
 
+// The worker transport uses LengthDelimitedCodec's 8 MiB frame.
+pub(crate) const MAX_BATCH_WIRE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Assemble clients transactions into batches.
 pub struct BatchMaker {
     /// The preferred batch size (in bytes).
@@ -30,8 +37,10 @@ pub struct BatchMaker {
     rx_transaction: Receiver<Transaction>,
     /// Current proposer round and whether local batch production is paused.
     rx_batch_silent: watch::Receiver<(u64, bool)>,
-    /// Output channel to deliver sealed batches to the local `Processor`.
-    tx_message: Sender<SerializedBatchMessage>,
+    /// Output channel to deliver sealed batches to the `QuorumWaiter`.
+    tx_message: Sender<QuorumWaiterMessage>,
+    workers_addresses: Vec<(PublicKey, SocketAddr)>,
+    network: ReliableSender,
     /// Holds the current batch.
     current_batch: Batch,
     /// Holds the size of the current batch (in bytes).
@@ -44,16 +53,19 @@ impl BatchMaker {
         max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>,
         rx_batch_silent: watch::Receiver<(u64, bool)>,
-        tx_message: Sender<SerializedBatchMessage>,
+        tx_message: Sender<QuorumWaiterMessage>,
+        workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
         tokio::spawn(async move {
             Self {
-                batch_size: batch_size.min(primary::MAX_PROPOSAL_BYTES - 1024),
+                batch_size,
                 max_batch_delay,
                 rx_transaction,
                 rx_batch_silent,
                 tx_message,
-                current_batch: Batch::with_capacity(batch_size * 2),
+                network: ReliableSender::new(),
+                workers_addresses,
+                current_batch: Batch::new(),
                 current_batch_size: 0,
             }
             .run()
@@ -93,12 +105,12 @@ impl BatchMaker {
 
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
-                    if transaction.len() + 32 > primary::MAX_PROPOSAL_BYTES {
-                        log::warn!("Transaction exceeds complete-proposal payload limit");
+                    if transaction.len() > MAX_BATCH_WIRE_BYTES - 20 {
+                        log::warn!("Transaction exceeds the worker frame limit");
                         continue;
                     }
                     if self.current_batch_size + transaction.len() + 8 * (self.current_batch.len() + 1) + 12
-                        > primary::MAX_PROPOSAL_BYTES && !self.current_batch.is_empty() {
+                        > MAX_BATCH_WIRE_BYTES && !self.current_batch.is_empty() {
                         self.seal().await;
                     }
                     self.current_batch_size += transaction.len();
@@ -167,11 +179,17 @@ impl BatchMaker {
             info!("Batch {:?} contains {} B", digest, size);
         }
 
-        // Store and hand the complete bytes to our primary. PROPOSE is the
-        // first cross-authority transmission, after its DAG references are fixed.
+        let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().copied().unzip();
+        let handlers = self
+            .network
+            .broadcast(addresses, Bytes::from(serialized.clone()))
+            .await;
         self.tx_message
-            .send(serialized)
+            .send(QuorumWaiterMessage {
+                batch: serialized,
+                handlers: names.into_iter().zip(handlers).collect(),
+            })
             .await
-            .expect("Failed to deliver local batch");
+            .expect("Failed to deliver sealed batch");
     }
 }

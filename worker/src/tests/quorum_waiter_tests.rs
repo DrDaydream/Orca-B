@@ -52,3 +52,37 @@ async fn wait_for_quorum() {
     // Ensure the other listeners correctly received the batch.
     assert!(try_join_all(listener_handles).await.is_ok());
 }
+
+#[tokio::test]
+async fn cancelled_or_invalid_ack_does_not_release_a_batch() {
+    let (input, rx) = channel(2);
+    let (out, mut received) = channel(2);
+    let c = committee_with_base_port(7100);
+    let peers = keys();
+    QuorumWaiter::spawn(c, 1, rx, out);
+    for (value, valid) in [(1, false), (2, true)] {
+        let (first, ack1) = tokio::sync::oneshot::channel();
+        let (second, ack2) = tokio::sync::oneshot::channel();
+        let (third, ack3) = tokio::sync::oneshot::channel();
+        first.send(Bytes::from_static(b"Ack")).unwrap();
+        if valid {
+            second.send(Bytes::from_static(b"Ack")).unwrap();
+        } else {
+            drop(second);
+        }
+        third.send(Bytes::from_static(b"wrong")).unwrap();
+        input
+            .send(QuorumWaiterMessage {
+                batch: vec![value],
+                handlers: vec![(peers[0].0, ack1), (peers[1].0, ack2), (peers[2].0, ack3)],
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), received.recv())
+            .await
+            .unwrap(),
+        Some(vec![2])
+    );
+}

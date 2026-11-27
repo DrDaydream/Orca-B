@@ -1,10 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 #[macro_use]
 mod error;
-pub mod adversary;
 mod aba_spool;
+pub mod adversary;
 mod aggregators;
-mod batch_bytes;
 mod core;
 mod garbage_collector;
 mod header_waiter;
@@ -26,6 +25,5 @@ mod common;
 pub use crate::messages::{
     AbaMessage, AbaMessageKind, BinaryValue, Certificate, ConsensusCommand, ConsensusMessage,
     ConsensusNetworkMessage, GrbcPhase, GrbcVote, GrbcVoteBatch, Header, Proposal,
-    MAX_PROPOSAL_BYTES,
 };
 pub use crate::primary::{Primary, PrimaryWorkerMessage, Round, WorkerPrimaryMessage};

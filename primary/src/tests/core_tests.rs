@@ -1,6 +1,6 @@
 use super::*;
 use crate::common::{committee, keys, proposal, votes};
-use crate::messages::{batch_key, proposal_header_key, GrbcVoteBatch};
+use crate::messages::{proposal_header_key, worker_batch_key, GrbcVoteBatch};
 use crypto::Signature;
 use std::collections::BTreeMap;
 use tokio::sync::mpsc::channel;
@@ -201,7 +201,6 @@ async fn runtime_review_stored_self_progresses_while_a_remote_vote_is_waiting() 
     let mut storage = core.store.clone();
     let remote = Proposal {
         header: crate::common::headers().remove(0),
-        batches: BTreeMap::new(),
     };
     let own = proposal();
     let (tx, mut outgoing) = channel(1);
@@ -217,11 +216,10 @@ async fn runtime_review_stored_self_progresses_while_a_remote_vote_is_waiting() 
     let run = tokio::spawn(async move { core.run().await });
     let check = async {
         for p in [&remote, &own] {
-            let (stored, _) = crate::proposal_processor::prepare_proposal(
+            let stored = crate::proposal_processor::prepare_proposal(
                 p.clone(),
                 committee(),
                 &mut storage,
-                None,
                 None,
             )
             .await
@@ -278,7 +276,6 @@ async fn queue_invariant_qualified_remote_finishes_behind_an_unrelated_vote() {
         h.core
             .process_proposal(Proposal {
                 header: header.clone(),
-                batches: BTreeMap::new(),
             })
             .await
             .unwrap();
@@ -386,11 +383,10 @@ async fn own_local_delivery_is_idempotent_and_rejects_a_second_round_variant() {
 async fn own_commit_before_core_registration_still_votes_and_does_not_duplicate_delivery() {
     let mut h = Harness::new("self_commit_before_callback", 3);
     let p = proposal();
-    let (stored, _) = crate::proposal_processor::prepare_proposal(
+    let stored = crate::proposal_processor::prepare_proposal(
         p.clone(),
         h.core.committee.clone(),
         &mut h.core.store,
-        None,
         None,
     )
     .await
@@ -412,11 +408,10 @@ async fn own_commit_before_core_registration_still_votes_and_does_not_duplicate_
 async fn runtime_review_early_commit_selects_both_own_voting_slots() {
     let mut h = Harness::new("self_selected_votes", 3);
     let selected = proposal();
-    let (stored, _) = crate::proposal_processor::prepare_proposal(
+    let stored = crate::proposal_processor::prepare_proposal(
         selected.clone(),
         committee(),
         &mut h.core.store,
-        None,
         None,
     )
     .await
@@ -506,7 +501,6 @@ async fn local_votes_finish_a_single_authority_committee() {
                 .collect(),
             ..Header::default()
         },
-        batches: BTreeMap::new(),
     };
     resign(&mut p);
     let mut h = Harness::with_committee("single_authority", 0, c);
@@ -665,14 +659,17 @@ async fn complete_payloads_progress_across_rounds_using_local_finish_parents() {
             };
             header.id = header.digest();
             header.signature = Signature::new(&header.id, &secret);
-            proposals.push(Proposal {
-                header,
-                batches: [(digest, data)].iter().cloned().collect(),
-            });
+            for node in &mut nodes {
+                node.core
+                    .store
+                    .write(worker_batch_key(&digest, 0), Vec::new())
+                    .await;
+            }
+            proposals.push(Proposal { header });
         }
         for proposal in &proposals {
             for node in &mut nodes {
-                // Exercise the exact network enum and serialization, including data.
+                // Exercise the exact network enum and serialization, including the signed batch references.
                 let wire = bincode::serialize(&PrimaryMessage::Proposal(proposal.clone())).unwrap();
                 node.core
                     .process_primary_burst(Some(bincode::deserialize(&wire).unwrap()))
@@ -720,16 +717,14 @@ async fn complete_payloads_progress_across_rounds_using_local_finish_parents() {
                     .await
                     .unwrap()
                     .is_some());
-                for (digest, bytes) in &proposal.batches {
-                    assert_eq!(
-                        node.core
-                            .store
-                            .read(batch_key(digest))
-                            .await
-                            .unwrap()
-                            .as_ref(),
-                        Some(bytes)
-                    );
+                for (digest, &worker) in &proposal.header.payload {
+                    assert!(node
+                        .core
+                        .store
+                        .read(worker_batch_key(digest, worker))
+                        .await
+                        .unwrap()
+                        .is_some());
                 }
             }
         }
@@ -767,6 +762,8 @@ async fn deduplicated_proposal_echoes_once_without_waiting_for_parents() {
         h.core.consensus_round.clone(),
         50,
         rx_remote,
+        channel(1).1,
+        1000,
         rx_local,
         tx_stored,
         h.core.in_flight.clone(),
@@ -775,10 +772,7 @@ async fn deduplicated_proposal_echoes_once_without_waiting_for_parents() {
     let parents: Vec<_> = crate::common::headers()
         .into_iter()
         .take(3)
-        .map(|header| Proposal {
-            header,
-            batches: BTreeMap::new(),
-        })
+        .map(|header| Proposal { header })
         .collect();
     let mut child = proposal();
     child.header.round = 2;
@@ -925,11 +919,10 @@ async fn actual_commit_completes_a_stored_unregistered_proposal_without_votes() 
     let mut h = Harness::new("commit_stored", 0);
     let p = proposal();
     let guard = h.core.in_flight.track(&p.header);
-    let (stored, _) = crate::proposal_processor::prepare_proposal(
+    let stored = crate::proposal_processor::prepare_proposal(
         p.clone(),
         committee(),
         &mut h.core.store,
-        None,
         Some(guard),
     )
     .await
@@ -979,7 +972,10 @@ async fn actual_commit_completes_a_stored_unregistered_proposal_without_votes() 
     let bytes = vec![7, 8, 9];
     let digest = crate::messages::batch_digest(&bytes);
     conflicting.header.payload.insert(digest.clone(), 0);
-    conflicting.batches.insert(digest, bytes);
+    h.core
+        .store
+        .write(worker_batch_key(&digest, 0), Vec::new())
+        .await;
     resign(&mut conflicting);
     h.core.process_proposal(conflicting).await.unwrap();
     assert!(h.outgoing().is_empty());
@@ -1020,10 +1016,7 @@ async fn committed_parent_batch_counts_with_grbc_once_without_gating_child_echo(
     let parents: Vec<_> = crate::common::headers()
         .into_iter()
         .take(3)
-        .map(|header| Proposal {
-            header,
-            batches: BTreeMap::new(),
-        })
+        .map(|header| Proposal { header })
         .collect();
     // One parent completes normally; two only have complete stored data.
     h.core.process_proposal(parents[0].clone()).await.unwrap();
@@ -1041,7 +1034,6 @@ async fn committed_parent_batch_counts_with_grbc_once_without_gating_child_echo(
             p.clone(),
             committee(),
             &mut h.core.store,
-            None,
             None,
         )
         .await
@@ -1100,10 +1092,7 @@ async fn completed_parent_fixture(label: &str) -> (Harness, Proposal) {
     child.header.round = 2;
     child.header.parents.clear();
     for header in crate::common::headers().into_iter().take(3) {
-        let parent = Proposal {
-            header,
-            batches: BTreeMap::new(),
-        };
+        let parent = Proposal { header };
         h.core.process_proposal(parent.clone()).await.unwrap();
         for vote in votes(&parent.header, GrbcPhase::Ready)
             .into_iter()
@@ -1126,7 +1115,6 @@ async fn ready_only_parent_does_not_block_child_echo() {
     let (mut h, mut child) = completed_parent_fixture("cached_ready_only").await;
     let parent = Proposal {
         header: crate::common::headers().pop().unwrap(),
-        batches: BTreeMap::new(),
     };
     h.core.process_proposal(parent.clone()).await.unwrap();
     for vote in votes(&parent.header, GrbcPhase::Echo)
@@ -1193,11 +1181,10 @@ async fn late_commit_after_gc_releases_dependencies_without_reviving_old_state()
 async fn commit_feedback_is_serviced_inside_a_hot_vote_burst() {
     let mut h = Harness::new("commit_burst", 0);
     let p = proposal();
-    let (stored, _) = crate::proposal_processor::prepare_proposal(
+    let stored = crate::proposal_processor::prepare_proposal(
         p.clone(),
         committee(),
         &mut h.core.store,
-        None,
         None,
     )
     .await
@@ -1235,11 +1222,10 @@ async fn in_flight_proposal_suppresses_repair_through_core_registration() {
         .unwrap();
     h.core.retry_missing_proposals().await;
     assert!(h.core.cancel_handlers.is_empty());
-    let (stored, _) = crate::proposal_processor::prepare_proposal(
+    let stored = crate::proposal_processor::prepare_proposal(
         p.clone(),
         committee(),
         &mut h.core.store,
-        None,
         Some(guard),
     )
     .await
@@ -1281,7 +1267,6 @@ async fn failed_duplicate_and_cancelled_proposals_release_repair_suppression() {
         invalid,
         committee(),
         &mut h.core.store,
-        None,
         Some(guard)
     )
     .await
@@ -1413,11 +1398,10 @@ async fn large_vote_vector_yields_to_stored_headers_and_preserves_remaining_work
     let mut later = p.clone();
     later.header = crate::common::headers().remove(1);
     let guard = h.core.in_flight.track(&later.header);
-    let (stored, _) = crate::proposal_processor::prepare_proposal(
+    let stored = crate::proposal_processor::prepare_proposal(
         later.clone(),
         committee(),
         &mut h.core.store,
-        None,
         Some(guard),
     )
     .await
@@ -1473,13 +1457,11 @@ async fn proposal_completed_during_a_vote_burst_is_serviced_by_the_next_burst() 
         .unwrap();
     let later = Proposal {
         header: crate::common::headers().remove(1),
-        batches: BTreeMap::new(),
     };
-    let (stored, _) = crate::proposal_processor::prepare_proposal(
+    let stored = crate::proposal_processor::prepare_proposal(
         later.clone(),
         committee(),
         &mut h.core.store,
-        None,
         None,
     )
     .await
@@ -1615,4 +1597,112 @@ async fn no_wait_committed_quorum_advances_without_local_dependencies() {
         .expect("Completed quorum must advance without its local dependencies");
     assert_eq!(round, 3);
     assert_eq!(parents.len(), 3);
+}
+
+#[tokio::test]
+async fn missing_worker_batches_are_repaired_before_echo_without_blocking_other_proposals() {
+    use crate::payload_receiver::PayloadReceiver;
+    use crate::primary::PrimaryWorkerMessage;
+    use futures::StreamExt;
+    use tokio::net::TcpListener;
+    use tokio::time::{timeout, Duration};
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    let mut h = Harness::new("worker_receipts", 0);
+    let mut c = committee();
+    let worker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    c.authorities
+        .get_mut(&h.core.name)
+        .unwrap()
+        .workers
+        .get_mut(&0)
+        .unwrap()
+        .primary_to_worker = worker.local_addr().unwrap();
+    let (tx_remote, remote) = channel(8);
+    let (tx_receipts, receipts) = channel(8);
+    let (tx, mut arrived) = channel(8);
+    PayloadReceiver::spawn(
+        h.core.name,
+        c,
+        h.core.store.clone(),
+        h.core.consensus_round.clone(),
+        50,
+        10000,
+        remote,
+        receipts,
+        tx,
+    );
+
+    let mut delayed = proposal();
+    let first = Digest([41; 32]);
+    let second = Digest([42; 32]);
+    delayed.header.payload.insert(first.clone(), 0);
+    delayed.header.payload.insert(second.clone(), 0);
+    resign(&mut delayed);
+    let ready = Proposal {
+        header: crate::common::headers().remove(1),
+    };
+    for candidate in [&delayed, &delayed, &ready] {
+        tx_remote
+            .send((candidate.clone(), h.core.in_flight.track(&candidate.header)))
+            .await
+            .unwrap();
+    }
+    let (socket, _) = timeout(Duration::from_secs(2), worker.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut frames = Framed::new(socket, LengthDelimitedCodec::new());
+    let request = timeout(Duration::from_secs(2), frames.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(bincode::deserialize(&request).unwrap(),
+        PrimaryWorkerMessage::Synchronize(keys, origin) if origin == delayed.header.author && keys == vec![first.clone(), second.clone()]));
+    let available = timeout(Duration::from_secs(2), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    h.core.process_stored_proposal(available).await.unwrap();
+    assert_eq!(h.outgoing()[0].id, ready.header.id);
+    for (digest, worker_id) in [(first, 0), (second.clone(), 1)] {
+        h.core
+            .store
+            .write_batch_if_absent(
+                std::iter::once((worker_batch_key(&digest, worker_id), vec![])).collect(),
+            )
+            .await
+            .unwrap();
+        tx_receipts.send((digest, worker_id)).await.unwrap();
+    }
+    assert!(timeout(Duration::from_millis(40), arrived.recv())
+        .await
+        .is_err());
+    assert!(h
+        .core
+        .store
+        .read(proposal_header_key(&delayed.block().digest()))
+        .await
+        .unwrap()
+        .is_none());
+    h.core
+        .store
+        .write_batch_if_absent(std::iter::once((worker_batch_key(&second, 0), vec![])).collect())
+        .await
+        .unwrap();
+    tx_receipts.send((second.clone(), 0)).await.unwrap();
+    tx_receipts.send((second, 0)).await.unwrap();
+    let repaired = timeout(Duration::from_secs(2), arrived.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    h.core.process_stored_proposal(repaired).await.unwrap();
+    let votes = h.outgoing();
+    assert_eq!(votes.len(), 1);
+    assert_eq!(votes[0].id, delayed.header.id);
+    assert_eq!(votes[0].phase, GrbcPhase::Echo);
+    assert!(timeout(Duration::from_millis(40), arrived.recv())
+        .await
+        .is_err());
 }

@@ -1,15 +1,15 @@
-//! Complete payload work stays outside the GRBC vote processing loop.
+//! Authenticate and relay digest proposals outside the GRBC vote processing loop.
 use crate::error::{DagError, DagResult};
 use crate::messages::{Certificate, Header, Proposal};
 use crate::primary::{PrimaryMessage, Round};
-use crate::proposal_store::{assemble_proposal, load_proposal, store_verified_proposal};
+use crate::proposal_store::{load_proposal, store_verified_proposal};
 use bytes::Bytes;
-use config::Committee;
+use config::{Committee, WorkerId};
 use crypto::{Digest, Hash as _, PublicKey};
 use futures::FutureExt;
 use log::{debug, warn};
 use network::{CancelHandler, ReliableSender};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,6 +69,14 @@ pub(crate) type QueuedProposal = (Proposal, ProposalGuard);
 pub(crate) struct StoredProposalHeader(Header, Option<ProposalGuard>);
 
 impl StoredProposalHeader {
+    pub(super) async fn store(
+        store: &mut Store,
+        proposal: Proposal,
+        guard: Option<ProposalGuard>,
+    ) -> DagResult<Self> {
+        Ok(Self(store_verified_proposal(store, proposal).await?, guard))
+    }
+
     pub(crate) fn into_header(self) -> Header {
         let Self(header, _guard) = self;
         header
@@ -78,16 +86,11 @@ impl StoredProposalHeader {
 async fn verify_and_serialize_proposal(
     proposal: Proposal,
     committee: Committee,
-    serialize: bool,
-) -> DagResult<(Proposal, Option<Bytes>)> {
+) -> DagResult<(Proposal, Bytes)> {
     tokio::task::spawn_blocking(move || {
         proposal.verify(&committee)?;
         let message = PrimaryMessage::Proposal(proposal);
-        let bytes = if serialize {
-            Some(Bytes::from(bincode::serialize(&message)?))
-        } else {
-            None
-        };
+        let bytes = Bytes::from(bincode::serialize(&message)?);
         match message {
             PrimaryMessage::Proposal(proposal) => Ok::<_, DagError>((proposal, bytes)),
             _ => unreachable!(),
@@ -97,30 +100,19 @@ async fn verify_and_serialize_proposal(
     .expect("Proposal validation task failed")
 }
 
+#[cfg(test)]
 pub(crate) async fn prepare_proposal(
     proposal: Proposal,
     committee: Committee,
     store: &mut Store,
-    outbound: Option<(&mut ReliableSender, Vec<SocketAddr>)>,
     in_flight: Option<ProposalGuard>,
-) -> DagResult<(StoredProposalHeader, Vec<CancelHandler>)> {
-    let (proposal, bytes) =
-        verify_and_serialize_proposal(proposal, committee, outbound.is_some()).await?;
-    // Validation precedes both operations. Network transmission need not wait
-    // for our disk, while Core still receives the header only after storage.
-    // join! reuses this task and preserves backpressure on the local producer.
-    let broadcast = async {
-        match outbound {
-            Some((network, addresses)) => {
-                network
-                    .broadcast(addresses, bytes.expect("Missing outbound proposal"))
-                    .await
-            }
-            None => Vec::new(),
-        }
-    };
-    let (handlers, header) = tokio::join!(broadcast, store_verified_proposal(store, proposal));
-    Ok((StoredProposalHeader(header?, in_flight), handlers))
+) -> DagResult<StoredProposalHeader> {
+    let missing =
+        crate::proposal_store::verify_worker_payload(&committee, store, &proposal).await?;
+    if let Some((digest, _)) = missing.into_iter().next() {
+        return Err(DagError::MissingBatch(digest));
+    }
+    StoredProposalHeader::store(store, proposal, in_flight).await
 }
 
 /// The reliable sender takes ownership on its first successful enqueue. Poll
@@ -152,15 +144,11 @@ pub(crate) async fn prepare_local_proposal(
     in_flight: ProposalGuard,
     tx: &Sender<StoredProposalHeader>,
 ) -> DagResult<(Vec<CancelHandler>, Vec<SocketAddr>)> {
-    let (proposal, bytes) = verify_and_serialize_proposal(proposal, committee, true).await?;
+    let (proposal, bytes) = verify_and_serialize_proposal(proposal, committee).await?;
     let (network, addresses) = outbound;
-    let dispatch = try_broadcast(
-        network,
-        addresses,
-        bytes.expect("Missing outbound proposal"),
-    );
-    let header = store_verified_proposal(store, proposal).await?;
-    tx.send(StoredProposalHeader(header, Some(in_flight)))
+    let dispatch = try_broadcast(network, addresses, bytes);
+    let header = StoredProposalHeader::store(store, proposal, Some(in_flight)).await?;
+    tx.send(header)
         .await
         .expect("Failed to deliver local proposal");
     Ok(dispatch)
@@ -215,7 +203,7 @@ pub(crate) fn spawn_proposal_retry(
     tx
 }
 
-fn report(result: DagResult<()>) {
+pub(super) fn report(result: DagResult<()>) {
     match result {
         Ok(()) => (),
         Err(DagError::StoreError(e)) => panic!("Storage failure: {}", e),
@@ -231,61 +219,24 @@ pub(crate) fn spawn_proposal_processors(
     store: Store,
     consensus_round: Arc<AtomicU64>,
     gc_depth: Round,
-    mut rx_remote: Receiver<QueuedProposal>,
+    rx_remote: Receiver<QueuedProposal>,
+    rx_available: Receiver<(Digest, WorkerId)>,
+    sync_retry_delay: u64,
     mut rx_local: Receiver<Header>,
     tx: Sender<StoredProposalHeader>,
     in_flight: ProposalTracker,
 ) {
-    // Separate bounded consumers prevent a remote payload backlog from blocking
-    // local proposals. At most one blocking validation job per consumer is active.
-    let remote_committee = committee.clone();
-    let mut remote_store = store.clone();
-    let remote_round = consensus_round.clone();
-    let remote_tx = tx.clone();
-    tokio::spawn(async move {
-        let capacity = remote_committee
-            .size()
-            .saturating_mul(gc_depth as usize)
-            .max(1);
-        let mut delivered = HashSet::new();
-        let mut delivery_order = VecDeque::new();
-        while let Some((proposal, guard)) = rx_remote.recv().await {
-            if proposal.header.round
-                < remote_round
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(gc_depth)
-                || delivered.contains(&proposal.header.id)
-            {
-                continue;
-            }
-            report(
-                async {
-                    let id = proposal.header.id.clone();
-                    let (header, _) = prepare_proposal(
-                        proposal,
-                        remote_committee.clone(),
-                        &mut remote_store,
-                        None,
-                        Some(guard),
-                    )
-                    .await?;
-                    remote_tx
-                        .send(header)
-                        .await
-                        .expect("Failed to deliver stored proposal");
-                    // Remember only fully verified, stored and enqueued values.
-                    // Cache hits discard the incoming copy without applying it.
-                    delivered.insert(id.clone());
-                    delivery_order.push_back(id);
-                    if delivery_order.len() > capacity {
-                        delivered.remove(&delivery_order.pop_front().unwrap());
-                    }
-                    Ok(())
-                }
-                .await,
-            );
-        }
-    });
+    crate::payload_receiver::PayloadReceiver::spawn(
+        name,
+        committee.clone(),
+        store.clone(),
+        consensus_round.clone(),
+        gc_depth,
+        sync_retry_delay,
+        rx_remote,
+        rx_available,
+        tx.clone(),
+    );
     tokio::spawn(async move {
         let mut store = store;
         let mut network = crate::adversary::reliable_sender();
@@ -321,7 +272,7 @@ pub(crate) fn spawn_proposal_processors(
                         let round = header.round;
                         let guard = in_flight.track(&header);
                         let digest = guard.digest.clone();
-                        let proposal = assemble_proposal(&mut store, header).await?;
+                        let proposal = Proposal { header };
                         let (handlers, deferred) = prepare_local_proposal(
                             proposal, committee.clone(), &mut store,
                             (&mut network, addresses.clone()), guard, &tx,

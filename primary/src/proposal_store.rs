@@ -1,53 +1,64 @@
-//! Complete proposals on the wire, content-addressed batches and headers on disk.
-use crate::error::{DagError, DagResult};
-use crate::messages::{batch_key, proposal_header_key, Header, Proposal};
+//! Durable, authenticated proposal metadata. Transaction bytes live on workers.
+use crate::error::DagResult;
+use crate::messages::{proposal_header_key, worker_batch_key, Header, Proposal};
+use config::{Committee, WorkerId};
 use crypto::{Digest, Hash as _};
 use std::collections::BTreeMap;
 use store::Store;
 
-/// Caller must verify the complete proposal first. The header is also a marker
-/// that all referenced bytes were received: publish it atomically with the data.
-/// This marker says nothing about local READY, FINISH, or DAG validation.
+pub(crate) async fn verify_worker_payload(
+    committee: &Committee,
+    store: &mut Store,
+    proposal: &Proposal,
+) -> DagResult<BTreeMap<Digest, WorkerId>> {
+    proposal.verify(committee)?;
+    let mut missing = BTreeMap::new();
+    for (digest, &worker) in &proposal.header.payload {
+        if store
+            .read(worker_batch_key(digest, worker))
+            .await?
+            .is_none()
+        {
+            missing.insert(digest.clone(), worker);
+        }
+    }
+    Ok(missing)
+}
+
+/// Only publish after authentication and local worker availability.
 pub(crate) async fn store_verified_proposal(
     store: &mut Store,
     proposal: Proposal,
 ) -> DagResult<Header> {
-    let digest = proposal.block().digest();
-    let Proposal { header, batches } = proposal;
-    let mut entries: BTreeMap<_, _> = batches
-        .into_iter()
-        .map(|(digest, bytes)| (batch_key(&digest), bytes))
-        .collect();
-    entries.insert(proposal_header_key(&digest), bincode::serialize(&header)?);
-    store.write_batch_if_absent(entries).await?;
-    Ok(header)
-}
-
-/// Only data transmission needs to assemble payload bytes. Dependency checks
-/// read the compact header marker directly.
-pub(crate) async fn assemble_proposal(store: &mut Store, header: Header) -> DagResult<Proposal> {
-    let mut batches = BTreeMap::new();
-    for digest in header.payload.keys() {
-        let bytes = store
-            .read(batch_key(digest))
-            .await?
-            .ok_or_else(|| DagError::MissingBatch(digest.clone()))?;
-        batches.insert(digest.clone(), bytes);
-    }
-    Ok(Proposal { header, batches })
+    let key = proposal_header_key(&proposal.block().digest());
+    let bytes = bincode::serialize(&proposal.header)?;
+    store
+        .write_batch_if_absent(std::iter::once((key, bytes)).collect())
+        .await?;
+    Ok(proposal.header)
 }
 
 pub(crate) async fn load_proposal(
     store: &mut Store,
     digest: &Digest,
 ) -> DagResult<Option<Proposal>> {
-    match store.read(proposal_header_key(digest)).await? {
-        Some(bytes) => {
-            let header = bincode::deserialize(&bytes)?;
-            assemble_proposal(store, header).await.map(Some)
+    let bytes = match store.read(proposal_header_key(digest)).await? {
+        Some(bytes) => Some(bytes),
+        // Old primaries also stored signed headers. They can serve a repair,
+        // but the receiver still needs fresh receipts from its own workers.
+        None => {
+            store
+                .read([b"orca-proposal-header-v3/".as_ref(), digest.as_ref()].concat())
+                .await?
         }
-        None => Ok(None),
-    }
+    };
+    bytes
+        .map(|bytes| {
+            Ok(Proposal {
+                header: bincode::deserialize(&bytes)?,
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]

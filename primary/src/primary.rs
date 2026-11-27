@@ -5,15 +5,15 @@ use crate::garbage_collector::GarbageCollector;
 use crate::header_waiter::HeaderWaiter;
 use crate::helper::{Helper, RepairRequest};
 use crate::messages::{
-    batch_digest, batch_key, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GrbcVote,
-    GrbcVoteBatch as VoteBatch, Proposal, MAX_PROPOSAL_BYTES,
+    worker_batch_key, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GrbcVote,
+    GrbcVoteBatch as VoteBatch, Proposal,
 };
-use crate::payload_receiver::PayloadReceiver;
 use crate::proposal_processor::{spawn_proposal_processors, ProposalTracker, QueuedProposal};
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
 use crate::vote_sender::spawn_vote_sender;
 use async_trait::async_trait;
+use bincode::Options;
 use bytes::Bytes;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
@@ -51,7 +51,7 @@ pub enum PrimaryMessage {
     Consensus(ConsensusNetworkMessage),
     LeaderRequest(Round, PublicKey, /* requestor */ PublicKey),
     CertificatesRequest(Vec<Digest>, /* requestor */ PublicKey),
-    /// Request saved ECHO/READY votes when the complete proposal is already local.
+    /// Request saved ECHO/READY votes for a locally available header.
     VotesRequest(Vec<Digest>, /* requestor */ PublicKey),
 }
 
@@ -69,8 +69,8 @@ pub enum PrimaryWorkerMessage {
 /// The messages sent by the workers to their primary.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerPrimaryMessage {
-    /// The worker indicates it sealed a new batch.
-    OurBatch(Vec<u8>, WorkerId),
+    /// A locally authored batch is stored and has reached the worker quorum.
+    OurBatch(Digest, WorkerId),
     /// The worker indicates it received a batch's digest from another authority.
     OthersBatch(Digest, WorkerId),
 }
@@ -224,14 +224,14 @@ impl Primary {
     ) {
         crate::adversary::initialize(keypair.name, &committee)
             .expect("Invalid BENCH_ADVERSARY_CONFIG");
-        let (tx_others_digests, rx_others_digests) = channel(CHANNEL_CAPACITY);
+        let (tx_available, rx_available) = channel(CHANNEL_CAPACITY);
         let (tx_our_digests, rx_our_digests) = channel(CHANNEL_CAPACITY);
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
         let (tx_headers, rx_headers) = channel(CHANNEL_CAPACITY);
         let (tx_sync_headers, rx_sync_headers) = channel(CHANNEL_CAPACITY);
         let (tx_headers_loopback, rx_headers_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
-        // Bound resident bulk data independently from the small control messages.
+        // Keep incoming proposal processing separate from signed control votes.
         let (tx_remote_proposals, rx_remote_proposals) = channel(32);
         let (tx_stored_proposals, rx_stored_proposals) = channel(CHANNEL_CAPACITY);
         let (tx_votes, rx_votes) = channel(CHANNEL_CAPACITY);
@@ -306,7 +306,7 @@ impl Primary {
             WorkerReceiverHandler {
                 store: store.clone(),
                 tx_our_digests,
-                tx_others_digests,
+                tx_available,
             },
         );
         info!(
@@ -341,6 +341,8 @@ impl Primary {
             consensus_round.clone(),
             parameters.gc_depth,
             rx_remote_proposals,
+            rx_available,
+            parameters.sync_retry_delay,
             rx_headers,
             tx_stored_proposals,
             in_flight.clone(),
@@ -370,12 +372,7 @@ impl Primary {
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
         GarbageCollector::spawn(&name, &committee, rx_cleanup);
 
-        // Receives batch digests from other workers. They are only used to validate headers.
-        PayloadReceiver::spawn(store.clone(), /* rx_workers */ rx_others_digests);
-
-        // Whenever the `Synchronizer` does not manage to validate a header due to missing parent certificates of
-        // batch digests, it commands the `HeaderWaiter` to synchronizer with other nodes, wait for their reply, and
-        // re-schedule execution of the header once we have all missing data.
+        // Handle DAG repair independently of worker batch availability.
         HeaderWaiter::spawn(
             name,
             committee.clone(),
@@ -469,11 +466,11 @@ impl MessageHandler for PrimaryReceiverHandler {
 
         // Large frames decode away from runtime threads. Independent TCP
         // connections and queues let votes bypass a full bulk proposal queue.
-        let message = if serialized.len() > 64 * 1024 {
-            tokio::task::spawn_blocking(move || bincode::deserialize::<PrimaryMessage>(&serialized))
+        let message: PrimaryMessage = if serialized.len() > 64 * 1024 {
+            tokio::task::spawn_blocking(move || decode_frame::<PrimaryMessage>(&serialized))
                 .await??
         } else {
-            bincode::deserialize(&serialized).map_err(DagError::SerializationError)?
+            decode_frame(&serialized)?
         };
         match message {
             PrimaryMessage::Proposal(proposal) => {
@@ -504,41 +501,47 @@ impl MessageHandler for PrimaryReceiverHandler {
     }
 }
 
+// Both digest-only interfaces must consume the complete frame. A legacy
+// inline-batch message must not be accepted as a prefix-compatible header.
+pub(crate) fn decode_frame<T: serde::de::DeserializeOwned>(frame: &[u8]) -> bincode::Result<T> {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(frame.len() as u64)
+        .reject_trailing_bytes()
+        .deserialize(frame)
+}
+
 /// Defines how the network receiver handles incoming workers messages.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     store: Store,
-    tx_our_digests: Sender<(Digest, WorkerId, usize)>,
-    tx_others_digests: Sender<(Digest, WorkerId)>,
+    tx_our_digests: Sender<(Digest, WorkerId)>,
+    tx_available: Sender<(Digest, WorkerId)>,
 }
 
 #[async_trait]
 impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
-        match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(batch, worker_id) => {
-                if batch.len() > MAX_PROPOSAL_BYTES {
-                    return Err("batch exceeds complete-proposal payload limit".into());
-                }
-                let digest = batch_digest(&batch);
-                let size = batch.len();
-                let mut store = self.store.clone();
-                store
-                    .write_batch_if_absent(std::iter::once((batch_key(&digest), batch)).collect())
-                    .await?;
-                self.tx_our_digests
-                    .send((digest, worker_id, size))
-                    .await
-                    .expect("Failed to send local batch");
-            }
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => {
-                self.tx_others_digests
-                    .send((digest, worker_id))
-                    .await
-                    .expect("Failed to send worker digest");
-            }
+        let (digest, worker, own) = match decode_frame(&serialized)? {
+            WorkerPrimaryMessage::OurBatch(digest, worker) => (digest, worker, true),
+            WorkerPrimaryMessage::OthersBatch(digest, worker) => (digest, worker, false),
+        };
+        let key = worker_batch_key(&digest, worker);
+        self.store
+            .clone()
+            .write_batch_if_absent(std::iter::once((key, Vec::new())).collect())
+            .await?;
+        self.tx_available
+            .send((digest.clone(), worker))
+            .await
+            .expect("Closed batch availability channel");
+        if own {
+            self.tx_our_digests
+                .send((digest, worker))
+                .await
+                .expect("Closed proposer digest channel");
         }
-        let _ = writer.send(Bytes::from("Ack")).await;
+        writer.send(Bytes::from_static(b"Ack")).await?;
         Ok(())
     }
 }
