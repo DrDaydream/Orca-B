@@ -15,7 +15,7 @@ type StoreResult<T> = Result<T, StoreError>;
 type Key = Vec<u8>;
 type Value = Vec<u8>;
 type ReadWaiters = HashMap<Key, VecDeque<oneshot::Sender<StoreResult<Value>>>>;
-type AfterPut = Box<dyn FnOnce() + Send>;
+type AfterPut = Box<dyn FnOnce(StoreResult<()>) + Send>;
 
 pub enum StoreCommand {
     Write(Key, Value),
@@ -42,14 +42,10 @@ impl Store {
         let db = rocksdb::DB::open_default(path)?;
         let mut obligations = ReadWaiters::new();
         let (tx, mut rx) = channel(100);
-        // RocksDB reads, writes and compactions may block. Keep their FIFO
-        // ordering on one worker without stalling protocol tasks or timers.
-        // The runtime joins blocking workers during shutdown, ensuring the DB
-        // is closed before RocksDB's process-wide state is destroyed.
-        tokio::task::spawn_blocking(move || {
+        tokio::spawn(async move {
             // HeaderWaiter cancels incomplete reads during GC, including keys that may never arrive.
             let mut next_prune = Instant::now() + Duration::from_secs(1);
-            while let Some(command) = rx.blocking_recv() {
+            while let Some(command) = rx.recv().await {
                 if !obligations.is_empty() && Instant::now() >= next_prune {
                     obligations.retain(|_, waiters| {
                         waiters.retain(|waiter| !waiter.is_closed());
@@ -133,10 +129,11 @@ impl Store {
         value: Value,
         after_put: Option<AfterPut>,
     ) {
-        db.put(&key, &value).expect("Failed to persist store value");
+        let result = db.put(&key, &value);
         if let Some(after_put) = after_put {
-            after_put();
+            after_put(result);
         }
+        // Like main, notify registered readers with the submitted value after each put attempt.
         if let Some(mut senders) = obligations.remove(&key) {
             while let Some(sender) = senders.pop_front() {
                 let _ = sender.send(Ok(value.clone()));
@@ -188,12 +185,12 @@ impl Store {
         }
     }
 
-    /// Enqueue a normal write and run the observer on the store actor after DB::put returns.
+    /// Enqueue a normal write and report DB::put's result from the store task.
     pub async fn write_observed(
         &mut self,
         key: Key,
         value: Value,
-        after_put: impl FnOnce() + Send + 'static,
+        after_put: impl FnOnce(StoreResult<()>) + Send + 'static,
     ) {
         self.channel
             .send(StoreCommand::WriteObserved(key, value, Box::new(after_put)))

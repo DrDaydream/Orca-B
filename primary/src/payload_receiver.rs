@@ -31,8 +31,13 @@ impl PayloadReceiver {
             #[cfg(feature = "benchmark")]
             {
                 let stored = digest.clone();
-                self.store.write_observed(key, Vec::new(), move || {
-                    log::info!(target: "orca_pipeline", "event=receipt_put_done batch={:?} worker={}", stored, worker_id);
+                self.store.write_observed(key, Vec::new(), move |result| {
+                    match result {
+                        Ok(()) => log::info!(target: "orca_pipeline",
+                            "event=receipt_put_done batch={:?} worker={}", stored, worker_id),
+                        Err(error) => log::error!(target: "orca_pipeline",
+                            "event=receipt_put_failed batch={:?} worker={} error={}", stored, worker_id, error),
+                    }
                 }).await;
                 log::info!(target: "orca_pipeline", "event=receipt_store_enqueued batch={:?} worker={}", digest, worker_id);
             }

@@ -2,42 +2,47 @@
 use super::*;
 use std::fs;
 
-#[test]
-fn database_progress_does_not_depend_on_polling_the_async_runtime() {
-    // A busy protocol runtime must not also suspend the database actor. Exercise
-    // the real store, including the atomic write acknowledgement, outside block_on.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    let path = format!(".db_test_independent_actor_{}", std::process::id());
+#[tokio::test(flavor = "current_thread")]
+async fn observed_put_runs_on_the_async_runtime() {
+    let path = format!(".db_test_observed_put_{}", std::process::id());
     let _ = fs::remove_dir_all(&path);
-    let store = runtime.block_on(async { Store::new(&path).unwrap() });
-    let (sender, mut receiver) = oneshot::channel();
+    let mut store = Store::new(&path).unwrap();
+    let runtime_thread = std::thread::current().id();
+    let (sender, receiver) = oneshot::channel();
     store
-        .channel
-        .try_send(StoreCommand::WriteBatchIfAbsent(
-            [(vec![4], vec![9])].iter().cloned().collect(),
-            sender,
-        ))
-        .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    let result = loop {
-        match receiver.try_recv() {
-            Ok(result) => break Some(result),
-            Err(oneshot::error::TryRecvError::Empty) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            _ => break None,
-        }
-    };
-    drop(store);
-    drop(runtime);
-    assert_eq!(
-        result
-            .expect("database stalled behind the async runtime")
-            .unwrap(),
-        1
+        .write_observed(vec![4], vec![9], move |result| {
+            sender.send((std::thread::current().id(), result)).unwrap();
+        })
+        .await;
+    let (writer_thread, result) = receiver.await.unwrap();
+    result.unwrap();
+    assert_eq!(writer_thread, runtime_thread);
+    assert_eq!(store.read(vec![4]).await.unwrap(), Some(vec![9]));
+}
+
+#[tokio::test]
+async fn failed_put_reports_the_error_and_wakes_registered_readers() {
+    let path = format!(".db_test_read_only_put_{}", std::process::id());
+    let _ = fs::remove_dir_all(&path);
+    drop(rocksdb::DB::open_default(&path).unwrap());
+    let db = rocksdb::DB::open_for_read_only(&rocksdb::Options::default(), &path, false).unwrap();
+    let (notify, reader) = oneshot::channel();
+    let mut waiters = ReadWaiters::new();
+    waiters.entry(vec![4]).or_default().push_back(notify);
+    let (report, observed) = oneshot::channel();
+    Store::put(
+        &db,
+        &mut waiters,
+        vec![4],
+        vec![9],
+        Some(Box::new(move |result| {
+            report.send(result).unwrap();
+        })),
     );
+
+    assert!(observed.await.unwrap().is_err());
+    assert_eq!(reader.await.unwrap().unwrap(), vec![9]);
+    assert!(db.get(&[4u8]).unwrap().is_none());
 }
 
 #[tokio::test]

@@ -76,9 +76,13 @@ impl Processor {
                 #[cfg(feature = "benchmark")]
                 {
                     let stored_digest = digest.clone();
-                    store.write_observed(digest.to_vec(), batch.serialized, move || {
-                        log::info!(target: "orca_pipeline", "event=store_put_done batch={:?} source={} worker={}",
-                            stored_digest, source, id);
+                    store.write_observed(digest.to_vec(), batch.serialized, move |result| {
+                        match result {
+                            Ok(()) => log::info!(target: "orca_pipeline",
+                                "event=store_put_done batch={:?} source={} worker={}", stored_digest, source, id),
+                            Err(error) => log::error!(target: "orca_pipeline",
+                                "event=store_put_failed batch={:?} source={} worker={} error={}", stored_digest, source, id, error),
+                        }
                     }).await;
                     log::info!(target: "orca_pipeline", "event=store_enqueued batch={:?} source={} worker={}",
                         digest, source, id);
