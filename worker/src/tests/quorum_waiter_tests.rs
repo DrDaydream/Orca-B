@@ -42,14 +42,12 @@ async fn wait_for_quorum() {
     let message = QuorumWaiterMessage {
         batch: serialized.clone(),
         handlers: names.into_iter().zip(handlers.into_iter()).collect(),
-        #[cfg(feature = "benchmark")]
-        digest: crate::processor::batch_digest(&serialized),
     };
     tx_message.send(message).await.unwrap();
 
     // Wait for the `QuorumWaiter` to gather enough acknowledgements and output the batch.
     let output = rx_batch.recv().await.unwrap();
-    assert_eq!(output.serialized, serialized);
+    assert_eq!(output, serialized);
 
     // Ensure the other listeners correctly received the batch.
     assert!(try_join_all(listener_handles).await.is_ok());

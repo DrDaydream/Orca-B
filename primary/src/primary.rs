@@ -482,10 +482,6 @@ impl MessageHandler for PrimaryReceiverHandler {
         };
         match message {
             PrimaryMessage::Header(header) => {
-                #[cfg(feature = "benchmark")]
-                log::info!(target: "orca_pipeline",
-                    "event=remote_received header={:?} round={} author={:?} batches={}",
-                    header.id, header.round, header.author, header.payload.len());
                 // Register before waiting for space in the bounded bulk queue.
                 let guard = self.in_flight.track(&header);
                 self.tx_remote_proposals
@@ -503,22 +499,11 @@ impl MessageHandler for PrimaryReceiverHandler {
                 .send(RepairRequest::Votes(missing, requestor))
                 .await
                 .expect("Failed to send vote repair request"),
-            request => {
-                #[cfg(feature = "benchmark")]
-                match &request {
-                    PrimaryMessage::GrbcVote(vote) => log::info!(target: "orca_pipeline",
-                        "event=vote_frame_received round={} voter={:?} phase={:?} headers=[{:?}]",
-                        vote.round, vote.author, vote.phase, vote.id),
-                    PrimaryMessage::GrbcVoteBatch(batch) => log::info!(target: "orca_pipeline",
-                        "event=vote_frame_received round={} voter={:?} phase={:?} headers={:?}",
-                        batch.round, batch.author, batch.phase, batch.votes.iter().map(|v| &v.0).collect::<Vec<_>>()),
-                    _ => {}
-                }
-                self.tx_primary_messages
-                    .send(request)
-                    .await
-                    .expect("Failed to send certificate");
-            }
+            request => self
+                .tx_primary_messages
+                .send(request)
+                .await
+                .expect("Failed to send certificate"),
         }
         Ok(())
     }
@@ -549,26 +534,18 @@ impl MessageHandler for WorkerReceiverHandler {
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize and parse the message.
-        let (queue, digest, worker_id, _source) = match decode_frame(&serialized)? {
-            WorkerPrimaryMessage::OurBatch(digest, id) => (&self.tx_our_digests, digest, id, "own"),
-            WorkerPrimaryMessage::OthersBatch(digest, id) => {
-                (&self.tx_others_digests, digest, id, "other")
-            }
-        };
-        #[cfg(feature = "benchmark")]
-        let batch = digest.clone();
-        #[cfg(feature = "benchmark")]
-        log::info!(target: "orca_pipeline",
-            "event=primary_notice_received batch={:?} worker={} source={} queue_free={}",
-            batch, worker_id, _source, queue.capacity());
-        queue
-            .send((digest, worker_id))
-            .await
-            .expect("Failed to send workers' digests");
-        #[cfg(feature = "benchmark")]
-        log::info!(target: "orca_pipeline",
-            "event=primary_notice_enqueued batch={:?} worker={} source={} queue_free={}",
-            batch, worker_id, _source, queue.capacity());
+        match decode_frame(&serialized)? {
+            WorkerPrimaryMessage::OurBatch(digest, worker_id) => self
+                .tx_our_digests
+                .send((digest, worker_id))
+                .await
+                .expect("Failed to send workers' digests"),
+            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => self
+                .tx_others_digests
+                .send((digest, worker_id))
+                .await
+                .expect("Failed to send workers' digests"),
+        }
         Ok(())
     }
 }

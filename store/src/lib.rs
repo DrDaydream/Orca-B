@@ -15,11 +15,9 @@ type StoreResult<T> = Result<T, StoreError>;
 type Key = Vec<u8>;
 type Value = Vec<u8>;
 type ReadWaiters = HashMap<Key, VecDeque<oneshot::Sender<StoreResult<Value>>>>;
-type AfterPut = Box<dyn FnOnce(StoreResult<()>) + Send>;
 
 pub enum StoreCommand {
     Write(Key, Value),
-    WriteObserved(Key, Value, AfterPut),
     WriteBatchIfAbsent(BTreeMap<Key, Value>, oneshot::Sender<StoreResult<usize>>),
     RestoreWorkerReceipts(oneshot::Sender<StoreResult<()>>),
     Read(Key, oneshot::Sender<StoreResult<Option<Value>>>),
@@ -55,10 +53,7 @@ impl Store {
                 }
                 match command {
                     StoreCommand::Write(key, value) => {
-                        Self::put(&db, &mut obligations, key, value, None);
-                    }
-                    StoreCommand::WriteObserved(key, value, after_put) => {
-                        Self::put(&db, &mut obligations, key, value, Some(after_put));
+                        Self::put(&db, &mut obligations, key, value);
                     }
                     StoreCommand::WriteBatchIfAbsent(entries, sender) => {
                         // This actor owns every write, so the existence check and
@@ -122,16 +117,14 @@ impl Store {
         Ok(Self { channel: tx })
     }
 
-    fn put(
-        db: &rocksdb::DB,
-        obligations: &mut ReadWaiters,
-        key: Key,
-        value: Value,
-        after_put: Option<AfterPut>,
-    ) {
-        let result = db.put(&key, &value);
-        if let Some(after_put) = after_put {
-            after_put(result);
+    fn put(db: &rocksdb::DB, obligations: &mut ReadWaiters, key: Key, value: Value) {
+        if let Err(error) = db.put(&key, &value) {
+            log::error!(
+                "RocksDB write failed in {} for key {:?}: {}",
+                db.path().display(),
+                key,
+                error
+            );
         }
         // Like main, notify registered readers with the submitted value after each put attempt.
         if let Some(mut senders) = obligations.remove(&key) {
@@ -183,19 +176,6 @@ impl Store {
         if let Err(e) = self.channel.send(StoreCommand::Write(key, value)).await {
             panic!("Failed to send Write command to store: {}", e);
         }
-    }
-
-    /// Enqueue a normal write and report DB::put's result from the store task.
-    pub async fn write_observed(
-        &mut self,
-        key: Key,
-        value: Value,
-        after_put: impl FnOnce(StoreResult<()>) + Send + 'static,
-    ) {
-        self.channel
-            .send(StoreCommand::WriteObserved(key, value, Box::new(after_put)))
-            .await
-            .expect("Failed to send observed Write command to store");
     }
 
     pub async fn read(&mut self, key: Key) -> StoreResult<Option<Value>> {

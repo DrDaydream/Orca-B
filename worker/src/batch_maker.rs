@@ -1,10 +1,12 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-#[cfg(feature = "benchmark")]
-use crate::processor::batch_digest;
 use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
+#[cfg(feature = "benchmark")]
+use crypto::Digest;
 use crypto::PublicKey;
+#[cfg(feature = "benchmark")]
+use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::ReliableSender;
@@ -128,8 +130,6 @@ impl BatchMaker {
     async fn seal(&mut self) {
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
-        #[cfg(feature = "benchmark")]
-        let transactions = self.current_batch.len();
 
         // Look for sample txs (they all start with 0) and gather their txs id (the next 8 bytes).
         #[cfg(feature = "benchmark")]
@@ -147,13 +147,14 @@ impl BatchMaker {
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
         #[cfg(feature = "benchmark")]
-        let digest = batch_digest(&serialized);
-        #[cfg(feature = "benchmark")]
         {
-            log::info!(target: "orca_pipeline",
-                "event=batch_sealed batch={:?} source=own txs={} payload_bytes={} wire_bytes={} peers={} silence_control_round={}",
-                digest, transactions, size, serialized.len(), self.workers_addresses.len(),
-                self.rx_batch_silent.borrow().0);
+            // NOTE: This is one extra hash that is only needed to print the following log entries.
+            let digest = Digest(
+                Sha512::digest(&serialized).as_slice()[..32]
+                    .try_into()
+                    .unwrap(),
+            );
+
             for id in tx_ids {
                 // NOTE: This log entry is used to compute performance.
                 info!(
@@ -171,21 +172,14 @@ impl BatchMaker {
         let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
         let bytes = Bytes::from(serialized.clone());
         let handlers = self.network.broadcast(addresses, bytes).await;
-        #[cfg(feature = "benchmark")]
-        log::info!(target: "orca_pipeline", "event=broadcast_enqueued batch={:?} source=own peers={}",
-            digest, handlers.len());
 
         // Send the batch through the deliver channel for further processing.
         self.tx_message
             .send(QuorumWaiterMessage {
                 batch: serialized,
                 handlers: names.into_iter().zip(handlers.into_iter()).collect(),
-                #[cfg(feature = "benchmark")]
-                digest: digest.clone(),
             })
             .await
             .expect("Failed to deliver batch");
-        #[cfg(feature = "benchmark")]
-        log::info!(target: "orca_pipeline", "event=quorum_enqueued batch={:?} source=own", digest);
     }
 }

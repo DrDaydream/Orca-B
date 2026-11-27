@@ -22,25 +22,8 @@ impl PayloadReceiver {
 
     async fn run(&mut self) {
         while let Some((digest, worker_id)) = self.rx_workers.recv().await {
-            #[cfg(feature = "benchmark")]
-            log::info!(target: "orca_pipeline", "event=receipt_dequeued batch={:?} worker={} queued={}",
-                digest, worker_id, self.rx_workers.len());
             let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
-            #[cfg(not(feature = "benchmark"))]
             self.store.write(key.to_vec(), Vec::default()).await;
-            #[cfg(feature = "benchmark")]
-            {
-                let stored = digest.clone();
-                self.store.write_observed(key, Vec::new(), move |result| {
-                    match result {
-                        Ok(()) => log::info!(target: "orca_pipeline",
-                            "event=receipt_put_done batch={:?} worker={}", stored, worker_id),
-                        Err(error) => log::error!(target: "orca_pipeline",
-                            "event=receipt_put_failed batch={:?} worker={} error={}", stored, worker_id, error),
-                    }
-                }).await;
-                log::info!(target: "orca_pipeline", "event=receipt_store_enqueued batch={:?} worker={}", digest, worker_id);
-            }
         }
     }
 }

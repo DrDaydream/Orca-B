@@ -49,7 +49,7 @@ pub(crate) fn spawn_vote_sender(
                         match rx.try_recv() { Ok(message) => add(message), Err(_) => break }
                     }
                     let oldest = consensus_round.load(Ordering::Relaxed).saturating_sub(gc_depth);
-                    for ((requestor, round, _phase, _voter), votes) in grouped {
+                    for ((requestor, round, _, _), votes) in grouped {
                         if round < oldest { continue; }
                         let destinations = match requestor {
                             Some(peer) => match committee.primary(&peer) {
@@ -58,24 +58,12 @@ pub(crate) fn spawn_vote_sender(
                             },
                             None => addresses.clone(),
                         };
-                        #[cfg(feature = "benchmark")]
-                        let headers: Vec<_> = votes.iter().map(|vote| vote.id.clone()).collect();
-                        #[cfg(feature = "benchmark")]
-                        let peers = destinations.len();
-                        #[cfg(feature = "benchmark")]
-                        log::info!(target: "orca_pipeline",
-                            "event=vote_broadcast_started round={} voter={:?} phase={:?} peers={} repair={} headers={:?}",
-                            round, _voter, _phase, peers, requestor.is_some(), headers);
                         let batch = GrbcVoteBatch::from_votes(votes).expect("Mixed GRBC vote batch");
                         let bytes = bincode::serialize(&PrimaryMessage::GrbcVoteBatch(batch))
                             .expect("Failed to serialize GRBC votes");
                         pending.entry(round).or_default().extend(
                             network.broadcast(destinations, Bytes::from(bytes)).await
                         );
-                        #[cfg(feature = "benchmark")]
-                        log::info!(target: "orca_pipeline",
-                            "event=vote_broadcast_returned round={} voter={:?} phase={:?} peers={} repair={} headers={:?}",
-                            round, _voter, _phase, peers, requestor.is_some(), headers);
                     }
                 }
                 _ = cleanup.tick() => {}

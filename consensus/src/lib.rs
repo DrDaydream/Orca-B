@@ -228,15 +228,6 @@ impl State {
         Some(ready_at)
     }
 
-    #[cfg(feature = "benchmark")]
-    fn log_observed(certificate: &Certificate, digest: &Digest) {
-        info!(
-            target: "orca_pipeline",
-            "event=consensus_observed header={:?} block={:?} round={} author={:?}",
-            certificate.header.id, digest, certificate.round(), certificate.origin()
-        );
-    }
-
     /// Record valid data seen at any GRBC stage. If it belongs to the causal
     /// history of a commit-ready leader, admit it immediately without waiting
     /// for grade 1 or grade 2.
@@ -253,8 +244,6 @@ impl State {
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(certificate.clone());
-                #[cfg(feature = "benchmark")]
-                Self::log_observed(&certificate, &digest);
             }
         }
         self.index_strong_paths(&certificate);
@@ -355,7 +344,7 @@ impl State {
                 }
             }
             if !self.dag_digests.contains(&digest) {
-                self.promote_to_dag_from(certificate, "forced_history");
+                self.promote_to_dag(certificate);
             }
         }
     }
@@ -371,31 +360,16 @@ impl State {
         if self.grade_two.contains(&digest) {
             self.promotion_queue.push_back(digest.clone());
         }
-        #[cfg(feature = "benchmark")]
-        let block = digest.clone();
-        let _previous = self
-            .vdag
+        self.vdag
             .entry(round)
             .or_insert_with(HashMap::new)
             .insert(origin, (digest, certificate.clone()));
-        #[cfg(feature = "benchmark")]
-        if _previous.as_ref().map(|(old, _)| old) != Some(&block) {
-            info!(
-                target: "orca_pipeline",
-                "event=consensus_vdag_inserted header={:?} block={:?} round={} author={:?}",
-                certificate.header.id, block, round, origin
-            );
-        }
         self.observe(certificate)
     }
 
     /// Promote a grade-1 block into Tusk's ordering DAG. A block contained in
     /// Dag must never remain in VDag.
     fn promote_to_dag(&mut self, certificate: Certificate) {
-        self.promote_to_dag_from(certificate, "grade_two");
-    }
-
-    fn promote_to_dag_from(&mut self, certificate: Certificate, _source: &'static str) {
         let round = certificate.round();
         let origin = certificate.origin();
         let digest = certificate.digest();
@@ -404,13 +378,9 @@ impl State {
             .entry(round)
             .or_default()
             .insert(origin, digest.clone());
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            self.observed.entry(digest.clone())
-        {
-            entry.insert(certificate.clone());
-            #[cfg(feature = "benchmark")]
-            Self::log_observed(&certificate, &digest);
-        }
+        self.observed
+            .entry(digest.clone())
+            .or_insert_with(|| certificate.clone());
 
         if let Some(authorities) = self.vdag.get_mut(&round) {
             let same_block = authorities
@@ -432,16 +402,6 @@ impl State {
         if !self.dag_digests.insert(digest.clone()) {
             return;
         }
-        let inserted = self
-            .dag_by_digest
-            .get(&digest)
-            .expect("new Dag block missing from digest index");
-        #[cfg(feature = "benchmark")]
-        info!(
-            target: "orca_pipeline",
-            "event=consensus_dag_inserted header={:?} block={:?} round={} author={:?} source={}",
-            inserted.header.id, digest, round, origin, _source
-        );
         if let Some(ancestors) = self.two_hop_ancestors.get(&digest) {
             for ancestor in ancestors {
                 self.dag_strong_support
@@ -450,7 +410,13 @@ impl State {
                     .insert(origin);
             }
         }
-        for parent in &inserted.header.parents {
+        for parent in &self
+            .dag_by_digest
+            .get(&digest)
+            .expect("new Dag block missing from digest index")
+            .header
+            .parents
+        {
             self.dag_direct_support
                 .entry((round, parent.clone()))
                 .or_default()
@@ -1032,11 +998,6 @@ impl Consensus {
                     state.aba_outbox.push(message);
                 }
                 AbaAction::Decide(value) => {
-                    #[cfg(feature = "benchmark")]
-                    let decided_us = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .expect("System clock is before Unix epoch")
-                        .as_micros();
                     // ABA is the cold-path trigger for an older leader. Before
                     // applying its output, perform one final targeted scan of
                     // that leader's rule-1 and rule-2 support rounds. A direct
@@ -1047,10 +1008,9 @@ impl Consensus {
                         if let Some(started_at) = state.aba_started_at.remove(&leader_round) {
                             #[cfg(feature = "benchmark")]
                             info!(
-                                "ABA duration round {} ms {} decided_us={}",
+                                "ABA duration round {} ms {}",
                                 leader_round,
-                                started_at.elapsed().as_millis(),
-                                decided_us
+                                started_at.elapsed().as_millis()
                             );
                         }
                         self.apply_aba_decision(leader_round, value, state).await;
@@ -1084,25 +1044,6 @@ impl Consensus {
         } else {
             3
         };
-        #[cfg(feature = "benchmark")]
-        {
-            let direct_ready = state.direct_commit_ready.contains(&leader_round);
-            if let Some(leader) = self.observed_leader(leader_round, state) {
-                info!(
-                    target: "orca_pipeline",
-                    "event=aba_decided header={:?} block={:?} round={} author={:?} value={} fallback_rule={} direct_ready={}",
-                    leader.header.id, leader.digest(), leader_round, leader.origin(),
-                    value.index(), aba_rule, direct_ready
-                );
-            } else {
-                info!(
-                    target: "orca_pipeline",
-                    "event=aba_decided header=- block=- round={} author={:?} value={} fallback_rule={} direct_ready={}",
-                    leader_round, self.ordering_leader_authority(leader_round), value.index(),
-                    aba_rule, direct_ready
-                );
-            }
-        }
         match value {
             BinaryValue::Zero => {
                 if state.direct_commit_ready.contains(&leader_round) {
@@ -1372,12 +1313,6 @@ impl Consensus {
             return;
         }
 
-        #[cfg(feature = "benchmark")]
-        info!(
-            target: "orca_pipeline",
-            "event=leader_rule_satisfied header={:?} block={:?} round={} rule=1 support_round={} observed_stake={} dag_stake={}",
-            leader.header.id, leader_digest, leader_round, r, observed_stake, dag_stake
-        );
         debug!(
             "Leader {:?} satisfies commit rule 1: observed {}, Dag {}",
             leader, observed_stake, dag_stake
@@ -1426,13 +1361,6 @@ impl Consensus {
             return;
         }
 
-        #[cfg(feature = "benchmark")]
-        info!(
-            target: "orca_pipeline",
-            "event=leader_rule_satisfied header={:?} block={:?} round={} rule=2 support_round={} observed_strong_stake={} dag_strong_stake={} dag_strong_or_virtual_stake={}",
-            leader.header.id, leader_digest, leader_round, q, observed_strong, dag_strong,
-            dag_strong_or_virtual
-        );
         if condition_three && !state.grade_two.contains(&leader_digest) {
             debug!("Commit rule 2 forces grade 2 for {:?}", leader);
             state.mark_grade_two(leader_digest.clone());
@@ -1609,20 +1537,6 @@ impl Consensus {
         state.pending_order.insert(round, ordered);
         state.pending_leaders.entry(round).or_insert(leader);
         state.wake_pending(round);
-        #[cfg(feature = "benchmark")]
-        {
-            let queued = &state.pending_leaders[&round];
-            let source = if state.direct_commit_ready.contains(&round) {
-                "direct"
-            } else {
-                "aba"
-            };
-            info!(
-                target: "orca_pipeline",
-                "event=leader_queued header={:?} block={:?} round={} rule={} source={} predecessor_resolved={}",
-                queued.header.id, queued.digest(), round, rule, source, state.predecessor_resolved(round)
-            );
-        }
 
         self.drain_ready_leaders(state).await;
     }
@@ -1686,23 +1600,15 @@ impl Consensus {
             let _committed_at_ms = committed_at.as_millis();
             let _committed_at_us = committed_at.as_micros();
             state.update(&sequence, self.gc_depth);
-            #[cfg(feature = "benchmark")]
-            info!(
-                target: "orca_pipeline",
-                "event=leader_committed header={:?} block={:?} round={} rule={} headers={} ready_ms={} commit_us={}",
-                leader.header.id, leader.digest(), ready_round, commit_rule, sequence.len(),
-                _rule_ready_at_ms, _committed_at_us
-            );
             for certificate in &sequence {
                 #[cfg(not(feature = "benchmark"))]
                 info!("Committed {}", certificate.header);
                 #[cfg(feature = "benchmark")]
                 info!(
-                    "Header committed round {} digest {:?} leader {} owner_round={}",
+                    "Header committed round {} digest {:?} leader {}",
                     certificate.round(),
                     certificate.header.digest(),
-                    certificate.origin() == self.ordering_leader_authority(certificate.round()),
-                    ready_round
+                    certificate.origin() == self.ordering_leader_authority(certificate.round())
                 );
                 #[cfg(feature = "benchmark")]
                 for digest in certificate.header.payload.keys() {

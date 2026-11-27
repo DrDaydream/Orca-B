@@ -2,26 +2,29 @@
 use super::*;
 use std::fs;
 
-#[tokio::test(flavor = "current_thread")]
-async fn observed_put_runs_on_the_async_runtime() {
-    let path = format!(".db_test_observed_put_{}", std::process::id());
+#[test]
+fn store_processes_writes_on_the_async_runtime() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let started_thread = Arc::new(AtomicBool::new(false));
+    let on_start = Arc::clone(&started_thread);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .on_thread_start(move || on_start.store(true, Ordering::SeqCst))
+        .build()
+        .unwrap();
+    let path = format!(".db_test_runtime_put_{}", std::process::id());
     let _ = fs::remove_dir_all(&path);
-    let mut store = Store::new(&path).unwrap();
-    let runtime_thread = std::thread::current().id();
-    let (sender, receiver) = oneshot::channel();
-    store
-        .write_observed(vec![4], vec![9], move |result| {
-            sender.send((std::thread::current().id(), result)).unwrap();
-        })
-        .await;
-    let (writer_thread, result) = receiver.await.unwrap();
-    result.unwrap();
-    assert_eq!(writer_thread, runtime_thread);
-    assert_eq!(store.read(vec![4]).await.unwrap(), Some(vec![9]));
+    runtime.block_on(async {
+        let mut store = Store::new(&path).unwrap();
+        store.write(vec![4], vec![9]).await;
+        assert_eq!(store.read(vec![4]).await.unwrap(), Some(vec![9]));
+    });
+    assert!(!started_thread.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
-async fn failed_put_reports_the_error_and_wakes_registered_readers() {
+async fn failed_put_wakes_registered_readers() {
     let path = format!(".db_test_read_only_put_{}", std::process::id());
     let _ = fs::remove_dir_all(&path);
     drop(rocksdb::DB::open_default(&path).unwrap());
@@ -29,18 +32,8 @@ async fn failed_put_reports_the_error_and_wakes_registered_readers() {
     let (notify, reader) = oneshot::channel();
     let mut waiters = ReadWaiters::new();
     waiters.entry(vec![4]).or_default().push_back(notify);
-    let (report, observed) = oneshot::channel();
-    Store::put(
-        &db,
-        &mut waiters,
-        vec![4],
-        vec![9],
-        Some(Box::new(move |result| {
-            report.send(result).unwrap();
-        })),
-    );
+    Store::put(&db, &mut waiters, vec![4], vec![9]);
 
-    assert!(observed.await.unwrap().is_err());
     assert_eq!(reader.await.unwrap().unwrap(), vec![9]);
     assert!(db.get(&[4u8]).unwrap().is_none());
 }

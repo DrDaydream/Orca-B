@@ -81,14 +81,7 @@ impl CertificatesAggregator {
 
         self.certificates.push(certificate.digest());
         self.weight += committee.stake(&origin);
-        let quorum = committee.quorum_threshold();
-        #[cfg(feature = "benchmark")]
-        log::info!(
-            target: "orca_pipeline",
-            "event=parent_counted header={:?} round={} author={:?} distinct={} weight={} quorum={}",
-            certificate.header.id, certificate.round(), origin, self.used.len(), self.weight, quorum
-        );
-        if self.weight >= quorum {
+        if self.weight >= committee.quorum_threshold() {
             self.weight = 0; // Ensures quorum is only reached once.
             return Ok(Some(self.certificates.drain(..).collect()));
         }

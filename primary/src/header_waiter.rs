@@ -365,15 +365,7 @@ impl HeaderWaiter {
                                 })
                                 .collect();
                             let (tx_cancel, rx_cancel) = channel(1);
-                            #[cfg(feature = "benchmark")]
-                            let request_header_id = header_id.clone();
                             self.pending.insert(header_id, (round, author, tx_cancel));
-                            #[cfg(feature = "benchmark")]
-                            log::info!(
-                                target: "orca_pipeline",
-                                "event=batch_wait header={:?} round={} author={:?} missing={}",
-                                request_header_id, round, author, missing.len()
-                            );
                             let fut = Self::waiter(wait_for, header, rx_cancel);
                             waiting.push(fut);
 
@@ -390,17 +382,9 @@ impl HeaderWaiter {
                             for (worker_id, digests) in requires_sync {
                                 let address = self.committee.worker(&self.name, &worker_id)
                                     .expect("Missing local worker for a verified header").primary_to_worker;
-                                #[cfg(feature = "benchmark")]
-                                let batches = digests.len();
                                 let message = PrimaryWorkerMessage::Synchronize(digests, author);
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize batch sync request");
                                 self.network.send(address, Bytes::from(bytes)).await;
-                                #[cfg(feature = "benchmark")]
-                                log::info!(
-                                    target: "orca_pipeline",
-                                    "event=batch_request header={:?} round={} author={:?} worker={} batches={}",
-                                    request_header_id, round, author, worker_id, batches
-                                );
                             }
                         }
                         WaiterMessage::Committed(blocks) => {

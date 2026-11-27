@@ -190,28 +190,16 @@ impl Proposer {
         );
 
         #[cfg(feature = "benchmark")]
-        info!(target: "orca_pipeline",
-            "event=proposal_created header={:?} block={:?} round={} author={:?} batches={} parents={} weak={} virtual={}",
-            header.id, header.block_digest(), header.round, header.author, header.payload.len(),
-            header.parents.len(), header.weak_edges.len(), header.virtual_edges.len());
-
-        #[cfg(feature = "benchmark")]
-        for (digest, worker) in &header.payload {
+        for digest in header.payload.keys() {
             // NOTE: This log entry is used to compute performance.
             info!("Created {} -> {:?}", header, digest);
-            info!(target: "orca_pipeline", "event=proposal_batch header={:?} round={} batch={:?} worker={}",
-                header.id, header.round, digest, worker);
         }
 
         // Send the new header to the `Core` that will broadcast and process it.
-        #[cfg(feature = "benchmark")]
-        let header_id = header.id.clone();
         self.tx_core
             .send(header)
             .await
             .expect("Failed to send header");
-        #[cfg(feature = "benchmark")]
-        info!(target: "orca_pipeline", "event=proposal_enqueued header={:?} round={}", header_id, self.round);
     }
 
     // Main loop listening to incoming messages.
@@ -240,11 +228,6 @@ impl Proposer {
                     self.last_virtual_edges.clear();
                 } else {
                     // Make a new header.
-                    #[cfg(feature = "benchmark")]
-                    info!(target: "orca_pipeline",
-                        "event=proposal_eligible round={} author={:?} parents={} pending={} digest_bytes={} size_met={} timer_elapsed={}",
-                        self.round, self.name, self.last_parents.len(), self.digests.len(), self.payload_size,
-                        enough_digests, timer_expired);
                     self.make_header().await;
                     self.payload_size = 0;
                 }
@@ -256,10 +239,6 @@ impl Proposer {
 
             tokio::select! {
                 Some((parents, weak_edges, virtual_edges, round)) = self.rx_core.recv() => {
-                    #[cfg(feature = "benchmark")]
-                    info!(target: "orca_pipeline",
-                        "event=parents_dequeued round={} next_round={} proposer_round={} parents={} stale={}",
-                        round, round + 1, self.round, parents.len(), round < self.round);
                     if round < self.round {
                         continue;
                     }
@@ -276,10 +255,6 @@ impl Proposer {
                 Some((digest, worker_id)) = self.rx_workers.recv() => {
                     #[cfg(feature = "benchmark")]
                     info!("Benchmark proposer received batch {:?} worker {}", digest, worker_id);
-                    #[cfg(feature = "benchmark")]
-                    info!(target: "orca_pipeline",
-                        "event=proposer_dequeued batch={:?} worker={} round={} queued={} pending_before={}",
-                        digest, worker_id, self.round, self.rx_workers.len(), self.digests.len());
                     self.payload_size += digest.size();
                     self.digests.push((digest, worker_id));
                 }
