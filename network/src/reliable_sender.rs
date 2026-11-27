@@ -246,12 +246,6 @@ impl Connection {
         loop {
             match TcpStream::connect(self.address).await {
                 Ok(stream) => {
-                    if let Err(error) = stream.set_nodelay(true) {
-                        warn!(
-                            "Could not enable TCP_NODELAY for {}: {}",
-                            self.address, error
-                        );
-                    }
                     info!("Outgoing connection established with {}", self.address);
 
                     // Reset the delay.

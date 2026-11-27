@@ -154,9 +154,6 @@ impl Client {
         let stream = TcpStream::connect(self.target)
             .await
             .context(format!("failed to connect to {}", self.target))?;
-        stream
-            .set_nodelay(true)
-            .context("Could not enable input TCP_NODELAY")?;
         let plan = match &self.start_plan {
             Some(path) => {
                 info!("Benchmark clock ready");
