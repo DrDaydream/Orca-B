@@ -68,7 +68,14 @@ impl StoredProposalHeader {
         header: Header,
         guard: Option<ProposalGuard>,
     ) -> DagResult<Self> {
-        Ok(Self(store_verified_proposal(store, header).await?, guard))
+        let header = store_verified_proposal(store, header).await?;
+        #[cfg(feature = "benchmark")]
+        log::info!(
+            target: "orca_pipeline",
+            "event=header_stored header={:?} round={} author={:?}",
+            header.id, header.round, header.author
+        );
+        Ok(Self(header, guard))
     }
 
     pub(crate) fn into_header(self) -> Header {
@@ -124,6 +131,12 @@ pub(crate) async fn prepare_remote_header(
     guard: Option<ProposalGuard>,
 ) -> DagResult<Option<StoredProposalHeader>> {
     header.verify(committee)?;
+    #[cfg(feature = "benchmark")]
+    log::info!(
+        target: "orca_pipeline",
+        "event=remote_verified header={:?} round={} author={:?}",
+        header.id, header.round, header.author
+    );
     if synchronizer.missing_payload(&header).await? {
         return Ok(None);
     }
@@ -163,7 +176,20 @@ pub(crate) async fn prepare_local_proposal(
 ) -> DagResult<(Vec<CancelHandler>, Vec<SocketAddr>)> {
     let (header, bytes) = verify_and_serialize_proposal(header, committee).await?;
     let (network, addresses) = outbound;
+    #[cfg(feature = "benchmark")]
+    log::info!(
+        target: "orca_pipeline",
+        "event=proposal_dispatch_start header={:?} round={} author={:?} peers={}",
+        header.id, header.round, header.author, addresses.len()
+    );
     let dispatch = try_broadcast(network, addresses, bytes);
+    #[cfg(feature = "benchmark")]
+    log::info!(
+        target: "orca_pipeline",
+        "event=proposal_dispatch header={:?} round={} author={:?} handlers={} deferred={} parents={} batches={}",
+        header.id, header.round, header.author, dispatch.0.len(), dispatch.1.len(),
+        header.parents.len(), header.payload.len()
+    );
     let header = StoredProposalHeader::store(store, header, Some(in_flight)).await?;
     tx.send(header)
         .await
@@ -195,13 +221,27 @@ pub(crate) fn spawn_proposal_retry(
             }
             let send = async {
                 if let Some(proposal) = load_proposal(&mut store, &digest).await? {
+                    #[cfg(feature = "benchmark")]
+                    let identity = (proposal.id.clone(), proposal.round, proposal.author);
                     let bytes = tokio::task::spawn_blocking(move || {
                         bincode::serialize(&PrimaryMessage::Header(proposal))
                     })
                     .await
                     .expect("Proposal serialization task failed")?;
                     // Only an already-released frame can be deferred by try_broadcast.
-                    let _ = network.send_released(address, Bytes::from(bytes)).await;
+                    #[cfg(feature = "benchmark")]
+                    log::info!(
+                        target: "orca_pipeline",
+                        "event=proposal_retry_started header={:?} round={} author={:?} peer={}",
+                        identity.0, identity.1, identity.2, address
+                    );
+                    let _ack = network.send_released(address, Bytes::from(bytes)).await;
+                    #[cfg(feature = "benchmark")]
+                    log::info!(
+                        target: "orca_pipeline",
+                        "event=proposal_retry_result header={:?} round={} author={:?} peer={} ack={}",
+                        identity.0, identity.1, identity.2, address, _ack.is_ok()
+                    );
                 }
                 Ok(())
             };
@@ -237,6 +277,12 @@ pub(crate) fn spawn_repaired_headers(
 ) {
     tokio::spawn(async move {
         while let Some(header) = repaired.recv().await {
+            #[cfg(feature = "benchmark")]
+            log::info!(
+                target: "orca_pipeline",
+                "event=header_resumed header={:?} round={} author={:?}",
+                header.id, header.round, header.author
+            );
             let stored = StoredProposalHeader::store(&mut store, header, None)
                 .await
                 .expect("Failed to store repaired header");
@@ -271,6 +317,12 @@ pub(crate) fn spawn_proposal_processors(
         let mut delivered = HashSet::new();
         let mut delivery_order = VecDeque::new();
         while let Some((header, guard)) = rx_remote.recv().await {
+            #[cfg(feature = "benchmark")]
+            log::info!(
+                target: "orca_pipeline",
+                "event=remote_dequeued header={:?} round={} author={:?}",
+                header.id, header.round, header.author
+            );
             if header.round
                 < remote_round
                     .load(Ordering::Relaxed)
@@ -344,6 +396,8 @@ pub(crate) fn spawn_proposal_processors(
                     if header.round < consensus_round.load(Ordering::Relaxed).saturating_sub(gc_depth) { continue; }
                     report(async {
                         let round = header.round;
+                        #[cfg(feature = "benchmark")]
+                        let identity = (header.id.clone(), header.author);
                         let guard = in_flight.track(&header);
                         let digest = guard.digest.clone();
                         let (handlers, deferred) = prepare_local_proposal(
@@ -354,7 +408,14 @@ pub(crate) fn spawn_proposal_processors(
                         for address in deferred {
                             // A saturated replay queue leaves recovery to the
                             // normal signed-vote/missing-proposal repair path.
-                            match retry[&address].try_send((round, digest.clone())) {
+                            let result = retry[&address].try_send((round, digest.clone()));
+                            #[cfg(feature = "benchmark")]
+                            log::info!(
+                                target: "orca_pipeline",
+                                "event=proposal_retry_queue header={:?} round={} author={:?} peer={} queued={}",
+                                identity.0, round, identity.1, address, result.is_ok()
+                            );
+                            match result {
                                 Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => panic!("Proposal retry worker stopped"),
                             }

@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
     };
     let mut logger = env_logger::Builder::from_env(Env::default().default_filter_or(log_level));
     #[cfg(feature = "benchmark")]
-    logger.format_timestamp_millis();
+    logger.format_timestamp_micros();
     logger.init();
 
     match matches.subcommand() {
@@ -97,6 +97,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     match matches.subcommand() {
         // Spawn the primary and consensus core.
         ("primary", _) => {
+            #[cfg(feature = "benchmark")]
+            log::info!(target: "orca_pipeline", "event=pipeline_start version=1 role=primary replica={:?}", keypair.name);
             store
                 .migrate_worker_receipts()
                 .await
@@ -131,6 +133,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .context("The worker id must be a positive integer")?;
             #[cfg(feature = "benchmark")]
             {
+                log::info!(target: "orca_pipeline", "event=pipeline_start version=1 role=worker replica={:?} worker={}", keypair.name, id);
                 network::observe_transaction_port(
                     committee.worker(&keypair.name, &id)?.transactions.port(),
                 );

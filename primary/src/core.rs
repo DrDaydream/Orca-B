@@ -42,6 +42,15 @@ struct SavedVotes {
     sent: usize,
 }
 
+#[cfg(feature = "benchmark")]
+fn log_vote_queued(vote: &GrbcVote, path: &str) {
+    log::info!(
+        target: "orca_pipeline",
+        "event=vote_queued header={:?} round={} author={:?} phase={:?} voter={:?} path={}",
+        vote.id, vote.round, vote.origin, vote.phase, vote.author, path
+    );
+}
+
 pub struct Core {
     /// The public key of this primary.
     name: PublicKey,
@@ -221,6 +230,12 @@ impl Core {
             self.proposal_headers.entry(header.id.clone())
         {
             entry.insert(header.clone());
+            #[cfg(feature = "benchmark")]
+            log::info!(
+                target: "orca_pipeline",
+                "event=header_registered header={:?} round={} author={:?} quorum={} relay={}",
+                header.id, header.round, header.author, self.quorum_threshold, self.validity_threshold
+            );
             self.tx_consensus
                 .send(ConsensusMessage::Observed(header.clone()))
                 .await
@@ -233,7 +248,7 @@ impl Core {
                 self.missing_proposals.remove(&vote.block_digest());
                 // Invalid buffered metadata must not crash the primary or discard
                 // the remaining valid votes in the same queue.
-                if let Err(error) = self.record_vote(&vote) {
+                if let Err(error) = self.record_vote(&vote, "buffered") {
                     warn!("Ignoring invalid buffered GRBC vote: {}", error);
                 }
             }
@@ -255,11 +270,17 @@ impl Core {
                 .insert(header.round, header.id.clone());
             self.own_pending_grbc.insert(header.id.clone());
             self.deliver_grade_one(&header).await?;
-            if self.record_completed(&block).await? {
+            if self.record_completed(&block, "own_early").await? {
                 self.tx_consensus
                     .send(ConsensusMessage::GradeTwo(block.clone()))
                     .await
                     .expect("Failed to deliver our local proposal");
+                #[cfg(feature = "benchmark")]
+                log::info!(
+                    target: "orca_pipeline",
+                    "event=grade_two_queued header={:?} round={} author={:?} source=own_early",
+                    header.id, header.round, header.author
+                );
                 self.try_advance_completed(block).await?;
             }
         }
@@ -268,7 +289,7 @@ impl Core {
 
     /// Count a fresh authenticated vote and report only threshold crossings.
     /// Proposal arrival rechecks votes collected before the proposal was verified.
-    fn record_vote(&mut self, vote: &VerifiedGrbcVote) -> DagResult<bool> {
+    fn record_vote(&mut self, vote: &VerifiedGrbcVote, _source: &str) -> DagResult<bool> {
         let header = self
             .proposal_headers
             .get(&vote.id)
@@ -284,6 +305,13 @@ impl Core {
         if !state.append(vote, &self.committee, header)? {
             return Ok(false);
         }
+        #[cfg(feature = "benchmark")]
+        log::info!(
+            target: "orca_pipeline",
+            "event=vote_applied header={:?} round={} author={:?} phase={:?} voter={:?} source={} echo_weight={} ready_weight={}",
+            header.id, header.round, header.author, vote.phase, vote.author, _source,
+            state.echo_weight, state.ready_weight
+        );
         Ok(match vote.phase {
             GrbcPhase::Echo => {
                 previous < self.quorum_threshold && state.echo_weight >= self.quorum_threshold
@@ -315,7 +343,11 @@ impl Core {
                 requestor: None,
                 votes: vec![vote],
             }) {
-                Ok(()) => saved.sent += 1,
+                Ok(()) => {
+                    #[cfg(feature = "benchmark")]
+                    log_vote_queued(&saved.votes[saved.sent], "immediate");
+                    saved.sent += 1;
+                }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     self.deferred_vote_blocks += 1
                 }
@@ -340,6 +372,10 @@ impl Core {
             requestor: None,
             votes: saved.votes[saved.sent..].to_vec(),
         });
+        #[cfg(feature = "benchmark")]
+        for vote in &saved.votes[saved.sent..] {
+            log_vote_queued(vote, "deferred");
+        }
         saved.sent = saved.votes.len();
         self.deferred_vote_blocks -= 1;
     }
@@ -411,7 +447,7 @@ impl Core {
             // Old committed history still releases disk-backed dependencies,
             // but must not repopulate state below an unchanged GC boundary.
             if header.round < self.gc_round {
-                self.record_completed(block).await?;
+                self.record_completed(block, "commit_backfill").await?;
                 continue;
             }
             // Commitment also closes this author's voting slot; it must not
@@ -440,7 +476,7 @@ impl Core {
                     .or_default()
                     .insert(header.author);
             }
-            if self.record_completed(block).await? {
+            if self.record_completed(block, "commit_backfill").await? {
                 self.missing_proposals.remove(&digest);
                 // A self proposal can be committed while its stored-header
                 // callback is queued. Its authenticated votes must survive
@@ -558,7 +594,13 @@ impl Core {
                 &mut self.signature_service,
             )
             .await;
-            self.record_vote(&vote)?;
+            #[cfg(feature = "benchmark")]
+            log::info!(
+                target: "orca_pipeline",
+                "event=vote_signed header={:?} round={} author={:?} phase=Echo voter={:?} reason=validated_header",
+                header.id, header.round, header.author, self.name
+            );
+            self.record_vote(&vote, "local")?;
             self.save_local_vote(vote.into_vote()).await?;
         }
         self.evaluate_grbc(header).await
@@ -585,6 +627,12 @@ impl Core {
                 return Ok(());
             }
             pending.push(vote.clone());
+            #[cfg(feature = "benchmark")]
+            log::info!(
+                target: "orca_pipeline",
+                "event=vote_buffered header={:?} round={} author={:?} phase={:?} voter={:?} pending={}",
+                vote.id, vote.round, vote.origin, vote.phase, vote.author, pending.len()
+            );
             let first = match self.missing_proposals.entry(digest.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert((vote.round, Instant::now()));
@@ -600,7 +648,7 @@ impl Core {
             }
             return Ok(());
         }
-        if self.record_vote(&vote)? && self.validated.contains(&vote.id) {
+        if self.record_vote(&vote, "live")? && self.validated.contains(&vote.id) {
             // Borrow metadata when counting; clone the full header only when
             // a validated instance crosses a threshold that can advance GRBC.
             let header = self.proposal_headers[&vote.id].clone();
@@ -633,7 +681,24 @@ impl Core {
                 &mut self.signature_service,
             )
             .await;
-            self.record_vote(&vote)?;
+            #[cfg(feature = "benchmark")]
+            {
+                let reason = match (
+                    state.echo_weight >= self.quorum_threshold,
+                    state.ready_weight >= self.validity_threshold,
+                ) {
+                    (true, true) => "echo_quorum_and_ready_relay",
+                    (true, false) => "echo_quorum",
+                    _ => "ready_relay",
+                };
+                log::info!(
+                    target: "orca_pipeline",
+                    "event=vote_signed header={:?} round={} author={:?} phase=Ready voter={:?} reason={} echo_weight={} ready_weight={} quorum={} relay={}",
+                    header.id, header.round, header.author, self.name, reason, state.echo_weight,
+                    state.ready_weight, self.quorum_threshold, self.validity_threshold
+                );
+            }
+            self.record_vote(&vote, "local")?;
             // Publish local READY before enqueueing the outbound vote. The
             // independent sender needs no later Core iteration to flush it.
             self.deliver_grade_one(header).await?;
@@ -693,17 +758,34 @@ impl Core {
                     .map_or(false, |s| s.ready_weight >= self.quorum_threshold),
             DagError::CertificateRequiresQuorum
         );
-        self.own_pending_grbc.remove(&block.header.id);
-        if self.completed.contains(&block.header.id) {
+        let _own_pending = self.own_pending_grbc.remove(&block.header.id);
+        let already_completed = self.completed.contains(&block.header.id);
+        #[cfg(feature = "benchmark")]
+        if _own_pending || !already_completed {
+            let state = &self.votes_aggregators[&block.header.id];
+            log::info!(
+                target: "orca_pipeline",
+                "event=grbc_finish header={:?} round={} author={:?} own_pending={} echo_weight={} ready_weight={} quorum={}",
+                block.header.id, block.header.round, block.header.author, _own_pending,
+                state.echo_weight, state.ready_weight, self.quorum_threshold
+            );
+        }
+        if already_completed {
             return Ok(());
         }
         self.deliver_grade_one(&block.header).await?;
-        if self.record_completed(&block).await? {
+        if self.record_completed(&block, "grbc").await? {
             debug!("GRBC grade 2 delivered for {:?}", block);
             self.tx_consensus
                 .send(ConsensusMessage::GradeTwo(block.clone()))
                 .await
                 .expect("Failed to send grade-2 certificate to consensus");
+            #[cfg(feature = "benchmark")]
+            log::info!(
+                target: "orca_pipeline",
+                "event=grade_two_queued header={:?} round={} author={:?} source=grbc",
+                block.header.id, block.header.round, block.header.author
+            );
             self.try_advance_completed(block).await?;
         }
         Ok(())
@@ -727,7 +809,7 @@ impl Core {
             .extend(handlers);
     }
 
-    async fn record_completed(&mut self, block: &Certificate) -> DagResult<bool> {
+    async fn record_completed(&mut self, block: &Certificate, _source: &str) -> DagResult<bool> {
         if self.completed.contains(&block.header.id) {
             return Ok(false);
         }
@@ -739,6 +821,12 @@ impl Core {
             self.completed.insert(block.header.id.clone());
             self.weak_edge_candidates.insert(digest, block.round());
         }
+        #[cfg(feature = "benchmark")]
+        log::info!(
+            target: "orca_pipeline",
+            "event=completion_record header={:?} round={} author={:?} source={} tracked={}",
+            block.header.id, block.header.round, block.header.author, _source, block.round() >= self.gc_round
+        );
         Ok(true)
     }
 
@@ -751,6 +839,14 @@ impl Core {
             .append(certificate.clone(), &self.committee)?
         {
             let round = certificate.round();
+            #[cfg(feature = "benchmark")]
+            let parent_count = parents.len();
+            #[cfg(feature = "benchmark")]
+            log::info!(
+                target: "orca_pipeline",
+                "event=parent_quorum header={:?} round={} author={:?} parents={} quorum={}",
+                certificate.header.id, round, certificate.header.author, parent_count, self.quorum_threshold
+            );
             let virtual_edges = self
                 .grade_one_certificates
                 .iter()
@@ -779,6 +875,12 @@ impl Core {
                 .send((parents, weak_edges, virtual_edges, round))
                 .await
                 .expect("Failed to send GRBC edges to proposer");
+            #[cfg(feature = "benchmark")]
+            log::info!(
+                target: "orca_pipeline",
+                "event=parents_sent header={:?} round={} author={:?} parents={} next_round={}",
+                certificate.header.id, round, certificate.header.author, parent_count, round + 1
+            );
         }
         Ok(())
     }

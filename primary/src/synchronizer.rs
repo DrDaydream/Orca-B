@@ -30,6 +30,12 @@ impl Synchronizer {
     pub async fn missing_payload(&mut self, header: &Header) -> DagResult<bool> {
         // We don't store the payload of our own workers.
         if header.author == self.name {
+            #[cfg(feature = "benchmark")]
+            log::info!(
+                target: "orca_pipeline",
+                "event=payload_check_skipped header={:?} round={} author={:?} reason=own_author",
+                header.id, header.round, header.author
+            );
             return Ok(false);
         }
 
@@ -48,10 +54,20 @@ impl Synchronizer {
             //         X as they will be querying worker #1.
             let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
             if self.store.read(key).await?.is_none() {
+                #[cfg(feature = "benchmark")]
+                log::info!(target: "orca_pipeline",
+                    "event=payload_missing header={:?} round={} author={:?} batch={:?} worker={}",
+                    header.id, header.round, header.author, digest, worker_id);
                 missing.insert(digest.clone(), *worker_id);
             }
         }
 
+        #[cfg(feature = "benchmark")]
+        log::info!(
+            target: "orca_pipeline",
+            "event=payload_checked header={:?} round={} author={:?} batches={} missing={}",
+            header.id, header.round, header.author, header.payload.len(), missing.len()
+        );
         if missing.is_empty() {
             return Ok(false);
         }

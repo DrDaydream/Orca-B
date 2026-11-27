@@ -2,7 +2,7 @@
 use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
-use crate::processor::{Processor, SerializedBatchMessage};
+use crate::processor::{Processor, ProcessorBatch};
 use crate::quorum_waiter::QuorumWaiter;
 use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
@@ -30,8 +30,13 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 // TODO: Move to the primary.
 pub type Round = u64;
 
-/// Indicates a serialized `WorkerPrimaryMessage` message.
-pub type SerializedBatchDigestMessage = Vec<u8>;
+/// A serialized worker-primary message and its local benchmark context.
+#[derive(Debug)]
+pub struct SerializedBatchDigestMessage {
+    pub bytes: Vec<u8>,
+    #[cfg(feature = "benchmark")]
+    pub trace: (Digest, WorkerId, &'static str),
+}
 
 /// The message exchanged between workers.
 #[derive(Debug, Serialize, Deserialize)]
@@ -274,7 +279,7 @@ impl MessageHandler for TxReceiverHandler {
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
-    tx_processor: Sender<SerializedBatchMessage>,
+    tx_processor: Sender<ProcessorBatch>,
 }
 
 #[async_trait]
@@ -287,7 +292,7 @@ impl MessageHandler for WorkerReceiverHandler {
         match bincode::deserialize(&serialized) {
             Ok(WorkerMessage::Batch(..)) => self
                 .tx_processor
-                .send(serialized.to_vec())
+                .send(serialized.to_vec().into())
                 .await
                 .expect("Failed to send batch"),
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => self

@@ -14,9 +14,12 @@ type StoreResult<T> = Result<T, StoreError>;
 
 type Key = Vec<u8>;
 type Value = Vec<u8>;
+type ReadWaiters = HashMap<Key, VecDeque<oneshot::Sender<StoreResult<Value>>>>;
+type AfterPut = Box<dyn FnOnce() + Send>;
 
 pub enum StoreCommand {
     Write(Key, Value),
+    WriteObserved(Key, Value, AfterPut),
     WriteBatchIfAbsent(BTreeMap<Key, Value>, oneshot::Sender<StoreResult<usize>>),
     RestoreWorkerReceipts(oneshot::Sender<StoreResult<()>>),
     Read(Key, oneshot::Sender<StoreResult<Option<Value>>>),
@@ -37,7 +40,7 @@ impl Store {
 
     pub fn new(path: &str) -> StoreResult<Self> {
         let db = rocksdb::DB::open_default(path)?;
-        let mut obligations = HashMap::<Key, VecDeque<oneshot::Sender<StoreResult<Value>>>>::new();
+        let mut obligations = ReadWaiters::new();
         let (tx, mut rx) = channel(100);
         // RocksDB reads, writes and compactions may block. Keep their FIFO
         // ordering on one worker without stalling protocol tasks or timers.
@@ -56,12 +59,10 @@ impl Store {
                 }
                 match command {
                     StoreCommand::Write(key, value) => {
-                        db.put(&key, &value).expect("Failed to persist store value");
-                        if let Some(mut senders) = obligations.remove(&key) {
-                            while let Some(s) = senders.pop_front() {
-                                let _ = s.send(Ok(value.clone()));
-                            }
-                        }
+                        Self::put(&db, &mut obligations, key, value, None);
+                    }
+                    StoreCommand::WriteObserved(key, value, after_put) => {
+                        Self::put(&db, &mut obligations, key, value, Some(after_put));
                     }
                     StoreCommand::WriteBatchIfAbsent(entries, sender) => {
                         // This actor owns every write, so the existence check and
@@ -125,6 +126,24 @@ impl Store {
         Ok(Self { channel: tx })
     }
 
+    fn put(
+        db: &rocksdb::DB,
+        obligations: &mut ReadWaiters,
+        key: Key,
+        value: Value,
+        after_put: Option<AfterPut>,
+    ) {
+        db.put(&key, &value).expect("Failed to persist store value");
+        if let Some(after_put) = after_put {
+            after_put();
+        }
+        if let Some(mut senders) = obligations.remove(&key) {
+            while let Some(sender) = senders.pop_front() {
+                let _ = sender.send(Ok(value.clone()));
+            }
+        }
+    }
+
     /// Upgrade the primary's receipt keys from the first digest-proposal release.
     /// This command is enqueued before primary startup. Each chunk and the final marker
     /// can be safely replayed if the process stops partway through the scan.
@@ -167,6 +186,19 @@ impl Store {
         if let Err(e) = self.channel.send(StoreCommand::Write(key, value)).await {
             panic!("Failed to send Write command to store: {}", e);
         }
+    }
+
+    /// Enqueue a normal write and run the observer on the store actor after DB::put returns.
+    pub async fn write_observed(
+        &mut self,
+        key: Key,
+        value: Value,
+        after_put: impl FnOnce() + Send + 'static,
+    ) {
+        self.channel
+            .send(StoreCommand::WriteObserved(key, value, Box::new(after_put)))
+            .await
+            .expect("Failed to send observed Write command to store");
     }
 
     pub async fn read(&mut self, key: Key) -> StoreResult<Option<Value>> {

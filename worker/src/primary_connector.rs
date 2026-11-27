@@ -29,11 +29,19 @@ impl PrimaryConnector {
     }
 
     async fn run(&mut self) {
-        while let Some(digest) = self.rx_digest.recv().await {
+        while let Some(message) = self.rx_digest.recv().await {
+            #[cfg(feature = "benchmark")]
+            let (batch, worker, source) = message.trace;
+            #[cfg(feature = "benchmark")]
+            log::info!(target: "orca_pipeline", "event=connector_dequeued batch={:?} source={} worker={} primary={}",
+                batch, source, worker, self.primary_address);
             // Send the digest through the network.
             self.network
-                .send(self.primary_address, Bytes::from(digest))
+                .send(self.primary_address, Bytes::from(message.bytes))
                 .await;
+            #[cfg(feature = "benchmark")]
+            log::info!(target: "orca_pipeline", "event=connector_send_returned batch={:?} source={} worker={} primary={}",
+                batch, source, worker, self.primary_address);
         }
     }
 }
