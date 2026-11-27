@@ -21,12 +21,13 @@ serde_json = "1.0.64"
 config = { path = "../config" }
 store = { path = "../store" }
 crypto = { path = "../crypto" }
+network = { path = "../network", optional = true }
 primary = { path = "../primary" }
 worker = { path = "../worker" }
 consensus = { path = "../consensus" }
 
 [features]
-benchmark = ["worker/benchmark", "primary/benchmark", "consensus/benchmark"]
+benchmark = ["network/benchmark", "worker/benchmark", "primary/benchmark", "consensus/benchmark"]
 
 [[bin]]         
 name = "benchmark_client"   

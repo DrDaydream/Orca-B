@@ -9,6 +9,8 @@ mod simple_sender;
 #[path = "tests/common.rs"]
 pub mod common;
 
+#[cfg(feature = "benchmark")]
+pub use crate::receiver::observe_transaction_port;
 pub use crate::receiver::{MessageHandler, Receiver, Writer};
 pub use crate::reliable_sender::{CancelHandler, ReliableSender};
 pub use crate::scheduler::{DelayBudget, Delivery, DeliveryPolicy};

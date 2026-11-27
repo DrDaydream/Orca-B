@@ -7,7 +7,9 @@ use crate::messages::{
     local_votes_key, Certificate, ConsensusCommand, ConsensusMessage, GrbcPhase, GrbcVote, Header,
 };
 use crate::primary::{PrimaryMessage, Round};
-use crate::proposal_processor::{try_broadcast, ProposalTracker, StoredProposalHeader};
+use crate::proposal_processor::{
+    prepare_remote_header, try_broadcast, ProposalTracker, StoredProposalHeader,
+};
 use crate::proposer::ProposerMessage;
 use crate::synchronizer::Synchronizer;
 use crate::verified_vote::VerifiedGrbcVote;
@@ -62,8 +64,6 @@ pub struct Core {
 
     /// Receiver for dag messages (headers, votes, certificates).
     rx_primaries: Receiver<PrimaryMessage>,
-    /// Receives loopback headers from the `HeaderWaiter`.
-    rx_header_waiter: Receiver<Header>,
     /// Compact metadata delivered after full proposal validation and storage.
     rx_proposals: Receiver<StoredProposalHeader>,
     in_flight: ProposalTracker,
@@ -122,7 +122,6 @@ impl Core {
         consensus_round: Arc<AtomicU64>,
         gc_depth: Round,
         rx_primaries: Receiver<PrimaryMessage>,
-        rx_header_waiter: Receiver<Header>,
         rx_proposals: Receiver<StoredProposalHeader>,
         in_flight: ProposalTracker,
         tx_votes: Sender<VoteDispatch>,
@@ -145,7 +144,6 @@ impl Core {
                 consensus_round,
                 gc_depth,
                 rx_primaries,
-                rx_header_waiter,
                 rx_proposals,
                 in_flight,
                 vote_batch: Vec::new().into_iter(),
@@ -181,14 +179,29 @@ impl Core {
 
     #[cfg(test)]
     async fn process_proposal(&mut self, proposal: Proposal) -> DagResult<()> {
-        let header = crate::proposal_processor::prepare_proposal(
-            proposal,
-            self.committee.clone(),
+        self.process_received_header(proposal.header).await
+    }
+
+    async fn process_received_header(&mut self, header: Header) -> DagResult<()> {
+        ensure!(
+            header.round >= self.gc_round,
+            DagError::TooOld(header.id.clone(), header.round)
+        );
+        if self.grbc_finished(&header.id) || self.proposal_headers.contains_key(&header.id) {
+            return Ok(());
+        }
+        if let Some(stored) = prepare_remote_header(
+            header,
+            &self.committee,
+            &mut self.synchronizer,
             &mut self.store,
             None,
         )
-        .await?;
-        self.process_stored_proposal(header).await
+        .await?
+        {
+            self.process_stored_proposal(stored).await?;
+        }
+        Ok(())
     }
 
     async fn process_stored_proposal(&mut self, stored: StoredProposalHeader) -> DagResult<()> {
@@ -200,12 +213,7 @@ impl Core {
             header.round >= self.gc_round,
             DagError::TooOld(header.id.clone(), header.round)
         );
-        let digest = Certificate {
-            header: header.clone(),
-            votes: Vec::new(),
-        }
-        .digest();
-        self.missing_proposals.remove(&digest);
+        self.missing_proposals.remove(&header.block_digest());
         // Consensus may traverse complete, authenticated data before local
         // GRBC delivery. This experimental early path assumes no equivocation;
         // voting proceeds independently of local DAG dependency availability.
@@ -777,8 +785,7 @@ impl Core {
 
     async fn process_primary_message(&mut self, message: PrimaryMessage) -> DagResult<()> {
         match message {
-            #[cfg(test)]
-            PrimaryMessage::Proposal(proposal) => self.process_proposal(proposal).await,
+            PrimaryMessage::Header(header) => self.process_received_header(header).await,
             PrimaryMessage::GrbcVote(vote) => self.process_grbc_vote(vote).await,
             PrimaryMessage::Consensus(message) => {
                 message.verify(&self.committee)?;
@@ -868,11 +875,7 @@ impl Core {
                 _ = std::future::ready(()), if self.vote_batch.len() != 0 =>
                     self.process_primary_burst(None).await,
 
-                // We receive here loopback headers from the `HeaderWaiter`. Those are headers for which we interrupted
-                // execution (we were missing some of their dependencies) and we are now ready to resume processing.
-                Some(header) = self.rx_header_waiter.recv() => self.process_header(&header).await,
-
-                // Payload validation, hashing, storage and broadcasting run outside Core.
+                // Validated headers from proposals and completed worker repairs share one queue.
                 Some(header) = self.rx_proposals.recv() => self.process_stored_proposal(header).await,
                 Some(command) = self.rx_consensus.recv() => self.process_consensus_command(command).await,
                 _ = repair.tick() => {

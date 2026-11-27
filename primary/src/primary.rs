@@ -5,10 +5,13 @@ use crate::garbage_collector::GarbageCollector;
 use crate::header_waiter::HeaderWaiter;
 use crate::helper::{Helper, RepairRequest};
 use crate::messages::{
-    worker_batch_key, ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GrbcVote,
-    GrbcVoteBatch as VoteBatch, Proposal,
+    ConsensusCommand, ConsensusMessage, ConsensusNetworkMessage, GrbcVote,
+    GrbcVoteBatch as VoteBatch, Header,
 };
-use crate::proposal_processor::{spawn_proposal_processors, ProposalTracker, QueuedProposal};
+use crate::payload_receiver::PayloadReceiver;
+use crate::proposal_processor::{
+    spawn_proposal_processors, spawn_repaired_headers, ProposalTracker, QueuedProposal,
+};
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
 use crate::vote_sender::spawn_vote_sender;
@@ -45,7 +48,7 @@ pub type Round = u64;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
-    Proposal(Proposal),
+    Header(Header),
     GrbcVote(GrbcVote),
     GrbcVoteBatch(VoteBatch),
     Consensus(ConsensusNetworkMessage),
@@ -224,7 +227,7 @@ impl Primary {
     ) {
         crate::adversary::initialize(keypair.name, &committee)
             .expect("Invalid BENCH_ADVERSARY_CONFIG");
-        let (tx_available, rx_available) = channel(CHANNEL_CAPACITY);
+        let (tx_others_digests, rx_others_digests) = channel(CHANNEL_CAPACITY);
         let (tx_our_digests, rx_our_digests) = channel(CHANNEL_CAPACITY);
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
         let (tx_headers, rx_headers) = channel(CHANNEL_CAPACITY);
@@ -304,9 +307,8 @@ impl Primary {
             address,
             /* handler */
             WorkerReceiverHandler {
-                store: store.clone(),
                 tx_our_digests,
-                tx_available,
+                tx_others_digests,
             },
         );
         info!(
@@ -314,7 +316,7 @@ impl Primary {
             name, address
         );
 
-        let synchronizer = Synchronizer::new(tx_sync_headers);
+        let synchronizer = Synchronizer::new(name, store.clone(), tx_sync_headers);
 
         // The `SignatureService` is used to require signatures on specific digests.
         let signature_service = SignatureService::new(secret);
@@ -334,6 +336,11 @@ impl Primary {
             parameters.gc_depth,
             rx_votes,
         );
+        spawn_repaired_headers(
+            store.clone(),
+            rx_headers_loopback,
+            tx_stored_proposals.clone(),
+        );
         spawn_proposal_processors(
             name,
             committee.clone(),
@@ -341,8 +348,7 @@ impl Primary {
             consensus_round.clone(),
             parameters.gc_depth,
             rx_remote_proposals,
-            rx_available,
-            parameters.sync_retry_delay,
+            synchronizer.clone(),
             rx_headers,
             tx_stored_proposals,
             in_flight.clone(),
@@ -358,7 +364,6 @@ impl Primary {
             consensus_round.clone(),
             parameters.gc_depth,
             /* rx_primaries */ rx_primary_messages,
-            /* rx_header_waiter */ rx_headers_loopback,
             rx_stored_proposals,
             in_flight,
             tx_votes.clone(),
@@ -372,7 +377,10 @@ impl Primary {
         // Keeps track of the latest consensus round and allows other tasks to clean up their their internal state
         GarbageCollector::spawn(&name, &committee, rx_cleanup);
 
-        // Handle DAG repair independently of worker batch availability.
+        // Only other authors' digests feed the worker availability store.
+        PayloadReceiver::spawn(store.clone(), rx_others_digests);
+
+        // Resume a header when all its local worker receipts arrive.
         HeaderWaiter::spawn(
             name,
             committee.clone(),
@@ -473,11 +481,11 @@ impl MessageHandler for PrimaryReceiverHandler {
             decode_frame(&serialized)?
         };
         match message {
-            PrimaryMessage::Proposal(proposal) => {
+            PrimaryMessage::Header(header) => {
                 // Register before waiting for space in the bounded bulk queue.
-                let guard = self.in_flight.track(&proposal.header);
+                let guard = self.in_flight.track(&header);
                 self.tx_remote_proposals
-                    .send((proposal, guard))
+                    .send((header, guard))
                     .await
                     .expect("Failed to enqueue remote proposal");
             }
@@ -514,34 +522,30 @@ pub(crate) fn decode_frame<T: serde::de::DeserializeOwned>(frame: &[u8]) -> binc
 /// Defines how the network receiver handles incoming workers messages.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
-    store: Store,
     tx_our_digests: Sender<(Digest, WorkerId)>,
-    tx_available: Sender<(Digest, WorkerId)>,
+    tx_others_digests: Sender<(Digest, WorkerId)>,
 }
 
 #[async_trait]
 impl MessageHandler for WorkerReceiverHandler {
-    async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
-        let (digest, worker, own) = match decode_frame(&serialized)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker) => (digest, worker, true),
-            WorkerPrimaryMessage::OthersBatch(digest, worker) => (digest, worker, false),
-        };
-        let key = worker_batch_key(&digest, worker);
-        self.store
-            .clone()
-            .write_batch_if_absent(std::iter::once((key, Vec::new())).collect())
-            .await?;
-        self.tx_available
-            .send((digest.clone(), worker))
-            .await
-            .expect("Closed batch availability channel");
-        if own {
-            self.tx_our_digests
-                .send((digest, worker))
+    async fn dispatch(
+        &self,
+        _writer: &mut Writer,
+        serialized: Bytes,
+    ) -> Result<(), Box<dyn Error>> {
+        // Deserialize and parse the message.
+        match decode_frame(&serialized)? {
+            WorkerPrimaryMessage::OurBatch(digest, worker_id) => self
+                .tx_our_digests
+                .send((digest, worker_id))
                 .await
-                .expect("Closed proposer digest channel");
+                .expect("Failed to send workers' digests"),
+            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => self
+                .tx_others_digests
+                .send((digest, worker_id))
+                .await
+                .expect("Failed to send workers' digests"),
         }
-        writer.send(Bytes::from_static(b"Ack")).await?;
         Ok(())
     }
 }

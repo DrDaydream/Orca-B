@@ -115,6 +115,14 @@ pub struct Header {
 }
 
 impl Header {
+    pub(crate) fn block_digest(&self) -> Digest {
+        let mut hasher = Sha512::new();
+        hasher.update(&self.id);
+        hasher.update(self.round.to_le_bytes());
+        hasher.update(&self.author);
+        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+    }
+
     pub async fn new(
         author: PublicKey,
         round: Round,
@@ -220,9 +228,6 @@ impl fmt::Display for Header {
     }
 }
 
-/// Maximum digest proposal frame, including the primary message tag.
-pub const MAX_PROPOSAL_WIRE_BYTES: u64 = 7 * 1024 * 1024;
-
 #[cfg(test)]
 pub fn batch_digest(bytes: &[u8]) -> Digest {
     Digest(Sha512::digest(bytes).as_slice()[..32].try_into().unwrap())
@@ -230,12 +235,7 @@ pub fn batch_digest(bytes: &[u8]) -> Digest {
 
 /// Receipts identify the actual worker that retained these bytes.
 pub fn worker_batch_key(digest: &Digest, worker: WorkerId) -> Vec<u8> {
-    [
-        b"orca-worker-batch-v1/".as_ref(),
-        digest.as_ref(),
-        &worker.to_le_bytes(),
-    ]
-    .concat()
+    [digest.as_ref(), &worker.to_le_bytes()].concat()
 }
 
 #[cfg(test)] // Retired storage key, used only to check compatibility in tests.
@@ -259,12 +259,7 @@ pub struct Proposal {
 
 impl Proposal {
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        self.header.verify(committee)?;
-        ensure!(
-            bincode::serialized_size(self)? + 4 <= MAX_PROPOSAL_WIRE_BYTES,
-            DagError::MalformedHeader(self.header.id.clone())
-        );
-        Ok(())
+        self.header.verify(committee)
     }
 
     pub fn block(&self) -> Certificate {
@@ -457,11 +452,7 @@ impl Certificate {
 
 impl Hash for Certificate {
     fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(&self.header.id);
-        hasher.update(self.round().to_le_bytes());
-        hasher.update(&self.origin());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        self.header.block_digest()
     }
 }
 

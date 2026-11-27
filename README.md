@@ -1,6 +1,6 @@
 # Orca-B
 
-Orca-B is a research implementation of a DAG-based consensus protocol built on Narwhal. Workers broadcast transaction batches to peer workers. After a stake quorum acknowledges a batch, its author forwards the digest and worker ID to its primary. GRBC proposals and proposal-repair replies carry the signed header with these references. A receiver waits for its local workers to store any missing batches before it can ECHO. Pending batch recovery allows other available proposals to progress. Orca-B combines the Good, Deferred and Fallback leader rules with asynchronous binary agreement (ABA) for recovery. The protocol is written in Rust. The Python benchmark uses Fabric to run a whole committee on one machine.
+Orca-B is a research implementation of a DAG-based consensus protocol built on Narwhal. The worker uses the Narwhal implementation from Bullshark-Ubuntu24 at commit `5a051e316f0acba557803db80b3fe7dd8f551083`. Workers broadcast sealed batches to their peers. Peer ACKs record receipt of the frame. Once their weight plus the author's stake reaches quorum in a healthy run, the author's worker queues the batch for storage and sends its digest and worker ID to its primary. GRBC proposals and proposal-repair replies carry the signed header with these references. A receiver waits for its local workers to store any missing batches before it can ECHO. Pending batch recovery allows other available proposals to progress. Orca-B combines the Good, Deferred and Fallback leader rules with asynchronous binary agreement (ABA) for recovery. The protocol is written in Rust. The Python benchmark uses Fabric to run a whole committee on one machine.
 
 Deploy matching primary and worker binaries throughout the committee. This digest proposal format changes the wire protocol. The commands below target Ubuntu 24.04 x86-64. The repository enables SSE4.2 and PCLMUL for this build. [Narwhal and Tusk paper](https://arxiv.org/abs/2105.11827)
 
@@ -109,6 +109,8 @@ For legacy runs that omit `--adversary`, the following environment variables con
 | `ORCA_CLIENT_SILENCE_SLOT_MS` | `max_header_delay` | Length in milliseconds of one slot in the client's wall-clock silence schedule. |
 
 ### Batching and synchronization
+
+A Bullshark worker logs the batch size and sampled transaction IDs at sealing. With the benchmark feature, the node timestamps sampled transactions at the client socket and the proposer logs `Benchmark proposer received batch` when it dequeues an author digest. Match the digest to `Created ... -> ...` to measure sealing to digest receipt and receipt to proposal inclusion. The first interval includes worker dissemination, the local storage queue, and digest delivery.
 
 The `node_params` dictionary inside `local()` in `benchmark/fabfile.py` sets the following defaults. `header_size` also has the command-line override shown above.
 

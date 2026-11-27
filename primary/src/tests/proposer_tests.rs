@@ -134,12 +134,7 @@ async fn proposal_carries_seventy_eight_batch_references_as_header_metadata() {
         .unwrap();
     assert_eq!(header.payload.len(), 78);
     header.verify(&committee()).unwrap();
-    let wire = bincode::serialize(&crate::primary::PrimaryMessage::Proposal(
-        crate::messages::Proposal {
-            header: header.clone(),
-        },
-    ))
-    .unwrap();
+    let wire = bincode::serialize(&crate::primary::PrimaryMessage::Header(header.clone())).unwrap();
     assert_eq!(&wire[4..], &bincode::serialize(&header).unwrap()[..]);
     assert!(wire.len() < 4096);
 }

@@ -142,7 +142,8 @@ fn serialized_proposals_and_saved_votes_use_sender_identity_and_same_policy() {
         .find(|peer| policy.should_delay(p.header.round, &[p.header.author], *peer))
         .unwrap();
     let address = committee().primary(&recipient).unwrap().primary_to_primary;
-    let proposal = Bytes::from(bincode::serialize(&PrimaryMessage::Proposal(p.clone())).unwrap());
+    let proposal =
+        Bytes::from(bincode::serialize(&PrimaryMessage::Header(p.header.clone())).unwrap());
     assert!(matches!(
         policy.delivery(address, &proposal),
         Delivery::Delay(_, _)
@@ -254,7 +255,7 @@ async fn honest_proposal_repair_obeys_network_delay_and_keeps_signature_bytes() 
     policy.config.delay_ms = 150;
     let mut sender =
         SimpleSender::with_schedule(Arc::new(policy), DelayBudget::new(4, 1024 * 1024));
-    let wire = Bytes::from(bincode::serialize(&PrimaryMessage::Proposal(proposal)).unwrap());
+    let wire = Bytes::from(bincode::serialize(&PrimaryMessage::Header(proposal.header)).unwrap());
     let started = Instant::now();
     sender.send(address, wire.clone()).await;
     assert!(timeout(Duration::from_millis(40), listener.accept())
@@ -269,7 +270,7 @@ async fn honest_proposal_repair_obeys_network_delay_and_keeps_signature_bytes() 
     assert_eq!(received.as_ref(), wire.as_ref());
     assert!(started.elapsed() >= Duration::from_millis(150));
     match bincode::deserialize::<PrimaryMessage>(&received).unwrap() {
-        PrimaryMessage::Proposal(proposal) => proposal.verify(&committee()).unwrap(),
+        PrimaryMessage::Header(header) => header.verify(&committee()).unwrap(),
         _ => panic!("wrong message kind"),
     }
     stream.send(Bytes::from_static(b"Ack")).await.unwrap();

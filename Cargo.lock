@@ -576,6 +576,7 @@ dependencies = [
  "env_logger",
  "futures",
  "log",
+ "network",
  "primary",
  "rand",
  "serde",

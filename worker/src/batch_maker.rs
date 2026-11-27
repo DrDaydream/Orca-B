@@ -24,9 +24,6 @@ pub mod batch_maker_tests;
 pub type Transaction = Vec<u8>;
 pub type Batch = Vec<Transaction>;
 
-// The worker transport uses LengthDelimitedCodec's 8 MiB frame.
-pub(crate) const MAX_BATCH_WIRE_BYTES: usize = 8 * 1024 * 1024;
-
 /// Assemble clients transactions into batches.
 pub struct BatchMaker {
     /// The preferred batch size (in bytes).
@@ -39,12 +36,14 @@ pub struct BatchMaker {
     rx_batch_silent: watch::Receiver<(u64, bool)>,
     /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_message: Sender<QuorumWaiterMessage>,
+    /// The network addresses of the other workers that share our worker id.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
-    network: ReliableSender,
     /// Holds the current batch.
     current_batch: Batch,
     /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
+    /// A network sender to broadcast the batches to the other workers.
+    network: ReliableSender,
 }
 
 impl BatchMaker {
@@ -63,10 +62,10 @@ impl BatchMaker {
                 rx_transaction,
                 rx_batch_silent,
                 tx_message,
-                network: ReliableSender::new(),
                 workers_addresses,
-                current_batch: Batch::new(),
+                current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
+                network: ReliableSender::new(),
             }
             .run()
             .await;
@@ -105,14 +104,6 @@ impl BatchMaker {
 
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
-                    if transaction.len() > MAX_BATCH_WIRE_BYTES - 20 {
-                        log::warn!("Transaction exceeds the worker frame limit");
-                        continue;
-                    }
-                    if self.current_batch_size + transaction.len() + 8 * (self.current_batch.len() + 1) + 12
-                        > MAX_BATCH_WIRE_BYTES && !self.current_batch.is_empty() {
-                        self.seal().await;
-                    }
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     if self.current_batch_size >= self.batch_size {
@@ -135,7 +126,7 @@ impl BatchMaker {
         }
     }
 
-    /// Seal and enqueue the current batch.
+    /// Seal and broadcast the current batch.
     async fn seal(&mut self) {
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
@@ -145,8 +136,8 @@ impl BatchMaker {
         let tx_ids: Vec<_> = self
             .current_batch
             .iter()
-            .filter(|tx| tx.len() > 8 && tx[0] == 0u8)
-            .map(|tx| u64::from_be_bytes(tx[1..9].try_into().unwrap()))
+            .filter(|tx| tx[0] == 0u8 && tx.len() > 8)
+            .filter_map(|tx| tx[1..9].try_into().ok())
             .collect();
 
         // Serialize the batch.
@@ -164,32 +155,31 @@ impl BatchMaker {
                     .unwrap(),
             );
 
-            // Clocked measurements use one record, including batches without samples.
-            info!(
-                "Benchmark batch {:?} bytes {} samples {:?}",
-                digest, size, tx_ids
-            );
-
             for id in tx_ids {
-                // NOTE: This log entry is used to compute legacy performance.
-                info!("Batch {:?} contains sample tx {}", digest, id);
+                // NOTE: This log entry is used to compute performance.
+                info!(
+                    "Batch {:?} contains sample tx {}",
+                    digest,
+                    u64::from_be_bytes(id)
+                );
             }
 
             // NOTE: This log entry is used to compute performance.
             info!("Batch {:?} contains {} B", digest, size);
         }
 
-        let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().copied().unzip();
-        let handlers = self
-            .network
-            .broadcast(addresses, Bytes::from(serialized.clone()))
-            .await;
+        // Broadcast the batch through the network.
+        let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
+        let bytes = Bytes::from(serialized.clone());
+        let handlers = self.network.broadcast(addresses, bytes).await;
+
+        // Send the batch through the deliver channel for further processing.
         self.tx_message
             .send(QuorumWaiterMessage {
                 batch: serialized,
-                handlers: names.into_iter().zip(handlers).collect(),
+                handlers: names.into_iter().zip(handlers.into_iter()).collect(),
             })
             .await
-            .expect("Failed to deliver sealed batch");
+            .expect("Failed to deliver batch");
     }
 }

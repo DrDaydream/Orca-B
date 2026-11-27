@@ -1,10 +1,13 @@
 use super::*;
 use crate::common::{committee, keys, proposal};
-use crate::messages::{batch_digest, local_votes_key, GrbcPhase};
+use crate::error::DagError;
+use crate::messages::{batch_digest, local_votes_key, worker_batch_key, GrbcPhase, Proposal};
 use crate::primary::PrimaryMessage;
+use crate::synchronizer::Synchronizer;
 use bytes::Bytes;
 use crypto::{Hash as _, Signature};
 use futures::{SinkExt, StreamExt};
+use std::collections::BTreeMap;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::channel;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -48,15 +51,15 @@ async fn local_proposal_broadcast_does_not_wait_for_storage_but_delivery_does() 
     let (_tx_remote, rx_remote) = channel(1);
     let (tx_stored, mut rx_stored) = channel(1);
     let tracker = ProposalTracker::default();
+    let storage = Store::from_channel(tx_store);
     spawn_proposal_processors(
         p.header.author,
         c,
-        Store::from_channel(tx_store),
+        storage.clone(),
         Arc::new(AtomicU64::new(0)),
         50,
         rx_remote,
-        channel(1).1,
-        1000,
+        Synchronizer::new(keys()[0].0, storage.clone(), channel(1).0),
         rx_local,
         tx_stored,
         tracker.clone(),
@@ -91,7 +94,7 @@ async fn local_proposal_broadcast_does_not_wait_for_storage_but_delivery_does() 
         .unwrap();
     assert_eq!(
         wire.as_ref(),
-        bincode::serialize(&PrimaryMessage::Proposal(p.clone())).unwrap()
+        bincode::serialize(&PrimaryMessage::Header(p.header.clone())).unwrap()
     );
     stream.send(Bytes::from_static(b"Ack")).await.unwrap();
     assert!(
@@ -137,11 +140,11 @@ async fn runtime_review_two_local_rounds_progress_while_peer_enqueue_is_saturate
     let address = listener.local_addr().unwrap();
     let p = with_payload();
     let mut replay_store = store("released_proposal_retry");
-    store_verified_proposal(&mut replay_store, p.clone())
+    store_verified_proposal(&mut replay_store, p.header.clone())
         .await
         .unwrap();
     let policy = Arc::new(CountProposalDecisions {
-        wire: Bytes::from(bincode::serialize(&PrimaryMessage::Proposal(p.clone())).unwrap()),
+        wire: Bytes::from(bincode::serialize(&PrimaryMessage::Header(p.header.clone())).unwrap()),
         calls: AtomicUsize::new(0),
     });
     // No delay budget remains, so the policy releases the initial attempt.
@@ -193,7 +196,7 @@ async fn runtime_review_two_local_rounds_progress_while_peer_enqueue_is_saturate
     let prepare = async {
         for (proposal, guard) in [(p, guard), (next, next_guard)] {
             let (accepted, deferred) = prepare_local_proposal(
-                proposal,
+                proposal.header,
                 committee(),
                 &mut storage,
                 (&mut network, vec![address]),
@@ -294,7 +297,7 @@ async fn local_proposal_storage_failure_returns_while_peer_enqueue_is_saturated(
     let mut storage = Store::from_channel(tx_store);
     let (tx_stored, mut rx_stored) = channel(1);
     let prepare = prepare_local_proposal(
-        p,
+        p.header,
         committee(),
         &mut storage,
         (&mut network, vec![address]),
@@ -349,7 +352,7 @@ async fn local_proposal_rejects_invalid_signature_before_storage_or_publication(
     let (tx_stored, mut rx_stored) = channel(1);
     let mut network = ReliableSender::new();
     assert!(prepare_local_proposal(
-        p,
+        p.header,
         committee(),
         &mut storage,
         (&mut network, Vec::new()),
@@ -378,7 +381,7 @@ async fn local_proposal_failed_storage_does_not_publish() {
     let (tx_stored, mut rx_stored) = channel(1);
     let mut network = ReliableSender::new();
     let prepare = prepare_local_proposal(
-        p,
+        p.header,
         committee(),
         &mut storage,
         (&mut network, Vec::new()),
@@ -431,7 +434,7 @@ async fn failed_proposal_storage_does_not_deliver_header_and_releases_tracker() 
 #[test]
 fn digest_proposal_wire_matches_header_and_rejects_legacy_inline_or_truncated_frames() {
     let p = with_payload();
-    let message = bincode::serialize(&PrimaryMessage::Proposal(p.clone())).unwrap();
+    let message = bincode::serialize(&PrimaryMessage::Header(p.header.clone())).unwrap();
     assert_eq!(&message[4..], &bincode::serialize(&p.header).unwrap()[..]);
     assert!(crate::primary::decode_frame::<PrimaryMessage>(&message).is_ok());
     assert!(crate::primary::decode_frame::<PrimaryMessage>(&message[..message.len() - 1]).is_err());
@@ -450,11 +453,7 @@ async fn old_signed_metadata_can_serve_repair_but_is_not_worker_availability() {
         .write(key, bincode::serialize(&p.header).unwrap())
         .await;
     assert_eq!(
-        load_proposal(&mut storage, &digest)
-            .await
-            .unwrap()
-            .unwrap()
-            .header,
+        load_proposal(&mut storage, &digest).await.unwrap().unwrap(),
         p.header
     );
     assert!(storage
@@ -462,11 +461,12 @@ async fn old_signed_metadata_can_serve_repair_but_is_not_worker_availability() {
         .await
         .unwrap()
         .is_none());
-    assert_eq!(
-        verify_worker_payload(&committee(), &mut storage, &p)
-            .await
-            .unwrap(),
-        p.header.payload
+    let (tx, mut pending) = channel(1);
+    let mut sync = Synchronizer::new(keys()[0].0, storage, tx);
+    assert!(sync.missing_payload(&p.header).await.unwrap());
+    assert!(
+        matches!(pending.recv().await.unwrap(), crate::header_waiter::WaiterMessage::SyncBatches(missing, _)
+        if missing == p.header.payload.into_iter().collect())
     );
 }
 
@@ -475,7 +475,7 @@ async fn helper_recovers_complete_proposal_before_local_ready() {
     let mut store = store("helper");
     let p = with_payload();
     let digest = p.block().digest();
-    store_verified_proposal(&mut store, p.clone())
+    store_verified_proposal(&mut store, p.header.clone())
         .await
         .unwrap();
     let vote = crate::common::votes(&p.header, GrbcPhase::Echo).remove(0);
@@ -531,9 +531,9 @@ async fn helper_recovers_complete_proposal_before_local_ready() {
     let (mut saw_proposal, mut saw_vote) = (false, false);
     for bytes in frames {
         match bincode::deserialize::<PrimaryMessage>(&bytes).unwrap() {
-            PrimaryMessage::Proposal(rebuilt) => {
+            PrimaryMessage::Header(rebuilt) => {
                 rebuilt.verify(&committee()).unwrap();
-                assert_eq!(rebuilt.header, p.header);
+                assert_eq!(rebuilt, p.header);
                 saw_proposal = true;
             }
             PrimaryMessage::GrbcVoteBatch(batch) => {
@@ -575,7 +575,7 @@ async fn proposal_processor_rejects_a_changed_signature_even_for_a_known_header(
         .await
         .is_err());
     let restored = load_proposal(&mut store, &digest).await.unwrap().unwrap();
-    assert_eq!(restored.header, p.header);
+    assert_eq!(restored, p.header);
     restored.verify(&committee()).unwrap();
 }
 
@@ -597,8 +597,7 @@ async fn remote_processor_delivers_known_proposals_once_and_rejects_invalid_firs
         Arc::new(AtomicU64::new(0)),
         50,
         rx_remote,
-        channel(1).1,
-        1000,
+        Synchronizer::new(keys()[0].0, storage.clone(), channel(1).0),
         rx_local,
         tx_stored,
         tracker.clone(),
@@ -618,7 +617,7 @@ async fn remote_processor_delivers_known_proposals_once_and_rejects_invalid_firs
     next.header.signature = Signature::new(&next.header.id, &keys().pop().unwrap().1);
     for proposal in [invalid.clone(), p.clone(), p.clone(), invalid, next.clone()] {
         let guard = tracker.track(&proposal.header);
-        tx_remote.send((proposal, guard)).await.unwrap();
+        tx_remote.send((proposal.header, guard)).await.unwrap();
     }
     drop(tx_remote);
     let mut delivered = Vec::new();
@@ -633,7 +632,7 @@ async fn remote_processor_delivers_known_proposals_once_and_rejects_invalid_firs
         let digest = expected.block().digest();
         assert!(!tracker.contains(&digest));
         let recovered = load_proposal(&mut storage, &digest).await.unwrap().unwrap();
-        assert_eq!(recovered.header, expected.header);
+        assert_eq!(recovered, expected.header);
     }
 }
 
@@ -659,8 +658,7 @@ async fn remote_duplicate_cache_eviction_and_restart_do_not_prevent_recovery() {
             Arc::new(AtomicU64::new(0)),
             1,
             rx_remote,
-            channel(1).1,
-            1000,
+            Synchronizer::new(keys()[0].0, storage.clone(), channel(1).0),
             rx_local,
             tx_stored,
             tracker.clone(),
@@ -674,7 +672,10 @@ async fn remote_duplicate_cache_eviction_and_restart_do_not_prevent_recovery() {
             expected.header.signature =
                 Signature::new(&expected.header.id, &keys().pop().unwrap().1);
             let guard = tracker.track(&expected.header);
-            tx_remote.send((expected.clone(), guard)).await.unwrap();
+            tx_remote
+                .send((expected.header.clone(), guard))
+                .await
+                .unwrap();
             let stored = timeout(Duration::from_secs(5), rx_stored.recv())
                 .await
                 .unwrap()

@@ -1,5 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use rocksdb::{Direction, IteratorMode};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
 
@@ -16,6 +18,7 @@ type Value = Vec<u8>;
 pub enum StoreCommand {
     Write(Key, Value),
     WriteBatchIfAbsent(BTreeMap<Key, Value>, oneshot::Sender<StoreResult<usize>>),
+    RestoreWorkerReceipts(oneshot::Sender<StoreResult<()>>),
     Read(Key, oneshot::Sender<StoreResult<Option<Value>>>),
     NotifyRead(Key, oneshot::Sender<StoreResult<Value>>),
 }
@@ -34,17 +37,26 @@ impl Store {
 
     pub fn new(path: &str) -> StoreResult<Self> {
         let db = rocksdb::DB::open_default(path)?;
-        let mut obligations = HashMap::<_, VecDeque<oneshot::Sender<_>>>::new();
+        let mut obligations = HashMap::<Key, VecDeque<oneshot::Sender<StoreResult<Value>>>>::new();
         let (tx, mut rx) = channel(100);
         // RocksDB reads, writes and compactions may block. Keep their FIFO
         // ordering on one worker without stalling protocol tasks or timers.
         // The runtime joins blocking workers during shutdown, ensuring the DB
         // is closed before RocksDB's process-wide state is destroyed.
         tokio::task::spawn_blocking(move || {
+            // HeaderWaiter cancels incomplete reads during GC, including keys that may never arrive.
+            let mut next_prune = Instant::now() + Duration::from_secs(1);
             while let Some(command) = rx.blocking_recv() {
+                if !obligations.is_empty() && Instant::now() >= next_prune {
+                    obligations.retain(|_, waiters| {
+                        waiters.retain(|waiter| !waiter.is_closed());
+                        !waiters.is_empty()
+                    });
+                    next_prune = Instant::now() + Duration::from_secs(1);
+                }
                 match command {
                     StoreCommand::Write(key, value) => {
-                        let _ = db.put(&key, &value);
+                        db.put(&key, &value).expect("Failed to persist store value");
                         if let Some(mut senders) = obligations.remove(&key) {
                             while let Some(s) = senders.pop_front() {
                                 let _ = s.send(Ok(value.clone()));
@@ -88,6 +100,9 @@ impl Store {
                             }
                         }
                     }
+                    StoreCommand::RestoreWorkerReceipts(sender) => {
+                        let _ = sender.send(Self::restore_worker_receipts(&db));
+                    }
                     StoreCommand::Read(key, sender) => {
                         let response = db.get(&key);
                         let _ = sender.send(response);
@@ -108,6 +123,44 @@ impl Store {
             }
         });
         Ok(Self { channel: tx })
+    }
+
+    /// Upgrade the primary's receipt keys from the first digest-proposal release.
+    /// This command is enqueued before primary startup. Each chunk and the final marker
+    /// can be safely replayed if the process stops partway through the scan.
+    fn restore_worker_receipts(db: &rocksdb::DB) -> StoreResult<()> {
+        const PREFIX: &[u8] = b"orca-worker-batch-v1/";
+        const DONE: &[u8] = b"orca-narwhal-worker-receipts-migrated-v1";
+        if db.get_pinned(DONE)?.is_some() {
+            return Ok(());
+        }
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut records = db.iterator(IteratorMode::From(PREFIX, Direction::Forward));
+        for (key, value) in records.by_ref() {
+            if !key.starts_with(PREFIX) {
+                break;
+            }
+            let receipt = &key[PREFIX.len()..];
+            if receipt.len() == 36 && value.is_empty() {
+                batch.put(receipt, &[]);
+                if batch.len() == 4096 {
+                    db.write(batch)?;
+                    batch = rocksdb::WriteBatch::default();
+                }
+            }
+        }
+        records.status()?;
+        batch.put(DONE, &[]);
+        db.write(batch)
+    }
+
+    pub async fn migrate_worker_receipts(&mut self) -> StoreResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.channel
+            .send(StoreCommand::RestoreWorkerReceipts(sender))
+            .await
+            .expect("Failed to request worker receipt migration");
+        receiver.await.expect("Worker receipt migration stopped")
     }
 
     pub async fn write(&mut self, key: Key, value: Value) {

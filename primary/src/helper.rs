@@ -90,9 +90,9 @@ impl Helper {
                     continue;
                 }
                 match load_proposal(&mut self.store, &digest).await {
-                    Ok(Some(proposal)) => {
+                    Ok(Some(header)) => {
                         let bytes = tokio::task::spawn_blocking(move || {
-                            bincode::serialize(&PrimaryMessage::Proposal(proposal))
+                            bincode::serialize(&PrimaryMessage::Header(header))
                         })
                         .await
                         .expect("Proposal response task failed")

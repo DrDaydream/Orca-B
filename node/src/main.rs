@@ -88,7 +88,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     };
 
     // Make the data store.
-    let store = Store::new(store_path).context("Failed to create a store")?;
+    let mut store = Store::new(store_path).context("Failed to create a store")?;
 
     // Channels the sequence of certificates.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
@@ -97,6 +97,10 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     match matches.subcommand() {
         // Spawn the primary and consensus core.
         ("primary", _) => {
+            store
+                .migrate_worker_receipts()
+                .await
+                .context("Failed to migrate Narwhal worker receipts")?;
             let name = keypair.name;
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
@@ -125,6 +129,14 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .unwrap()
                 .parse::<WorkerId>()
                 .context("The worker id must be a positive integer")?;
+            #[cfg(feature = "benchmark")]
+            {
+                network::observe_transaction_port(
+                    committee.worker(&keypair.name, &id)?.transactions.port(),
+                );
+                log::info!("Benchmark latency instrumentation version 1");
+                log::info!("Benchmark worker batch format narwhal");
+            }
             Worker::spawn(keypair.name, id, committee, parameters, store);
         }
         _ => unreachable!(),

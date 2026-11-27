@@ -1,9 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
-use crate::messages::Header;
-use crate::primary::{PrimaryMessage, Round};
+use crate::messages::{worker_batch_key, Header};
+use crate::primary::{PrimaryMessage, PrimaryWorkerMessage, Round};
 use bytes::Bytes;
-use config::Committee;
+use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
@@ -27,6 +27,7 @@ const TIMER_RESOLUTION: u64 = 1_000;
 /// The commands that can be sent to the `Waiter`.
 #[derive(Debug)]
 pub enum WaiterMessage {
+    SyncBatches(HashMap<Digest, WorkerId>, Header),
     // Local completion records for strong/weak edges, proposal markers for virtual edges.
     // Retained for repair regression tests; the no-wait Core never queues it.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -103,7 +104,7 @@ mod tests {
             PrimaryMessage::CertificatesRequest(digests, _) if digests == vec![digest.clone()])
         );
 
-        store_verified_proposal(&mut store, p).await.unwrap();
+        store_verified_proposal(&mut store, p.header).await.unwrap();
         let bytes = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
             .unwrap()
@@ -213,9 +214,11 @@ pub struct HeaderWaiter {
     /// along with a timestamp (`u128`) indicating when we sent the request.
     parent_requests: HashMap<Digest, (Round, u128)>,
     virtual_requests: HashMap<Digest, (Round, u128)>,
+    // The same digest on a different worker needs a separate availability receipt.
+    batch_requests: HashMap<(Digest, WorkerId), Round>,
     /// List of digests (either certificates, headers or tx batch) that are waiting
     /// to be processed. Their processing will resume when we get all their dependencies.
-    pending: HashMap<Digest, (Round, Sender<()>)>,
+    pending: HashMap<Digest, (Round, PublicKey, Sender<()>)>,
 }
 
 impl HeaderWaiter {
@@ -246,6 +249,7 @@ impl HeaderWaiter {
                 network: SimpleSender::new(),
                 parent_requests: HashMap::new(),
                 virtual_requests: HashMap::new(),
+                batch_requests: HashMap::new(),
                 pending: HashMap::new(),
             }
             .run()
@@ -333,6 +337,56 @@ impl HeaderWaiter {
             tokio::select! {
                 Some(message) = self.rx_synchronizer.recv() => {
                     match message {
+                        WaiterMessage::SyncBatches(missing, header) => {
+                            debug!("Synching the payload of {}", header);
+                            let header_id = header.id.clone();
+                            let round = header.round;
+                            let author = header.author;
+
+                            // Ensure we sync only once per header.
+                            if round < self.gc_round || self.pending.contains_key(&header_id) {
+                                continue;
+                            }
+                            if missing.values().any(|worker_id| self.committee.worker(&self.name, worker_id).is_err()) {
+                                log::warn!("Missing local worker for header {}", header);
+                                continue;
+                            }
+                            // Bound outstanding waits from one author, including conflicting signed headers.
+                            if self.pending.values().filter(|(_, origin, _)| origin == &author).count()
+                                >= self.gc_depth.saturating_add(1).saturating_mul(2) as usize {
+                                continue;
+                            }
+
+                            // Resume this header when all missing local worker receipts arrive.
+                            let wait_for = missing
+                                .iter()
+                                .map(|(digest, worker_id)| {
+                                    (worker_batch_key(digest, *worker_id), self.store.clone())
+                                })
+                                .collect();
+                            let (tx_cancel, rx_cancel) = channel(1);
+                            self.pending.insert(header_id, (round, author, tx_cancel));
+                            let fut = Self::waiter(wait_for, header, rx_cancel);
+                            waiting.push(fut);
+
+                            // Ask our worker to fetch missing bytes from the header author's worker.
+                            let mut requires_sync = HashMap::new();
+                            for (digest, worker_id) in missing {
+                                self.batch_requests.entry((digest.clone(), worker_id))
+                                    .and_modify(|last| *last = round.max(*last))
+                                    .or_insert_with(|| {
+                                        requires_sync.entry(worker_id).or_insert_with(Vec::new).push(digest);
+                                        round
+                                    });
+                            }
+                            for (worker_id, digests) in requires_sync {
+                                let address = self.committee.worker(&self.name, &worker_id)
+                                    .expect("Missing local worker for a verified header").primary_to_worker;
+                                let message = PrimaryWorkerMessage::Synchronize(digests, author);
+                                let bytes = bincode::serialize(&message).expect("Failed to serialize batch sync request");
+                                self.network.send(address, Bytes::from(bytes)).await;
+                            }
+                        }
                         WaiterMessage::Committed(blocks) => {
                             for (digest, header_id) in blocks {
                                 self.parent_requests.remove(&digest);
@@ -363,7 +417,7 @@ impl HeaderWaiter {
                                     (crate::messages::proposal_header_key(x), self.store.clone())))
                                 .collect();
                             let (tx_cancel, rx_cancel) = channel(1);
-                            self.pending.insert(header_id, (round, tx_cancel));
+                            self.pending.insert(header_id, (round, author, tx_cancel));
                             let fut = Self::waiter(wait_for, header, rx_cancel);
                             waiting.push(fut);
 
@@ -401,6 +455,9 @@ impl HeaderWaiter {
                 Some(result) = waiting.next() => match result {
                     Ok(Some(header)) => {
                         let _ = self.pending.remove(&header.id);
+                        for (digest, &worker_id) in &header.payload {
+                            self.batch_requests.remove(&(digest.clone(), worker_id));
+                        }
                         for x in header
                             .parents
                             .iter()
@@ -466,12 +523,13 @@ impl HeaderWaiter {
             if gc_round > self.gc_round {
                 self.gc_round = gc_round;
 
-                for (r, handler) in self.pending.values() {
-                    if r <= &gc_round {
+                for (r, _, handler) in self.pending.values() {
+                    if r < &gc_round {
                         let _ = handler.send(()).await;
                     }
                 }
-                self.pending.retain(|_, (r, _)| *r > gc_round);
+                self.pending.retain(|_, (r, _, _)| *r >= gc_round);
+                self.batch_requests.retain(|_, r| *r >= gc_round);
                 self.parent_requests.retain(|_, (r, _)| *r > gc_round);
                 self.virtual_requests.retain(|_, (r, _)| *r > gc_round);
             }

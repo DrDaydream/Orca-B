@@ -14,6 +14,8 @@ from statistics import mean
 _TIME = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})')
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _VERSION = 'Benchmark latency instrumentation version 1'
+_NARWHAL_BATCH_FORMAT = 'Benchmark worker batch format narwhal'
+_NARWHAL_BATCH = re.compile(r'\bBatch (\S+) contains (?:(\d+) B|sample tx (\d+))$')
 _FINAL_RECORD = re.compile(
     r'Committed B\d+\([^()\s]+\) -> (\S+) @ (\d+) commit (\d+) commit_us (\d+)'
 )
@@ -51,6 +53,40 @@ def _samples(log, kind):
         ident, stamp = int(ident), int(stamp)
         result[ident] = min(result.get(ident, stamp), stamp)
     return result
+
+
+def _narwhal_batch_observations(log):
+    sizes, samples = {}, {}
+    for line in log.splitlines():
+        record = _NARWHAL_BATCH.search(line)
+        if record is None:
+            continue
+        digest, size, sample = record.groups()
+        if size is None:
+            samples.setdefault(digest, []).append(int(sample))
+        elif digest in sizes:
+            raise ValueError(f'Ambiguous batch observation for {digest}')
+        else:
+            sizes[digest] = int(size)
+    if samples.keys() - sizes.keys():
+        raise ValueError('Missing batch size for Narwhal worker sample')
+    return ((digest, size, samples.get(digest, [])) for digest, size in sizes.items())
+
+
+def _orca_batch_observations(log, source_id):
+    for line in log.splitlines():
+        marker = line.find('Benchmark batch')
+        if marker == -1:
+            continue
+        observation = _BATCH_OBSERVATION.fullmatch(line[marker:])
+        if observation is None:
+            raise ValueError(f'Malformed batch observation for source {source_id}')
+        digest, size, samples = observation.groups()
+        try:
+            ids = json.loads(samples)
+        except ValueError as error:
+            raise ValueError(f'Malformed batch observation for {digest}') from error
+        yield digest, int(size), ids
 
 
 def aba_counter_samples(log):
@@ -369,23 +405,14 @@ class Measurements:
                     or any(ident != position for position, ident in enumerate(source['release']))):
                 raise ValueError(f'Incomplete sample release sequence for source {source_id}')
             batches = {}
-            for line in worker.splitlines():
-                marker = line.find('Benchmark batch')
-                if marker == -1:
-                    continue
-                observation = _BATCH_OBSERVATION.fullmatch(line[marker:])
-                if observation is None:
-                    raise ValueError(f'Malformed batch observation for source {source_id}')
-                batch, size, sample_ids = observation.groups()
-                try:
-                    ids = json.loads(sample_ids)
-                except ValueError as error:
-                    raise ValueError(f'Malformed batch observation for {batch}') from error
-                if (int(size) <= 0 or any(type(ident) is not int or ident < 0 for ident in ids)):
+            observations = (_narwhal_batch_observations(worker) if _NARWHAL_BATCH_FORMAT in worker
+                            else _orca_batch_observations(worker, source_id))
+            for batch, size, ids in observations:
+                if (size <= 0 or any(type(ident) is not int or ident < 0 for ident in ids)):
                     raise ValueError(f'Invalid batch observation for {batch}')
                 if batch in batch_sizes:
                     raise ValueError(f'Ambiguous batch observation for {batch}')
-                batch_sizes[batch] = int(size)
+                batch_sizes[batch] = size
                 for ident in ids:
                     if ident in batches:
                         raise ValueError(f'Ambiguous sample-to-batch mapping for source {source_id}')

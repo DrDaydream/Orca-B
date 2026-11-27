@@ -85,6 +85,18 @@ class ClockMeasurementTests(unittest.TestCase):
             [worker()],
         )
 
+    def test_bullshark_worker_records_produce_the_same_clocked_results(self):
+        old = worker()
+        narwhal = line(EPOCH_US, 'Benchmark worker batch format narwhal') + ''.join(
+            row for row in old.splitlines(keepends=True) if 'Benchmark batch ' not in row)
+        final = primary({'batchA=': 4_000_000, 'batchB=': 6_000_000, 'batchC=': 7_000_000})
+        expected = Measurements([client()], [final], [old]).clock_metrics(PLAN)
+        actual = Measurements([client()], [final], [narwhal]).clock_metrics(PLAN)
+        self.assertEqual(actual, expected)
+        duplicate = narwhal + line(EPOCH_US, 'Batch batchB= contains 200 B')
+        with self.assertRaisesRegex(ValueError, 'Ambiguous batch observation'):
+            Measurements([client()], [final], [duplicate]).clock_metrics(PLAN)
+
     def test_clock_windows_keep_warmup_release_and_exclude_end_boundary(self):
         result = self.measurements().clock_metrics(PLAN)
 

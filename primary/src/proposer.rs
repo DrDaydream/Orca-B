@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::adversary;
-use crate::messages::{Certificate, Header, MAX_PROPOSAL_WIRE_BYTES};
+use crate::messages::{Certificate, Header};
 use crate::primary::{PrimaryWorkerMessage, Round};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
@@ -10,7 +10,6 @@ use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::{CancelHandler, ReliableSender};
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
@@ -60,7 +59,7 @@ pub struct Proposer {
     last_weak_edges: Vec<Digest>,
     last_virtual_edges: Vec<Digest>,
     /// Holds the batches' digests waiting to be included in the next header.
-    digests: VecDeque<(Digest, WorkerId)>,
+    digests: Vec<(Digest, WorkerId)>,
     /// Keeps track of the size (in bytes) of batches' digests that we received so far.
     payload_size: usize,
 }
@@ -118,7 +117,7 @@ impl Proposer {
                 last_parents: genesis,
                 last_weak_edges: Vec::new(),
                 last_virtual_edges: Vec::new(),
-                digests: VecDeque::with_capacity(2 * header_size),
+                digests: Vec::with_capacity(2 * header_size),
                 payload_size: 0,
             }
             .run()
@@ -170,39 +169,14 @@ impl Proposer {
     }
 
     async fn make_header(&mut self) {
-        let mut payload = std::collections::BTreeMap::new();
-        let parents = self.last_parents.drain(..).collect();
-        let weak_edges = self.last_weak_edges.drain(..).collect();
-        let virtual_edges = self.last_virtual_edges.drain(..).collect();
-        let skeleton = Header {
-            author: self.name,
-            round: self.round,
-            parents,
-            weak_edges,
-            virtual_edges,
-            ..Header::default()
-        };
-        // bincode's outer enum tag is four bytes. Each map entry adds a
-        // 32-byte digest and a u32 worker ID, independent of the batch size.
-        let mut wire_bytes = 4 + bincode::serialized_size(&skeleton).unwrap();
-        while wire_bytes + 36 <= MAX_PROPOSAL_WIRE_BYTES {
-            let (digest, worker) = match self.digests.pop_front() {
-                Some(entry) => entry,
-                None => break,
-            };
-            self.payload_size -= digest.size();
-            if payload.insert(digest, worker).is_none() {
-                wire_bytes += 36;
-            }
-        }
-        // Freeze every edge and payload digest before the first network message.
+        // Make a new header.
         let header = Header::new(
             self.name,
             self.round,
-            payload,
-            skeleton.parents,
-            skeleton.weak_edges,
-            skeleton.virtual_edges,
+            self.digests.drain(..).collect(),
+            self.last_parents.drain(..).collect(),
+            self.last_weak_edges.drain(..).collect(),
+            self.last_virtual_edges.drain(..).collect(),
             &mut self.signature_service,
         )
         .await;
@@ -255,6 +229,7 @@ impl Proposer {
                 } else {
                     // Make a new header.
                     self.make_header().await;
+                    self.payload_size = 0;
                 }
 
                 // Reschedule the timer.
@@ -278,8 +253,10 @@ impl Proposer {
                     self.last_virtual_edges = virtual_edges;
                 }
                 Some((digest, worker_id)) = self.rx_workers.recv() => {
+                    #[cfg(feature = "benchmark")]
+                    info!("Benchmark proposer received batch {:?} worker {}", digest, worker_id);
                     self.payload_size += digest.size();
-                    self.digests.push_back((digest, worker_id));
+                    self.digests.push((digest, worker_id));
                 }
                 () = &mut timer, if !timer_expired => {
                     // Nothing to do.

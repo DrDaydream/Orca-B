@@ -19,7 +19,7 @@ pub struct QuorumWaiterMessage {
     pub handlers: Vec<(PublicKey, CancelHandler)>,
 }
 
-/// Releases a batch once local stake and acknowledged peer stake reach quorum.
+/// The QuorumWaiter waits for 2f authorities to acknowledge reception of a batch.
 pub struct QuorumWaiter {
     /// The committee information.
     committee: Committee,
@@ -51,33 +51,36 @@ impl QuorumWaiter {
         });
     }
 
+    /// Helper function. It waits for a future to complete and then delivers a value.
+    async fn waiter(wait_for: CancelHandler, deliver: Stake) -> Stake {
+        let _ = wait_for.await;
+        deliver
+    }
+
+    /// Main loop.
     async fn run(&mut self) {
         while let Some(QuorumWaiterMessage { batch, handlers }) = self.rx_message.recv().await {
-            let mut replies: FuturesUnordered<_> = handlers
+            let mut wait_for_quorum: FuturesUnordered<_> = handlers
                 .into_iter()
                 .map(|(name, handler)| {
                     let stake = self.committee.stake(&name);
-                    async move {
-                        match handler.await {
-                            Ok(reply) if reply.as_ref() == b"Ack" => stake,
-                            _ => 0,
-                        }
-                    }
+                    Self::waiter(handler, stake)
                 })
                 .collect();
-            let mut weight = self.stake;
-            let quorum = self.committee.quorum_threshold();
-            while weight < quorum {
-                match replies.next().await {
-                    Some(stake) => weight += stake,
-                    None => break,
+
+            // Wait for the first 2f nodes to send back an Ack. Then we consider the batch
+            // delivered and we send its digest to the primary (that will include it into
+            // the dag). This should reduce the amount of synching.
+            let mut total_stake = self.stake;
+            while let Some(stake) = wait_for_quorum.next().await {
+                total_stake += stake;
+                if total_stake >= self.committee.quorum_threshold() {
+                    self.tx_batch
+                        .send(batch)
+                        .await
+                        .expect("Failed to deliver batch");
+                    break;
                 }
-            }
-            if weight >= quorum {
-                self.tx_batch
-                    .send(batch)
-                    .await
-                    .expect("Failed to deliver available batch");
             }
         }
     }

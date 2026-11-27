@@ -39,6 +39,7 @@ pub enum DagError {
     #[error("Malformed header {0}")]
     MalformedHeader(Digest),
 
+    #[cfg(test)]
     #[error("Missing stored batch {0}")]
     MissingBatch(Digest),
 

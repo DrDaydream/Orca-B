@@ -41,10 +41,10 @@ async fn dependency_repair_with_local_payload_does_not_download_it_again() {
         Store::new(&format!(".db_test_vote_only_local_{}", std::process::id())).unwrap();
     let mut remote =
         Store::new(&format!(".db_test_vote_only_remote_{}", std::process::id())).unwrap();
-    store_verified_proposal(&mut local, p.clone())
+    store_verified_proposal(&mut local, p.header.clone())
         .await
         .unwrap();
-    store_verified_proposal(&mut remote, p.clone())
+    store_verified_proposal(&mut remote, p.header.clone())
         .await
         .unwrap();
     let vote = votes(&p.header, GrbcPhase::Echo).remove(1);
@@ -150,7 +150,10 @@ async fn echo_and_ready_bypass_a_blocked_proposal_connection() {
     // Fill the bulk queue and deliberately never run its consumer.
     let first = proposal();
     let guard = in_flight.track(&first.header);
-    tx_remote_proposals.send((first, guard)).await.unwrap();
+    tx_remote_proposals
+        .send((first.header, guard))
+        .await
+        .unwrap();
     let handler = PrimaryReceiverHandler {
         tx_primary_messages,
         tx_remote_proposals,
@@ -185,7 +188,7 @@ async fn echo_and_ready_bypass_a_blocked_proposal_connection() {
     let ack = bulk_network
         .send(
             address,
-            Bytes::from(bincode::serialize(&PrimaryMessage::Proposal(p.clone())).unwrap()),
+            Bytes::from(bincode::serialize(&PrimaryMessage::Header(p.header.clone())).unwrap()),
         )
         .await;
     // The bulk handler ACKs its frame, then blocks on the full queue.

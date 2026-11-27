@@ -131,3 +131,20 @@ async fn immutable_batch_inserts_only_missing_values() {
     let duplicate = [(vec![1], vec![99])].iter().cloned().collect();
     assert_eq!(store.write_batch_if_absent(duplicate).await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn restores_only_legacy_worker_receipts_before_primary_startup() {
+    let path = format!(".db_test_receipt_migration_{}", std::process::id());
+    let mut store = Store::new(&path).unwrap();
+    let digest = [7u8; 32];
+    let key = [digest.as_ref(), &2u32.to_le_bytes()].concat();
+    let old = [b"orca-worker-batch-v1/".as_ref(), &key].concat();
+    let metadata = [b"orca-proposal-header-v3/".as_ref(), digest.as_ref()].concat();
+    store.write(old, Vec::new()).await;
+    store.write(metadata, vec![1]).await;
+    store.migrate_worker_receipts().await.unwrap();
+    store.migrate_worker_receipts().await.unwrap();
+    assert_eq!(store.read(key).await.unwrap(), Some(Vec::new()));
+    let other_worker = [digest.as_ref(), &3u32.to_le_bytes()].concat();
+    assert_eq!(store.read(other_worker).await.unwrap(), None);
+}

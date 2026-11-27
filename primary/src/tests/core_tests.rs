@@ -25,7 +25,7 @@ impl Harness {
         let path = format!(".db_test_grbc_{}_{}_{}", label, node, std::process::id());
         let store = Store::new(&path).unwrap();
         let (tx_headers, headers) = channel(100);
-        let sync = Synchronizer::new(tx_headers);
+        let sync = Synchronizer::new(name, store.clone(), tx_headers);
         let (tx_events, events) = channel(100);
         let (tx_parents, parents) = channel(100);
         let (tx_votes, outgoing) = channel(100);
@@ -44,7 +44,6 @@ impl Harness {
                 consensus_round: Arc::new(AtomicU64::new(0)),
                 gc_depth: 50,
                 rx_primaries: channel(1).1,
-                rx_header_waiter: channel(1).1,
                 rx_proposals: channel(1).1,
                 in_flight: ProposalTracker::default(),
                 vote_batch: Vec::new().into_iter(),
@@ -443,11 +442,10 @@ async fn runtime_review_early_commit_selects_both_own_voting_slots() {
 }
 
 #[tokio::test]
-async fn invalid_own_payload_is_not_delivered_locally() {
+async fn a_modified_own_header_is_rejected_before_local_delivery() {
     let mut h = Harness::new("self_invalid_payload", 3);
     let mut p = proposal();
     p.header.payload.insert(Digest([77; 32]), 0);
-    resign(&mut p);
     assert!(h.core.process_proposal(p).await.is_err());
     assert!(h.grades().is_empty());
     assert!(h.core.completed.is_empty());
@@ -599,7 +597,11 @@ async fn malformed_or_missing_data_cannot_trigger_echo() {
     p.header.payload.insert(Digest([7; 32]), 0);
     p.header.id = p.header.digest();
     p.header.signature = Signature::new(&p.header.id, &keys().pop().unwrap().1);
-    assert!(h.core.process_proposal(p).await.is_err());
+    h.core.process_proposal(p).await.unwrap();
+    assert!(matches!(
+        h._headers.try_recv(),
+        Ok(crate::header_waiter::WaiterMessage::SyncBatches(..))
+    ));
     assert!(h.outgoing().is_empty());
     assert!(h.grades().is_empty());
 }
@@ -670,7 +672,8 @@ async fn complete_payloads_progress_across_rounds_using_local_finish_parents() {
         for proposal in &proposals {
             for node in &mut nodes {
                 // Exercise the exact network enum and serialization, including the signed batch references.
-                let wire = bincode::serialize(&PrimaryMessage::Proposal(proposal.clone())).unwrap();
+                let wire =
+                    bincode::serialize(&PrimaryMessage::Header(proposal.header.clone())).unwrap();
                 node.core
                     .process_primary_burst(Some(bincode::deserialize(&wire).unwrap()))
                     .await
@@ -762,8 +765,7 @@ async fn deduplicated_proposal_echoes_once_without_waiting_for_parents() {
         h.core.consensus_round.clone(),
         50,
         rx_remote,
-        channel(1).1,
-        1000,
+        h.core.synchronizer.clone(),
         rx_local,
         tx_stored,
         h.core.in_flight.clone(),
@@ -780,7 +782,7 @@ async fn deduplicated_proposal_echoes_once_without_waiting_for_parents() {
     resign(&mut child);
     for _ in 0..2 {
         let guard = h.core.in_flight.track(&child.header);
-        tx_remote.send((child.clone(), guard)).await.unwrap();
+        tx_remote.send((child.header.clone(), guard)).await.unwrap();
     }
     drop(tx_remote);
     let stored = timeout(Duration::from_secs(5), rx_stored.recv())
@@ -1566,7 +1568,7 @@ async fn no_wait_committed_quorum_advances_without_local_dependencies() {
         p.header.weak_edges.insert(Digest([43; 32]));
         p.header.virtual_edges.insert(Digest([44; 32]));
         resign(&mut p);
-        crate::proposal_store::store_verified_proposal(&mut h.core.store, p.clone())
+        crate::proposal_store::store_verified_proposal(&mut h.core.store, p.header.clone())
             .await
             .unwrap();
         blocks.push(p.block());
@@ -1608,30 +1610,55 @@ async fn missing_worker_batches_are_repaired_before_echo_without_blocking_other_
     use tokio::time::{timeout, Duration};
     use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-    let mut h = Harness::new("worker_receipts", 0);
-    let mut c = committee();
+    use crate::header_waiter::HeaderWaiter;
+    use crate::proposal_processor::spawn_proposal_processors;
+
+    let h = Harness::new("worker_receipts", 0);
+    let mut core = h.core;
+    let mut storage = core.store.clone();
+    let mut c = core.committee.clone();
     let worker = TcpListener::bind("127.0.0.1:0").await.unwrap();
     c.authorities
-        .get_mut(&h.core.name)
+        .get_mut(&core.name)
         .unwrap()
         .workers
         .get_mut(&0)
         .unwrap()
         .primary_to_worker = worker.local_addr().unwrap();
+
     let (tx_remote, remote) = channel(8);
     let (tx_receipts, receipts) = channel(8);
-    let (tx, mut arrived) = channel(8);
-    PayloadReceiver::spawn(
-        h.core.name,
-        c,
-        h.core.store.clone(),
-        h.core.consensus_round.clone(),
+    let (tx_stored, stored) = channel(8);
+    let (tx_loopback, loopback) = channel(8);
+    let tracker = core.in_flight.clone();
+    PayloadReceiver::spawn(storage.clone(), receipts);
+    crate::proposal_processor::spawn_repaired_headers(storage.clone(), loopback, tx_stored.clone());
+    spawn_proposal_processors(
+        core.name,
+        c.clone(),
+        storage.clone(),
+        core.consensus_round.clone(),
         50,
-        10000,
         remote,
-        receipts,
-        tx,
+        core.synchronizer.clone(),
+        channel(1).1,
+        tx_stored,
+        tracker.clone(),
     );
+    HeaderWaiter::spawn(
+        core.name,
+        c,
+        storage.clone(),
+        core.consensus_round.clone(),
+        50,
+        10_000,
+        3,
+        h._headers,
+        tx_loopback,
+    );
+    core.rx_proposals = stored;
+    let run = tokio::spawn(async move { core.run().await });
+    let mut outgoing = h.outgoing;
 
     let mut delayed = proposal();
     let first = Digest([41; 32]);
@@ -1639,70 +1666,60 @@ async fn missing_worker_batches_are_repaired_before_echo_without_blocking_other_
     delayed.header.payload.insert(first.clone(), 0);
     delayed.header.payload.insert(second.clone(), 0);
     resign(&mut delayed);
-    let ready = Proposal {
-        header: crate::common::headers().remove(1),
-    };
-    for candidate in [&delayed, &delayed, &ready] {
+    let ready = crate::common::headers().remove(1);
+    for header in [&delayed.header, &delayed.header, &ready] {
         tx_remote
-            .send((candidate.clone(), h.core.in_flight.track(&candidate.header)))
+            .send((header.clone(), tracker.track(header)))
             .await
             .unwrap();
     }
-    let (socket, _) = timeout(Duration::from_secs(2), worker.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    let mut frames = Framed::new(socket, LengthDelimitedCodec::new());
-    let request = timeout(Duration::from_secs(2), frames.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(matches!(bincode::deserialize(&request).unwrap(),
-        PrimaryWorkerMessage::Synchronize(keys, origin) if origin == delayed.header.author && keys == vec![first.clone(), second.clone()]));
-    let available = timeout(Duration::from_secs(2), arrived.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    h.core.process_stored_proposal(available).await.unwrap();
-    assert_eq!(h.outgoing()[0].id, ready.header.id);
-    for (digest, worker_id) in [(first, 0), (second.clone(), 1)] {
-        h.core
-            .store
-            .write_batch_if_absent(
-                std::iter::once((worker_batch_key(&digest, worker_id), vec![])).collect(),
-            )
+
+    timeout(Duration::from_secs(5), async {
+        let (socket, _) = worker.accept().await.unwrap();
+        let mut frames = Framed::new(socket, LengthDelimitedCodec::new());
+        let request = frames.next().await.unwrap().unwrap();
+        match bincode::deserialize(&request).unwrap() {
+            PrimaryWorkerMessage::Synchronize(mut missing, author) => {
+                missing.sort();
+                assert_eq!(missing, vec![first.clone(), second.clone()]);
+                assert_eq!(author, delayed.header.author);
+            }
+            _ => panic!("Expected a request at the local worker"),
+        }
+
+        let votes = outgoing.recv().await.unwrap().votes;
+        assert_eq!(votes.len(), 1);
+        assert_eq!((votes[0].phase, &votes[0].id), (GrbcPhase::Echo, &ready.id));
+
+        tx_receipts.send((first, 0)).await.unwrap();
+        tx_receipts.send((second.clone(), 1)).await.unwrap();
+        storage
+            .notify_read(worker_batch_key(&second, 1))
             .await
             .unwrap();
-        tx_receipts.send((digest, worker_id)).await.unwrap();
-    }
-    assert!(timeout(Duration::from_millis(40), arrived.recv())
-        .await
-        .is_err());
-    assert!(h
-        .core
-        .store
-        .read(proposal_header_key(&delayed.block().digest()))
-        .await
-        .unwrap()
-        .is_none());
-    h.core
-        .store
-        .write_batch_if_absent(std::iter::once((worker_batch_key(&second, 0), vec![])).collect())
-        .await
-        .unwrap();
-    tx_receipts.send((second.clone(), 0)).await.unwrap();
-    tx_receipts.send((second, 0)).await.unwrap();
-    let repaired = timeout(Duration::from_secs(2), arrived.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    h.core.process_stored_proposal(repaired).await.unwrap();
-    let votes = h.outgoing();
-    assert_eq!(votes.len(), 1);
-    assert_eq!(votes[0].id, delayed.header.id);
-    assert_eq!(votes[0].phase, GrbcPhase::Echo);
-    assert!(timeout(Duration::from_millis(40), arrived.recv())
-        .await
-        .is_err());
+        assert!(timeout(Duration::from_millis(40), outgoing.recv())
+            .await
+            .is_err());
+        let marker = proposal_header_key(&delayed.block().digest());
+        assert!(storage.read(marker.clone()).await.unwrap().is_none());
+
+        tx_receipts.send((second.clone(), 0)).await.unwrap();
+        tx_receipts.send((second, 0)).await.unwrap();
+        let votes = outgoing.recv().await.unwrap().votes;
+        assert_eq!(votes.len(), 1);
+        assert_eq!(
+            (votes[0].phase, &votes[0].id),
+            (GrbcPhase::Echo, &delayed.header.id)
+        );
+        assert_eq!(
+            storage.read(marker).await.unwrap().unwrap(),
+            bincode::serialize(&delayed.header).unwrap()
+        );
+        assert!(timeout(Duration::from_millis(40), outgoing.recv())
+            .await
+            .is_err());
+    })
+    .await
+    .unwrap();
+    run.abort();
 }
