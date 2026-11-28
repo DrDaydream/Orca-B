@@ -150,7 +150,8 @@ def coordinate(clients, primaries, read_logs, publish, *, duration, warmup=0, dr
         if (poll_started_us >= plan['drain_end_us'] and len(stopped) == len(clients)
                 and len(started) == len(clients)):
             return plan
-        if now >= evidence_end and len(stopped) != len(clients):
+        # A poll started before the deadline can still contain a pre-stop snapshot.
+        if poll_started_us >= evidence_end and len(stopped) != len(clients):
             raise ClockError(f'Missing input-stop evidence: {set(clients) - stopped}')
         if now < plan['drain_end_us']:
             sleep(min(1, (plan['drain_end_us'] - now) / 1_000_000))

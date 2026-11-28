@@ -9,7 +9,7 @@ from benchmark import timing
 class TimingTests(unittest.TestCase):
     def run_clock(self, *, delays=None, bad_plan=False, late=0, missing=None,
                   stop_late=0, missing_stop=False, observe_late=False, straddle=False,
-                  primary_message=''):
+                  primary_message='', slow_stop_poll=False):
         clock = [1_000_000_000]
         published = []
         ready_at = {'client-0': 0, 'client-2': 2, 'primary-0': 1, 'primary-2': 3}
@@ -34,6 +34,11 @@ class TimingTests(unittest.TestCase):
                         log += f"Benchmark input stopped at_us {plan['end_us'] + stop_late} released_samples 1\n"
                 output[name] = log
             output['primary-0'] += primary_message
+            if published and slow_stop_poll:
+                end = published[0]['end_us']
+                if end - 1_000_000 <= clock[0] < end:
+                    # These logs were captured before the clients stopped.
+                    clock[0] = end + timing.EVIDENCE_GRACE_US + 100_000
             if published and straddle:
                 cutoff = published[0]['drain_end_us']
                 if cutoff - 1_000_000 <= clock[0] < cutoff:
@@ -108,6 +113,10 @@ class TimingTests(unittest.TestCase):
     def test_missing_stop_marker_rejects_run(self):
         with self.assertRaisesRegex(timing.ClockError, 'input-stop'):
             self.run_clock(missing_stop=True)
+
+    def test_slow_poll_before_stop_cannot_report_missing_evidence(self):
+        plan, finished = self.run_clock(slow_stop_poll=True)
+        self.assertGreaterEqual(finished, plan['end_us'] + timing.EVIDENCE_GRACE_US)
 
     def test_late_plan_publication_cannot_arm_at_last_moment(self):
         clock = [1_000_000_000]
