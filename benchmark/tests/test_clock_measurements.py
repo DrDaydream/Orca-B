@@ -75,6 +75,26 @@ def primary(finals):
 
 
 class ClockMeasurementTests(unittest.TestCase):
+    def test_namespaced_samples_keep_release_validation_and_metrics(self):
+        def rename(log):
+            for old, new in ((0, 66), (1, 69)):
+                for field in ('id ', 'sample transaction ', 'sample tx '):
+                    log = log.replace(f'{field}{old} ', f'{field}{new} ')
+                    log = log.replace(f'{field}{old}\n', f'{field}{new}\n')
+                log = log.replace(f'samples [{old}]', f'samples [{new}]')
+            return log
+
+        # rank 2, stride 3, mask 64 gives the first two IDs 66 and 69.
+        sender = rename(client()) + line(EPOCH_US, 'Benchmark sample ID sequence source 2 sources 3 mask 64')
+        receiver = rename(worker())
+        commits = [primary({'batchA=': 4_000_000, 'batchB=': 6_000_000})]
+        old = Measurements([client()], commits, [worker()]).clock_metrics(PLAN)
+        new = Measurements([sender], commits, [receiver]).clock_metrics(PLAN)
+        self.assertEqual(old, new)
+        with self.assertRaisesRegex(ValueError, 'sample release sequence'):
+            Measurements([sender.replace('released id 69 ', 'released id 72 ')],
+                         commits, [receiver]).clock_metrics(PLAN)
+
     def measurements(self, release_logs=None):
         return Measurements(
             [client() if release_logs is None else release_logs],

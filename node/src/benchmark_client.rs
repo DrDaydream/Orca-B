@@ -9,6 +9,8 @@ use futures::future::join_all;
 use futures::sink::SinkExt as _;
 use log::{info, warn};
 use rand::Rng;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
@@ -130,6 +132,47 @@ struct Client {
     start_plan: Option<std::path::PathBuf>,
 }
 
+struct SampleIds {
+    source: u64,
+    sources: u64,
+    mask: u64,
+}
+
+impl SampleIds {
+    fn new(target: SocketAddr, nodes: &[SocketAddr], run_id: Option<&str>) -> Self {
+        // Fabric gives each client the same list of transaction sockets and
+        // launches one client per socket. Rank by full address, including IP.
+        let mut workers = nodes.to_vec();
+        workers.sort_unstable();
+        workers.dedup();
+        if let Ok(rank) = workers.binary_search(&target) {
+            let mut hasher = DefaultHasher::new();
+            run_id.hash(&mut hasher);
+            Self {
+                source: rank as u64,
+                sources: workers.len() as u64,
+                mask: hasher.finish(),
+            }
+        } else {
+            // Standalone clients may omit the roster. Give each process its
+            // own random 64-bit namespace, also when they share a target.
+            Self {
+                source: 0,
+                sources: 1,
+                mask: rand::thread_rng().gen(),
+            }
+        }
+    }
+
+    fn at(&self, counter: u64) -> Result<u64> {
+        let ordinal = counter
+            .checked_mul(self.sources)
+            .and_then(|base| base.checked_add(self.source))
+            .context("Sample transaction ID space exhausted")?;
+        Ok(ordinal ^ self.mask)
+    }
+}
+
 fn client_is_silent(schedule: &[u8], slot_ms: u64, elapsed: Duration) -> bool {
     if schedule.is_empty() || slot_ms == 0 {
         return false;
@@ -143,7 +186,7 @@ impl Client {
         const PRECISION: u64 = 20; // Sample precision.
         const BURST_DURATION: u64 = 1000 / PRECISION;
 
-        // The transaction size must be at least 16 bytes to ensure all txs are different.
+        // Both transaction kinds carry a one-byte tag and an eight-byte ID.
         if self.size < 9 {
             return Err(anyhow::Error::msg(
                 "Transaction size must be at least 9 bytes",
@@ -164,6 +207,15 @@ impl Client {
 
         // Submit all transactions.
         let burst = self.rate / PRECISION;
+        let sample_ids = SampleIds::new(
+            self.target,
+            &self.nodes,
+            plan.as_ref().map(|p| p.run_id.as_str()),
+        );
+        info!(
+            "Benchmark sample ID sequence source {} sources {} mask {}",
+            sample_ids.source, sample_ids.sources, sample_ids.mask
+        );
         let mut tx = BytesMut::with_capacity(self.size);
         let mut counter = 0;
         let mut released_samples = 0;
@@ -203,6 +255,7 @@ impl Client {
                 continue;
             }
 
+            let sample_id = sample_ids.at(counter)?;
             if burst > 0 {
                 // Release the whole active burst before any send can block.
                 match SystemTime::now().duration_since(UNIX_EPOCH) {
@@ -215,7 +268,7 @@ impl Client {
                         }
                         info!(
                             "Benchmark sample released id {} at_us {}",
-                            counter,
+                            sample_id,
                             released_at.as_micros()
                         );
                         released_samples += 1;
@@ -223,7 +276,7 @@ impl Client {
                     Err(error) if plan.is_some() => return Err(error.into()),
                     Err(error) => warn!(
                         "Benchmark sample release timestamp unavailable id {}: {}",
-                        counter, error
+                        sample_id, error
                     ),
                 }
             }
@@ -231,10 +284,10 @@ impl Client {
             for x in 0..burst {
                 if x == counter % burst {
                     // NOTE: This log entry is used to compute performance.
-                    info!("Sending sample transaction {}", counter);
+                    info!("Sending sample transaction {}", sample_id);
 
                     tx.put_u8(0u8); // Sample txs start with 0.
-                    tx.put_u64(counter); // This counter identifies the tx.
+                    tx.put_u64(sample_id);
                 } else {
                     r += 1;
                     tx.put_u8(1u8); // Standard txs start with 1.
@@ -288,6 +341,64 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_sequences_include_host_and_port_across_roster_orders() {
+        let addresses: Vec<SocketAddr> = ["127.0.0.1:10", "127.0.0.1:20", "127.0.0.2:10"]
+            .iter()
+            .map(|address| address.parse().unwrap())
+            .collect();
+        let reversed = [addresses[2], addresses[1], addresses[1], addresses[0]];
+        let mut ids = std::collections::HashSet::new();
+        for address in &addresses {
+            let sequence = SampleIds::new(*address, &addresses, Some("run-a"));
+            let reordered = SampleIds::new(*address, &reversed, Some("run-a"));
+            for counter in 0..20 {
+                let id = sequence.at(counter).unwrap();
+                assert_eq!(id, reordered.at(counter).unwrap());
+                assert!(ids.insert(id));
+            }
+            assert!(sequence.at(u64::MAX).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn different_workers_receive_distinct_sample_transactions() {
+        use futures::StreamExt;
+        use std::collections::HashSet;
+        use tokio::net::TcpListener;
+
+        let mut listeners = Vec::new();
+        let mut nodes = Vec::new();
+        for _ in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            nodes.push(listener.local_addr().unwrap());
+            listeners.push(listener);
+        }
+        let mut seen = HashSet::new();
+        for listener in listeners {
+            let client = Client {
+                target: listener.local_addr().unwrap(),
+                size: 9,
+                rate: 20,
+                nodes: nodes.clone(),
+                silence_schedule: Vec::new(),
+                silence_slot_ms: 0,
+                start_plan: None,
+            };
+            let sender = tokio::spawn(async move { client.send().await });
+            let (connection, _) = listener.accept().await.unwrap();
+            let mut frames = Framed::new(connection, LengthDelimitedCodec::new());
+            // Each burst has one sample, including the counter=4 regression.
+            for _ in 0..5 {
+                let frame = frames.next().await.unwrap().unwrap();
+                assert_eq!(frame.len(), 9);
+                assert_eq!(frame[0], 0);
+                assert!(seen.insert(frame.freeze()), "duplicate sample transaction");
+            }
+            sender.abort();
+        }
+    }
 
     #[test]
     fn follows_pre_generated_silence_slots() {

@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import time
 from benchmark import timing
+from benchmark.utils import Print
 
 
 class LocalProcesses:
@@ -15,9 +16,30 @@ class LocalProcesses:
         self.client_logs = []
         self.logs = []
         self.clock = None
+        self.tokio_worker_threads = None
+
+    def configure_tokio(self, process_count):
+        """Share the local machine between its primaries, workers and clients."""
+        try:
+            cpus = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            cpus = os.cpu_count() or 1
+        override = os.environ.get('TOKIO_WORKER_THREADS')
+        if override is None:
+            # Allow another task to run while one runtime thread is busy in RocksDB.
+            threads = max(min(2, cpus), cpus // process_count)
+            self.tokio_worker_threads = str(threads)
+            source = 'automatic'
+        else:
+            self.tokio_worker_threads = override
+            source = 'set by environment'
+        Print.info(f'Local Tokio runtime: TOKIO_WORKER_THREADS={self.tokio_worker_threads} '
+                   f'per process ({source}, {cpus} CPUs, {process_count} Rust processes)')
 
     def start(self, command, log_file):
         args, env = shlex.split(command), os.environ.copy()
+        if self.tokio_worker_threads is not None:
+            env['TOKIO_WORKER_THREADS'] = self.tokio_worker_threads
         if args and args[0] == 'env':
             args.pop(0)
         while args and re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*=.*', args[0]):
@@ -62,7 +84,6 @@ class LocalProcesses:
         deadline = min(starts.values()) + duration
         if max(starts.values()) >= deadline:
             raise RuntimeError('Client startup skew exceeds the measurement window')
-        # Polling is outside the node processes; default Tokio settings are untouched.
         while time.time() < deadline:
             self._check_alive()
             time.sleep(min(0.1, max(0, deadline - time.time())))
@@ -82,3 +103,4 @@ class LocalProcesses:
         self.client_logs.clear()
         self.logs.clear()
         self.clock = None
+        self.tokio_worker_threads = None

@@ -35,10 +35,16 @@ pub type SerializedBatchDigestMessage = Vec<u8>;
 
 /// The message exchanged between workers.
 #[derive(Debug, Serialize, Deserialize)]
-pub enum WorkerMessage {
-    Batch(Batch),
+#[serde(rename = "WorkerMessage")]
+pub enum WorkerMessageFrame<B> {
+    Batch(B),
     BatchRequest(Vec<Digest>, /* origin */ PublicKey),
 }
+
+pub type WorkerMessage = WorkerMessageFrame<Batch>;
+// A receiver only classifies the frame. Borrow transaction bytes while checking
+// the batch so the processor can hash and store the original serialized frame.
+type ReceivedWorkerMessage<'a> = WorkerMessageFrame<Vec<&'a [u8]>>;
 
 pub struct Worker {
     /// The public key of this authority.
@@ -285,12 +291,12 @@ impl MessageHandler for WorkerReceiverHandler {
 
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(..)) => self
+            Ok(ReceivedWorkerMessage::Batch(..)) => self
                 .tx_processor
                 .send(serialized.to_vec())
                 .await
                 .expect("Failed to send batch"),
-            Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
+            Ok(ReceivedWorkerMessage::BatchRequest(missing, requestor)) => self
                 .tx_helper
                 .send((missing, requestor))
                 .await

@@ -96,6 +96,9 @@ class LocalBench:
             # Run the clients (they will wait for the nodes to be ready).
             workers_addresses = {i: rows for i, rows in enumerate(committee.workers_addresses(0))
                                  if i in active}
+            worker_count = sum(len(addresses) for addresses in workers_addresses.values())
+            # Each active worker has a separate load client on this host.
+            self.processes.configure_tokio(len(active) + 2 * worker_count)
             rate_share = ceil(rate / committee.workers())
             if adversary_config is None:
                 silence_slot_ms = client_silence_slot_ms(

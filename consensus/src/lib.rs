@@ -970,19 +970,17 @@ impl Consensus {
         value: BinaryValue,
         state: &mut State,
     ) {
-        if state.aba_decisions.contains_key(&leader_round) {
-            return;
-        }
         self.ensure_aba_instance(leader_round, state).await;
+        // Replaying buffered messages can decide the instance and retire it.
+        let aba = match state.aba_instances.get_mut(&leader_round) {
+            Some(aba) if aba.decision().is_none() => aba,
+            _ => return,
+        };
         if !state.aba_inputs.insert(leader_round) {
             return;
         }
         debug!("ABA instance {} receives input {:?}", leader_round, value);
-        let actions = state
-            .aba_instances
-            .get_mut(&leader_round)
-            .unwrap()
-            .propose(value);
+        let actions = aba.propose(value);
         self.handle_aba_actions(leader_round, actions, state).await;
     }
 

@@ -1,14 +1,47 @@
 from pathlib import Path
+import os
 import shlex
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from benchmark.local_processes import LocalProcesses
 
 
 class LocalProcessesTests(unittest.TestCase):
+    def configured_child_threads(self, processes, process_count):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'worker-0-0.log'
+            processes.configure_tokio(process_count)
+            self.launch(processes, path,
+                        'import os,sys; print(os.environ.get("TOKIO_WORKER_THREADS"), file=sys.stderr)')
+            try:
+                self.assertEqual(processes.processes[0].wait(timeout=10), 0)
+                return path.read_text().strip()
+            finally:
+                processes.stop()
+
+    def test_local_threads_share_affinity_across_colocated_processes(self):
+        for cpus, processes, expected in [(16, 60, '2'), (1, 60, '1'), (24, 6, '4')]:
+            with self.subTest(cpus=cpus, processes=processes), patch.dict(os.environ), \
+                    patch.object(os, 'sched_getaffinity', create=True, return_value=set(range(cpus))):
+                os.environ.pop('TOKIO_WORKER_THREADS', None)
+                self.assertEqual(self.configured_child_threads(LocalProcesses(), processes), expected)
+                self.assertNotIn('TOKIO_WORKER_THREADS', os.environ)
+
+    def test_local_threads_fall_back_when_affinity_is_unavailable(self):
+        with patch.dict(os.environ), \
+                patch.object(os, 'sched_getaffinity', create=True, side_effect=OSError), \
+                patch.object(os, 'cpu_count', return_value=12):
+            os.environ.pop('TOKIO_WORKER_THREADS', None)
+            self.assertEqual(self.configured_child_threads(LocalProcesses(), 4), '3')
+
+    def test_explicit_local_thread_count_reaches_child_unchanged(self):
+        with patch.dict(os.environ, TOKIO_WORKER_THREADS='7'):
+            self.assertEqual(self.configured_child_threads(LocalProcesses(), 60), '7')
+
     def test_env_prefix_delivers_json_to_actual_child(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'primary-env.log'

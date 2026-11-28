@@ -623,6 +623,55 @@ fn grade_two_dirties_only_its_r_plus_two_aba_instance() {
 }
 
 #[tokio::test]
+async fn aba_offers_input_once_to_active_instances_and_leaves_archived_decisions_closed() {
+    let committee = mock_committee();
+    let genesis = Certificate::genesis(&committee);
+    let (tx_output, mut rx_output) = channel(1);
+    let mut consensus = Consensus {
+        name: keys()[0].0,
+        committee,
+        gc_depth: 50,
+        rx_primary: channel(1).1,
+        tx_primary: channel(1).0,
+        tx_output: OutputSender::Individual(tx_output),
+        genesis: genesis.clone(),
+    };
+    let mut state = State::new(genesis);
+
+    let archived = 1;
+    state.aba_decisions.insert(archived, BinaryValue::Zero);
+    state.mark_skipped(archived);
+    consensus
+        .offer_aba_input(archived, BinaryValue::One, &mut state)
+        .await;
+    assert_eq!(state.aba_decisions[&archived], BinaryValue::Zero);
+    assert!(!state.aba_instances.contains_key(&archived));
+    assert!(!state.aba_inputs.contains(&archived));
+    assert!(state.aba_outbox.is_empty());
+    assert!(rx_output.try_recv().is_err());
+
+    let active = 2;
+    consensus.ensure_aba_instance(active, &mut state).await;
+    assert!(state.aba_instances[&active].decision().is_none());
+    consensus
+        .offer_aba_input(active, BinaryValue::One, &mut state)
+        .await;
+    consensus
+        .offer_aba_input(active, BinaryValue::Zero, &mut state)
+        .await;
+    assert!(state.aba_inputs.contains(&active));
+    assert_eq!(state.aba_inputs.len(), 1);
+    assert_eq!(
+        state.aba_outbox,
+        vec![AbaMessage {
+            instance: active,
+            round: 0,
+            kind: aba::AbaMessageKind::BVal(BinaryValue::One),
+        }]
+    );
+}
+
+#[tokio::test]
 async fn missing_aba_leader_request_is_retried() {
     let committee = mock_committee();
     let (tx_primary, mut rx_primary) = channel(10);

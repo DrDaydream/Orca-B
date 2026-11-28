@@ -55,6 +55,19 @@ def _samples(log, kind):
     return result
 
 
+def _sample_sequence(log, source_id):
+    marker = 'Benchmark sample ID sequence'
+    records = [line.partition(marker)[2] for line in log.splitlines() if marker in line]
+    if not records:
+        return 0, 1, 0  # Earlier clients encoded their burst counter directly.
+    match = re.fullmatch(r' source (\d+) sources (\d+) mask (\d+)', records[0])
+    if len(records) == 1 and match:
+        rank, count, mask = map(int, match.groups())
+        if rank < count < 1 << 64 and mask < 1 << 64:
+            return rank, count, mask
+    raise ValueError(f'Invalid sample ID sequence for source {source_id}')
+
+
 def _narwhal_batch_observations(log):
     sizes, samples = {}, {}
     for line in log.splitlines():
@@ -401,8 +414,10 @@ class Measurements:
                     stamps.setdefault(int(ident), []).append(int(at))
                 if any(len(values) != 1 for values in stamps.values()):
                     raise ValueError(f'Ambiguous sample {kind} timestamps for source {source_id}')
+            rank, count, mask = _sample_sequence(client, source_id)
             if (len(source['release']) != released_samples
-                    or any(ident != position for position, ident in enumerate(source['release']))):
+                    or any(ident != ((position * count + rank) ^ mask)
+                           for position, ident in enumerate(source['release']))):
                 raise ValueError(f'Incomplete sample release sequence for source {source_id}')
             batches = {}
             observations = (_narwhal_batch_observations(worker) if _NARWHAL_BATCH_FORMAT in worker
