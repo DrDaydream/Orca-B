@@ -59,7 +59,7 @@ impl Drop for ProposalGuard {
 
 pub(crate) type QueuedProposal = (Header, ProposalGuard);
 
-/// Created only after complete authentication, payload checks and atomic storage.
+/// Authenticated header whose payload checks passed and whose Store write is queued.
 pub(crate) struct StoredProposalHeader(Header, Option<ProposalGuard>);
 
 impl StoredProposalHeader {
@@ -298,7 +298,7 @@ pub(crate) fn spawn_proposal_processors(
                         .send(stored)
                         .await
                         .expect("Failed to deliver stored proposal");
-                    // Remember only fully verified, stored and enqueued values.
+                    // Both the header write and delivery to Core are now queued.
                     // Cache hits discard the incoming copy without applying it.
                     delivered.insert(id.clone());
                     delivery_order.push_back(id);

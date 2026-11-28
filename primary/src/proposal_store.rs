@@ -1,19 +1,17 @@
-//! Durable, authenticated proposal metadata. Transaction bytes live on workers.
+//! Storage for authenticated proposal headers. Transaction bytes live on workers.
 use crate::error::DagResult;
 use crate::messages::{proposal_header_key, Header};
 use crypto::Digest;
 use store::Store;
 
-/// Only publish after authentication and local worker availability.
+/// Queue the verified header before handing it to Core.
 pub(crate) async fn store_verified_proposal(
     store: &mut Store,
     header: Header,
 ) -> DagResult<Header> {
     let key = proposal_header_key(&header.block_digest());
     let bytes = bincode::serialize(&header)?;
-    store
-        .write_batch_if_absent(std::iter::once((key, bytes)).collect())
-        .await?;
+    store.write(key, bytes).await;
     Ok(header)
 }
 
